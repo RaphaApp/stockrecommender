@@ -1,0 +1,11 @@
+# Optional but recommended. Commit this alongside app.py (in a .streamlit/ folder).
+[theme]
+base = "dark"
+primaryColor = "#3b82f6"
+
+[server]
+# Keep reruns snappy on the 1 GB free tier.
+runOnSave = false
+
+[browser]
+gatherUsageStats = false
