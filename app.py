@@ -346,6 +346,33 @@ TRANSLATIONS = {
         "wsb_source_authenticated": "🟢 Source: authenticated Reddit API (most reliable).",
         "wsb_source_rss": "🟡 Source: public RSS feed — may be blocked or throttled on cloud hosts.",
         "wsb_source_offline": "⚪ Source: offline — Reddit was unreachable, so mentions counted as 0.",
+        "historical_performance": "Historical Performance (Mock Portfolio)",
+        "historical_perf_note": "Return % is the live price vs. the price when the pick was logged. Green = ahead, red = behind. These curated picks also feed the walk-forward weight optimizer.",
+        "no_portfolio_picks": "No saved picks yet — run a scan to start logging the mock portfolio.",
+        "col_reason": "Reason",
+        "col_rec_price": "Rec. Price",
+        "col_current_price": "Current Price",
+        "col_return_pct": "Return %",
+        "reason_growth": "Top Growth",
+        "reason_dividend": "Top Dividend",
+        "regions_to_scan": "Regions to Scan",
+        "update_hist_prices": "Update Historical Portfolio Prices",
+        "no_region_selected": "Select at least one region to scan.",
+        "prices_skipped": "Live price update is off — current prices and returns are left blank. Tick 'Update Historical Portfolio Prices' to refresh.",
+        "sell_privacy_note": "Your portfolio list stays in this session only — it is never saved to the database.",
+        "sell_paste_label": "Paste tickers (comma, space, or newline separated)",
+        "sell_upload_label": "…or upload a CSV with a 'Ticker' or 'Symbol' column",
+        "sell_csv_nocol": "No 'Ticker' or 'Symbol' column found in that CSV.",
+        "sell_csv_error": "Couldn't read that CSV file.",
+        "sell_loaded": "{n} ticker(s) loaded: {tickers}",
+        "sell_scan_btn": "Scan Portfolio",
+        "sell_bulk_fetch": "Bulk-fetching price history for {total} tickers in one request…",
+        "sell_scan_progress": "Scanning {done}/{total}…",
+        "sell_need_portfolio": "Paste tickers or upload a CSV above, then press Scan Portfolio.",
+        "sell_verdict_na": "NO DATA",
+        "col_verdict": "Verdict",
+        "sell_detail_expander": "🔎 View full breakdown for one ticker",
+        "sell_detail_select": "Select a ticker from your scan",
         # Sell-Signal scanner
         "tab_sell": "🔻 Sell Signals",
         "sell_header": "🔻 Sell-Signal Scanner",
@@ -466,6 +493,33 @@ TRANSLATIONS = {
         "wsb_source_authenticated": "🟢 ソース：認証済み Reddit API（最も安定）。",
         "wsb_source_rss": "🟡 ソース：公開RSSフィード（クラウド環境ではブロック・制限される場合があります）。",
         "wsb_source_offline": "⚪ ソース：オフライン（Redditに接続できず、言及数は0としてカウント）。",
+        "historical_performance": "ヒストリカル・パフォーマンス（模擬ポートフォリオ）",
+        "historical_perf_note": "リターン％は、記録時の株価に対する現在株価の変化です。緑＝プラス、赤＝マイナス。これらの厳選銘柄はウォークフォワード重み最適化にも反映されます。",
+        "no_portfolio_picks": "保存された推奨はまだありません。スキャンを実行すると模擬ポートフォリオの記録が始まります。",
+        "col_reason": "理由",
+        "col_rec_price": "推奨時株価",
+        "col_current_price": "現在株価",
+        "col_return_pct": "リターン %",
+        "reason_growth": "成長株トップ",
+        "reason_dividend": "高配当トップ",
+        "regions_to_scan": "スキャンする地域",
+        "update_hist_prices": "履歴ポートフォリオの株価を更新",
+        "no_region_selected": "スキャンする地域を1つ以上選択してください。",
+        "prices_skipped": "ライブ株価の更新はオフです。現在株価とリターンは空欄です。「履歴ポートフォリオの株価を更新」をオンにすると更新されます。",
+        "sell_privacy_note": "ポートフォリオのリストはこのセッション内にのみ保持され、データベースには保存されません。",
+        "sell_paste_label": "ティッカーを貼り付け（カンマ・スペース・改行区切り）",
+        "sell_upload_label": "…または「Ticker」「Symbol」列を含むCSVをアップロード",
+        "sell_csv_nocol": "そのCSVに「Ticker」または「Symbol」列が見つかりませんでした。",
+        "sell_csv_error": "そのCSVファイルを読み込めませんでした。",
+        "sell_loaded": "{n} 銘柄を読み込みました：{tickers}",
+        "sell_scan_btn": "ポートフォリオをスキャン",
+        "sell_bulk_fetch": "{total} 銘柄の価格履歴を一括取得中…",
+        "sell_scan_progress": "スキャン中 {done}/{total}…",
+        "sell_need_portfolio": "上にティッカーを貼り付けるかCSVをアップロードし、「ポートフォリオをスキャン」を押してください。",
+        "sell_verdict_na": "データなし",
+        "col_verdict": "判定",
+        "sell_detail_expander": "🔎 個別銘柄の詳細を表示",
+        "sell_detail_select": "スキャンした銘柄から選択",
         # 売りシグナル・スキャナー
         "tab_sell": "🔻 売りシグナル",
         "sell_header": "🔻 売りシグナル・スキャナー",
@@ -666,12 +720,28 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, update_date TEXT NOT NULL,
                 momentum REAL, value REAL, technical REAL, hype REAL, quality REAL, note TEXT
             )""")
+        # Walk-forward optimisation tables (new). CREATE ... IF NOT EXISTS is
+        # inherently non-destructive, so existing data is never touched.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS mock_portfolio (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL, ticker TEXT NOT NULL,
+                recommendation_price REAL, reason TEXT, kpi_snapshot TEXT,
+                evaluated INTEGER DEFAULT 0
+            )""")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS system_weights (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL, factor_name TEXT NOT NULL, current_weight REAL
+            )""")
         # --- Safe migration for pre-existing stock_engine.db files ---
         # Databases created before the "quality" factor existed are missing the
         # column. Add it (defaulting old rows to 0.0) only when absent, so this is
         # a no-op on fresh installs and never errors on an upgrade.
         _ensure_column(conn, "recommendations", "quality")
         _ensure_column(conn, "kpi_weights", "quality")
+        # Bookkeeping flag so each logged pick feeds the walk-forward loop once.
+        _ensure_column(conn, "mock_portfolio", "evaluated", "INTEGER DEFAULT 0")
         conn.commit()
     if get_weight_history().empty:
         save_weights(DEFAULT_WEIGHTS, note="initial defaults")
@@ -690,10 +760,17 @@ def get_latest_weights() -> dict[str, float]:
     return {f: raw[f] / total for f in FACTORS}
 
 def save_weights(weights: dict[str, float], note: str = "") -> None:
+    ts = datetime.now().isoformat(timespec="seconds")
     with get_conn() as conn:
         conn.execute(
             "INSERT INTO kpi_weights (update_date, momentum, value, technical, hype, quality, note) VALUES (?,?,?,?,?,?,?)",
-            (datetime.now().isoformat(timespec="seconds"), weights["momentum"], weights["value"], weights["technical"], weights["hype"], weights["quality"], note),
+            (ts, weights["momentum"], weights["value"], weights["technical"], weights["hype"], weights["quality"], note),
+        )
+        # Mirror each factor into the long-format system_weights ledger (one row per
+        # factor per change) so the walk-forward audit can track them individually.
+        conn.executemany(
+            "INSERT INTO system_weights (timestamp, factor_name, current_weight) VALUES (?,?,?)",
+            [(ts, f, float(weights[f])) for f in FACTORS],
         )
         conn.commit()
 
@@ -1014,18 +1091,23 @@ def fetch_insider_activity(ticker: str) -> dict:
     out["available"] = (out["n_buys"] + out["n_sells"]) > 0
     return out
 
-def analyze_sell_signals(ticker: str) -> dict | None:
-    """Compose every bearish KPI into a single sell-pressure profile for one ticker."""
+def analyze_sell_signals(ticker: str, hist: pd.DataFrame | None = None) -> dict | None:
+    """Compose every bearish KPI into a single sell-pressure profile for one ticker.
+
+    `hist` lets a bulk caller pass in a pre-fetched 1y price history (from a single
+    yf.download for the whole portfolio) so we don't make a per-ticker history
+    request here. When it's None we fetch individually, as the single-ticker path does.
+    """
     ticker = (ticker or "").strip().upper()
     if not ticker:
         return None
-    hist = fetch_history(ticker, period="1y")   # 1y so SMA200 is available
+    if hist is None:
+        hist = fetch_history(ticker, period="1y")   # 1y so SMA200 is available
+        time.sleep(0.2)                              # pace only when we hit the network
     if hist is None or len(hist) < 60:
         return None
 
-    # Pace the remaining requests slightly. Hitting four Yahoo endpoints back-to-back
-    # for one ticker is a common trigger for IP-level rate limiting, so we space them.
-    time.sleep(0.2)
+    # Pace the remaining (un-bulkable) per-ticker endpoints to avoid IP-level rate limits.
     funds = fetch_fundamentals(ticker)
     time.sleep(0.2)
     analyst = fetch_analyst_signals(ticker)
@@ -1211,6 +1293,222 @@ def update_weights_from_outcomes() -> None:
     new = {f: new[f] / total for f in FACTORS}
     save_weights(new, note=f"Auto-tuned on {n} metrics (Win rate: {100 * done['outcome'].mean():.0f}%)")
 
+# ----------------------------------------------------------------------------
+# Walk-Forward Optimisation: mock portfolio + factor-attribution feedback loop
+# ----------------------------------------------------------------------------
+def save_mock_portfolio(results: list[dict]) -> None:
+    """Log today's Top-3 Growth and Top-3 Dividend picks with a full KPI snapshot.
+
+    Growth = highest 1-month momentum; Dividend = highest composite among names
+    yielding >= 1.5%. Idempotent per day: re-running a scan the same day refreshes
+    the entry for a given ticker+reason rather than duplicating it.
+    """
+    if not results:
+        return
+
+    def _val(r, k, d=float("nan")):
+        return safe_float(r.get(k), d)
+
+    growth = sorted(
+        [r for r in results if not math.isnan(_val(r, "ret_1m"))],
+        key=lambda r: _val(r, "ret_1m"), reverse=True,
+    )[:3]
+    dividend = sorted(
+        [r for r in results if not math.isnan(_val(r, "div_yield")) and r["div_yield"] >= 1.5],
+        key=lambda r: _val(r, "composite", 0.0), reverse=True,
+    )[:3]
+    picks = [(r, "Top Growth") for r in growth] + [(r, "Top Dividend") for r in dividend]
+
+    today = date.today().isoformat()
+    ts = datetime.now().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        for r, reason in picks:
+            snapshot = json.dumps({
+                "momentum": round(_val(r, "momentum", 0.0), 2),
+                "value": round(_val(r, "value", 0.0), 2),
+                "technical": round(_val(r, "technical", 0.0), 2),
+                "hype": round(_val(r, "hype_score", 0.0), 2),
+                "quality": round(_val(r, "quality", 0.0), 2),
+                "composite": round(_val(r, "composite", 0.0), 2),
+            })
+            conn.execute(
+                "DELETE FROM mock_portfolio WHERE date(timestamp)=? AND ticker=? AND reason=?",
+                (today, r["ticker"], reason),
+            )
+            conn.execute(
+                "INSERT INTO mock_portfolio (timestamp, ticker, recommendation_price, reason, kpi_snapshot, evaluated) VALUES (?,?,?,?,?,0)",
+                (ts, r["ticker"], _val(r, "price"), reason, snapshot),
+            )
+        conn.commit()
+
+def get_mock_portfolio() -> pd.DataFrame:
+    with get_conn() as conn:
+        return pd.read_sql_query(
+            "SELECT timestamp, ticker, recommendation_price, reason FROM mock_portfolio ORDER BY id DESC", conn
+        )
+
+def _bulk_history(tickers: list, period: str = "1y") -> dict:
+    """Fetch history for many tickers in ONE yf.download, returned as
+    {ticker: DataFrame} so a bulk scan reuses it instead of one request per name.
+
+    Tickers with no usable Close series (delisted, or fewer than 60 rows) are
+    omitted, so the caller falls back to an individual fetch for those. Never raises.
+    """
+    out: dict[str, pd.DataFrame] = {}
+    uniq = list(dict.fromkeys(t for t in tickers if t))
+    if yf is None or not uniq:
+        return out
+    try:
+        kwargs = dict(period=period, progress=False, threads=False,
+                      group_by="ticker", auto_adjust=True)
+        try:
+            data = yf.download(uniq, session=_YF_SESSION, **kwargs)   # reuse SSL-aware session
+        except TypeError:
+            data = yf.download(uniq, **kwargs)                        # older yfinance: no session kwarg
+    except Exception:
+        return out
+    if data is None or len(data) == 0:
+        return out
+    try:
+        if isinstance(data.columns, pd.MultiIndex):
+            # group_by="ticker" -> column level 0 = ticker, level 1 = field.
+            available = set(data.columns.get_level_values(0))
+            for t in uniq:
+                if t not in available:
+                    continue
+                frame = data[t]
+                if "Close" in frame.columns:
+                    sub = frame.dropna(subset=["Close"])
+                    if len(sub) >= 60:
+                        out[t] = sub
+        elif "Close" in data.columns and len(uniq) == 1:
+            sub = data.dropna(subset=["Close"])     # single ticker -> flat columns
+            if len(sub) >= 60:
+                out[uniq[0]] = sub
+    except Exception:
+        return out
+    return out
+
+def _bulk_latest_close(tickers: list) -> dict:
+    """Most-recent close for many tickers in ONE bulk yf.download request.
+
+    Fetching prices one ticker at a time hammered Yahoo and tripped its IP rate
+    limiter (crashing the app on Streamlit Cloud). A single `yf.download(...)` for
+    the whole list fixes that. Returns {ticker: close} with NaN for anything that
+    didn't come back, and never raises.
+    """
+    out = {t: float("nan") for t in tickers}
+    uniq = list(dict.fromkeys(tickers))
+    if yf is None or not uniq:
+        return out
+    try:
+        kwargs = dict(period="1d", progress=False, threads=False)
+        try:
+            data = yf.download(uniq, session=_YF_SESSION, **kwargs)   # reuse SSL-aware session
+        except TypeError:
+            data = yf.download(uniq, **kwargs)                        # older yfinance: no session kwarg
+    except Exception:
+        return out
+    if data is None or len(data) == 0:
+        return out
+    try:
+        if isinstance(data.columns, pd.MultiIndex):
+            # Multi-ticker frame: column level 0 = field, level 1 = ticker.
+            close = data["Close"].dropna(how="all")
+            if not close.empty:
+                last = close.iloc[-1]
+                for t in uniq:
+                    if t in last.index:
+                        out[t] = safe_float(last[t])
+        else:
+            # Single-ticker frame: flat columns, 'Close' is a Series.
+            series = data["Close"].dropna()
+            if not series.empty and len(uniq) == 1:
+                out[uniq[0]] = safe_float(series.iloc[-1])
+    except Exception:
+        return out
+    return out
+
+def walk_forward_update() -> int:
+    """Walk-forward optimiser driven by the mock_portfolio KPI snapshots.
+
+    For each logged pick that has matured (>= EVAL_HORIZON_DAYS old) and hasn't yet
+    been scored, compute its benchmark-relative forward return, then attribute that
+    outcome to the KPI profile it was picked on: factors that scored highly on
+    winners get nudged UP, factors that scored highly on losers get nudged DOWN
+    (so e.g. Value rises if value-heavy picks are beating their market). The new
+    weights are persisted via save_weights — meaning they drive scoring through
+    score_with_weights AND land in the system_weights ledger. Each pick is flagged
+    evaluated so it contributes exactly once. Returns the count newly evaluated.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, timestamp, ticker, recommendation_price, kpi_snapshot FROM mock_portfolio WHERE evaluated=0"
+        ).fetchall()
+    if not rows:
+        return 0
+
+    cutoff = date.today() - timedelta(days=EVAL_HORIZON_DAYS)
+    bench_cache: dict[str, pd.DataFrame | None] = {}
+    def bench_hist(sym: str) -> pd.DataFrame | None:
+        if sym not in bench_cache:
+            bench_cache[sym] = fetch_history(sym, period="1y")
+        return bench_cache[sym]
+    def _close_on_or_after(h: pd.DataFrame | None, when) -> float:
+        if h is None or h.empty: return float("nan")
+        sub = h[h.index.tz_localize(None) >= pd.Timestamp(when)]
+        return safe_float(sub["Close"].iloc[0]) if not sub.empty else float("nan")
+
+    grad = {f: 0.0 for f in FACTORS}
+    evaluated_ids, n = [], 0
+    for row in rows:
+        rec_dt = pd.to_datetime(row["timestamp"], errors="coerce")
+        if pd.isna(rec_dt) or rec_dt.date() > cutoff:
+            continue   # not matured yet — leave unflagged so it's re-checked later
+        try:
+            snap = json.loads(row["kpi_snapshot"] or "{}")
+        except Exception:
+            snap = {}
+        hist = fetch_history(row["ticker"], period="1y")
+        if hist is None:
+            continue
+        target = rec_dt + timedelta(days=EVAL_HORIZON_DAYS)
+        future = hist[hist.index.tz_localize(None) >= pd.Timestamp(target)]
+        if future.empty:
+            continue
+        price_after = safe_float(future["Close"].iloc[0])
+        price_then = safe_float(row["recommendation_price"])
+        if math.isnan(price_after) or math.isnan(price_then) or price_then <= 0:
+            continue
+        stock_ret = price_after / price_then - 1.0
+
+        bh = bench_hist(benchmark_for(row["ticker"]))
+        b_then = _close_on_or_after(bh, rec_dt)
+        b_after = _close_on_or_after(bh, target)
+        if not math.isnan(b_then) and not math.isnan(b_after) and b_then > 0:
+            win = stock_ret > (b_after / b_then - 1.0)   # beat its home market
+        else:
+            win = stock_ret > 0                          # fallback: absolute return
+        direction = 1.0 if win else -1.0
+        for f in FACTORS:
+            grad[f] += direction * (safe_float(snap.get(f), 50.0) / 100.0 - 0.5)
+        evaluated_ids.append(int(row["id"]))
+        n += 1
+
+    if n == 0:
+        return 0
+
+    weights = get_latest_weights()
+    new = {f: max(MIN_WEIGHT, weights[f] + LEARNING_RATE * grad[f] / n) for f in FACTORS}
+    total = sum(new.values())
+    new = {f: new[f] / total for f in FACTORS}
+    save_weights(new, note=f"Walk-forward update on {n} matured mock-portfolio pick(s)")
+
+    with get_conn() as conn:
+        conn.executemany("UPDATE mock_portfolio SET evaluated=1 WHERE id=?", [(i,) for i in evaluated_ids])
+        conn.commit()
+    return n
+
 def seed_demo_history() -> None:
     rng = np.random.default_rng(42)
     with get_conn() as conn:
@@ -1233,16 +1531,19 @@ def seed_demo_history() -> None:
         tot = sum(w.values())
         save_weights({f: w[f] / tot for f in FACTORS}, note="Demo backfill loop simulation")
 
-def run_engine(limit_per_region: int | None = None) -> tuple[list[dict], list[str]]:
+def run_engine(limit_per_region: int | None = None,
+               regions: list | None = None) -> tuple[list[dict], list[str]]:
     weights = get_latest_weights()
     results, failed = [], []
 
-    # On a quick scan, only take the first N tickers per region. Fewer requests
-    # means a faster run, lighter memory use, and a much lower chance of Yahoo
-    # rate-limiting the server's IP (a frequent issue on Streamlit Cloud).
+    # Only scan the regions the user selected (defaults to all). On a quick scan,
+    # also cap to the first N tickers per region — fewer requests means a faster
+    # run and a much lower chance of Yahoo rate-limiting the server's IP.
+    selected = regions if regions else list(TICKER_UNIVERSE.keys())
     universe = {
         region: (ticks[:limit_per_region] if limit_per_region else ticks)
         for region, ticks in TICKER_UNIVERSE.items()
+        if region in selected
     }
 
     # Pull WallStreetBets mention counts ONCE for the whole scan (a single RSS
@@ -1274,6 +1575,12 @@ def run_engine(limit_per_region: int | None = None) -> tuple[list[dict], list[st
             progress.progress(current_index / total_symbols, text=tr("processing", ticker=t, region=region_name(region)))
     progress.empty()
     results.sort(key=lambda r: r["composite"], reverse=True)
+    # Log today's curated Top-3 Growth / Top-3 Dividend picks for the walk-forward
+    # loop. Wrapped so a logging hiccup can never sink an otherwise-successful scan.
+    try:
+        save_mock_portfolio(results)
+    except Exception:
+        pass
     return results, failed
 
 # ----------------------------------------------------------------------------
@@ -1310,14 +1617,14 @@ def render_category_views(results: list[dict]) -> None:
         st.markdown(f"### {tr('growth_header_text')}")
         growth_df = df.sort_values(by="ret_1m", ascending=False).head(5).copy()
         growth_df["region"] = growth_df["region"].map(region_name)
-        st.dataframe(growth_df[["ticker", "name", "region", "price", "ret_1m", "composite"]].rename(columns={"ticker": tr("col_ticker"), "name": tr("col_company"), "region": tr("col_region"), "price": tr("col_price"), "ret_1m": tr("col_momentum_1m"), "composite": tr("col_overall_score")}), use_container_width=True, hide_index=True)
+        st.dataframe(growth_df[["ticker", "name", "region", "price", "ret_1m", "composite"]].rename(columns={"ticker": tr("col_ticker"), "name": tr("col_company"), "region": tr("col_region"), "price": tr("col_price"), "ret_1m": tr("col_momentum_1m"), "composite": tr("col_overall_score")}), width="stretch", hide_index=True)
 
     with v2:
         st.markdown(f"### {tr('dividend_header_text')}")
         div_df = df[df["div_yield"] >= 1.5].sort_values(by="composite", ascending=False).head(5).copy()
         if not div_df.empty:
             div_df["region"] = div_df["region"].map(region_name)
-            st.dataframe(div_df[["ticker", "name", "region", "price", "div_yield", "composite"]].rename(columns={"ticker": tr("col_ticker"), "name": tr("col_company"), "region": tr("col_region"), "price": tr("col_price"), "div_yield": tr("col_dividend_return"), "composite": tr("col_overall_score")}), use_container_width=True, hide_index=True)
+            st.dataframe(div_df[["ticker", "name", "region", "price", "div_yield", "composite"]].rename(columns={"ticker": tr("col_ticker"), "name": tr("col_company"), "region": tr("col_region"), "price": tr("col_price"), "div_yield": tr("col_dividend_return"), "composite": tr("col_overall_score")}), width="stretch", hide_index=True)
         else:
             st.info(tr("no_dividend_match"))
 
@@ -1363,7 +1670,7 @@ def render_deep_dive(results: list[dict]) -> None:
     st.caption(tr("wsb_caption"))
     st.caption(tr(f"wsb_source_{_LAST_REDDIT_SOURCE}"))
 
-def render_engine_audit() -> None:
+def render_engine_audit(update_prices: bool = True) -> None:
     st.markdown(f"### {tr('audit_header_text')}")
     st.caption(tr("persistence_note"))
     st.caption(tr("benchmark_note"))
@@ -1392,30 +1699,55 @@ def render_engine_audit() -> None:
         plot = wh.set_index("update_date")[FACTORS]
         st.line_chart(plot)
 
+    # --- Historical Performance: live return of every logged mock-portfolio pick ---
+    st.markdown(f"#### {tr('historical_performance')}")
+    mp = get_mock_portfolio()
+    if mp.empty:
+        st.caption(tr("no_portfolio_picks"))
+        return
+    mp = mp.head(40)
+    uniq = list(mp["ticker"].unique())
+    if update_prices:
+        # SINGLE bulk request for every unique ticker — replaces the per-ticker
+        # fetch storm that was tripping Yahoo's rate limiter and crashing the app.
+        prices = _bulk_latest_close(uniq)
+    else:
+        prices = {t: float("nan") for t in uniq}   # checkbox off -> leave prices blank
+    mp["current"] = mp["ticker"].map(prices)
+    mp["return_pct"] = (mp["current"] / mp["recommendation_price"] - 1.0) * 100.0
+    mp["date"] = pd.to_datetime(mp["timestamp"], errors="coerce").dt.date.astype(str)
+    reason_map = {"Top Growth": tr("reason_growth"), "Top Dividend": tr("reason_dividend")}
+    mp["reason"] = mp["reason"].map(lambda x: reason_map.get(x, x))
+
+    ret_col = tr("col_return_pct")
+    rec_col, cur_col = tr("col_rec_price"), tr("col_current_price")
+    disp = mp[["date", "ticker", "reason", "recommendation_price", "current", "return_pct"]].rename(columns={
+        "date": tr("col_date"), "ticker": tr("col_ticker"), "reason": tr("col_reason"),
+        "recommendation_price": rec_col, "current": cur_col, "return_pct": ret_col,
+    })
+
+    def _style_returns(series):
+        styles = []
+        for v in series:
+            if pd.isna(v): styles.append("")
+            elif v >= 0: styles.append("color: #16a34a; font-weight: 600;")  # green winner
+            else: styles.append("color: #dc2626; font-weight: 600;")          # red loser
+        return styles
+
+    styled = (disp.style
+              .apply(_style_returns, subset=[ret_col])
+              .format({rec_col: "{:,.2f}", cur_col: "{:,.2f}", ret_col: "{:+.2f}%"}, na_rep="—"))
+    st.dataframe(styled, width="stretch", hide_index=True)
+    st.caption(tr("historical_perf_note"))
+    if not update_prices:
+        st.caption(tr("prices_skipped"))
+
 def _sell_pill(verdict: str) -> str:
     cls = {"high": "qc-sell", "mixed": "qc-hold", "low": "qc-buy"}.get(verdict, "qc-hold")
     return f'<span class="qc-pill {cls}">{tr(f"sell_verdict_{verdict}")}</span>'
 
-def render_sell_signals() -> None:
-    st.markdown(f"### {tr('sell_header')}")
-    st.caption(tr("sell_disclaimer"))
-
-    col_in, col_btn = st.columns([3, 1])
-    typed = col_in.text_input(tr("sell_input_label"), key="sell_ticker_input", placeholder="AAPL")
-    col_btn.button(tr("sell_btn"), use_container_width=True)   # affordance; Enter also submits
-
-    target = (typed or "").strip().upper()
-    if not target:
-        st.info(tr("sell_need_input"))
-        return
-
-    with st.spinner(tr("sell_spinner", ticker=target)):
-        data = analyze_sell_signals(target)
-
-    if data is None:
-        st.warning(tr("sell_no_data", ticker=target))
-        return
-
+def _render_sell_detail(data: dict) -> None:
+    """Full single-ticker sell breakdown (reused by the optional drill-down)."""
     cur = (data["currency"] + " ") if data["currency"] else ""
     comp_txt = "—" if math.isnan(data["composite"]) else f"{data['composite']:.0f}/100"
     price_txt = "—" if math.isnan(data["price"]) else f"{cur}{data['price']:,.2f}"
@@ -1425,7 +1757,6 @@ def render_sell_signals() -> None:
         f'<br><span class="qc-sub">{data["name"]}</span></div>',
         unsafe_allow_html=True,
     )
-    # For sell pressure, LOW is the "good/green" reading, so positive=True when low.
     c[1].markdown(metric_card(tr("sell_pressure"), comp_txt,
                               positive=(not math.isnan(data["composite"]) and data["composite"] < SELL_LOW)),
                   unsafe_allow_html=True)
@@ -1441,7 +1772,7 @@ def render_sell_signals() -> None:
         tr("col_signal"): "—" if s is None else f"{s:.0f}",
         tr("col_reading"): detail,
     } for k, s, detail in data["signals"]]
-    st.dataframe(pd.DataFrame(readings), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(readings), width="stretch", hide_index=True)
 
     st.markdown(f"#### {tr('sell_recent_downgrades')}")
     if data["changes"]:
@@ -1449,7 +1780,7 @@ def render_sell_signals() -> None:
             "date": tr("col_date"), "firm": tr("col_firm"),
             "from": tr("col_from"), "to": tr("col_to"), "action": tr("col_action"),
         })
-        st.dataframe(cdf, use_container_width=True, hide_index=True)
+        st.dataframe(cdf, width="stretch", hide_index=True)
     else:
         st.caption(tr("sell_no_analyst"))
 
@@ -1460,9 +1791,104 @@ def render_sell_signals() -> None:
             "date": tr("col_date"), "insider": tr("col_insider"),
             "transaction": tr("col_transaction"), "shares": tr("col_shares"), "value": tr("col_value"),
         })
-        st.dataframe(idf, use_container_width=True, hide_index=True)
+        st.dataframe(idf, width="stretch", hide_index=True)
     else:
         st.caption(tr("sell_no_insider"))
+
+def _parse_portfolio_input(pasted: str, uploaded) -> list:
+    """Build a deduped ticker list from a comma/space/newline text area and/or a CSV
+    whose 'Ticker' or 'Symbol' column (case-insensitive) holds the symbols."""
+    tickers = []
+    if pasted:
+        tickers += [s.strip().upper() for s in re.split(r"[,\n;\s]+", pasted) if s.strip()]
+    if uploaded is not None:
+        try:
+            cdf = pd.read_csv(uploaded)
+            col = next((c for c in cdf.columns if str(c).strip().lower() in ("ticker", "symbol")), None)
+            if col is None:
+                st.warning(tr("sell_csv_nocol"))
+            else:
+                tickers += [str(x).strip().upper() for x in cdf[col].dropna().tolist() if str(x).strip()]
+        except Exception:
+            st.warning(tr("sell_csv_error"))
+    return list(dict.fromkeys(t for t in tickers if t))   # dedupe, preserve order
+
+def render_sell_signals() -> None:
+    st.markdown(f"### {tr('sell_header')}")
+    st.caption(tr("sell_disclaimer"))
+    st.caption(tr("sell_privacy_note"))
+
+    pasted = st.text_area(tr("sell_paste_label"), key="sell_paste", placeholder="AAPL, MSFT, NVDA")
+    uploaded = st.file_uploader(tr("sell_upload_label"), type=["csv"], key="sell_csv")
+
+    tickers = _parse_portfolio_input(pasted, uploaded)
+    if tickers:
+        # Stored in session_state only — never written to the SQLite DB — so each
+        # user's portfolio stays private in a shared/multi-user deployment.
+        st.session_state["portfolio_tickers"] = tickers
+
+    portfolio = st.session_state.get("portfolio_tickers", [])
+    if portfolio:
+        preview = ", ".join(portfolio[:20]) + (" …" if len(portfolio) > 20 else "")
+        st.caption(tr("sell_loaded", n=len(portfolio), tickers=preview))
+
+    if st.button(tr("sell_scan_btn"), width="stretch", disabled=not portfolio):
+        rows = []
+        # OPTIMISATION: one bulk yf.download for every name's history up front, so
+        # the per-ticker loop reuses it instead of making a history request each.
+        with st.spinner(tr("sell_bulk_fetch", total=len(portfolio))):
+            histories = _bulk_history(portfolio, period="1y")
+        prog = st.progress(0.0, text=tr("sell_scan_progress", done=0, total=len(portfolio)))
+        for i, tk in enumerate(portfolio, start=1):
+            try:
+                data = analyze_sell_signals(tk, hist=histories.get(tk))
+            except Exception:
+                data = None
+            if data is not None:
+                rows.append({"ticker": data["ticker"], "price": data["price"],
+                             "composite": data["composite"],
+                             "verdict": tr(f"sell_verdict_{data['verdict']}")})
+            else:
+                rows.append({"ticker": tk, "price": float("nan"),
+                             "composite": float("nan"), "verdict": tr("sell_verdict_na")})
+            prog.progress(i / len(portfolio), text=tr("sell_scan_progress", done=i, total=len(portfolio)))
+        prog.empty()
+        st.session_state["portfolio_results"] = rows
+
+    results = st.session_state.get("portfolio_results", [])
+    if not results:
+        st.info(tr("sell_need_portfolio"))
+        return
+
+    rdf = pd.DataFrame(results).sort_values(by="composite", ascending=False, na_position="last")
+    comp_col, price_col = tr("sell_pressure"), tr("col_current_price")
+    verdict_col, tick_col = tr("col_verdict"), tr("col_ticker")
+    disp = rdf.rename(columns={"ticker": tick_col, "price": price_col, "composite": comp_col, "verdict": verdict_col})
+
+    def _style_pressure(series):
+        out = []
+        for v in series:
+            if pd.isna(v): out.append("")
+            elif v >= SELL_HIGH: out.append("color: #dc2626; font-weight: 600;")   # elevated -> red
+            elif v < SELL_LOW: out.append("color: #16a34a; font-weight: 600;")      # low -> green
+            else: out.append("color: #d97706; font-weight: 600;")                   # mixed -> amber
+        return out
+
+    styled = (disp.style.apply(_style_pressure, subset=[comp_col])
+              .format({price_col: "{:,.2f}", comp_col: "{:.0f}"}, na_rep="—"))
+    st.dataframe(styled, width="stretch", hide_index=True)
+
+    # Optional drill-down: full breakdown for any one scanned ticker.
+    with st.expander(tr("sell_detail_expander")):
+        choices = [r["ticker"] for r in results]
+        sel = st.selectbox(tr("sell_detail_select"), choices, key="sell_detail_pick")
+        if sel:
+            with st.spinner(tr("sell_spinner", ticker=sel)):
+                detail = analyze_sell_signals(sel)
+            if detail is None:
+                st.warning(tr("sell_no_data", ticker=sel))
+            else:
+                _render_sell_detail(detail)
 
 # ----------------------------------------------------------------------------
 # Main Application Controller Setup
@@ -1474,6 +1900,9 @@ def main() -> None:
     # Auto Execution of background performance auditor calculations
     try: evaluate_pending()
     except Exception: pass
+    # Walk-forward optimiser: re-tunes factor weights from matured mock-portfolio picks.
+    try: walk_forward_update()
+    except Exception: pass
 
     # Sidebar Interface Controller Layout 
     # Language menu first, so changing it re-renders the whole UI in the chosen language.
@@ -1481,20 +1910,27 @@ def main() -> None:
     st.session_state["lang"] = LANGUAGES[lang_choice]
 
     st.sidebar.title(tr("console_title"))
+    region_keys = list(TICKER_UNIVERSE.keys())
+    selected_regions = st.sidebar.multiselect(tr("regions_to_scan"), region_keys,
+                                              default=region_keys, format_func=region_name)
     quick_scan = st.sidebar.toggle(tr("scan_quick_toggle"), value=True, help=tr("scan_quick_help"))
-    if st.sidebar.button(tr("scan_btn"), use_container_width=True):
-        with st.spinner(tr("scan_spinner")):
-            limit = 6 if quick_scan else None
-            res, fail = run_engine(limit_per_region=limit)
-            st.session_state["results"], st.session_state["failed"] = res, fail
-        if res:
-            st.success(tr("scan_success"))
-        elif fail:
-            # Nothing came back and tickers failed → almost always an IP-level
-            # rate limit from Yahoo, which is common on Streamlit Cloud.
-            st.error(tr("all_failed"))
+    update_prices = st.sidebar.checkbox(tr("update_hist_prices"), value=True)
+    if st.sidebar.button(tr("scan_btn"), width="stretch"):
+        if not selected_regions:
+            st.sidebar.warning(tr("no_region_selected"))
+        else:
+            with st.spinner(tr("scan_spinner")):
+                limit = 6 if quick_scan else None
+                res, fail = run_engine(limit_per_region=limit, regions=selected_regions)
+                st.session_state["results"], st.session_state["failed"] = res, fail
+            if res:
+                st.success(tr("scan_success"))
+            elif fail:
+                # Nothing came back and tickers failed → almost always an IP-level
+                # rate limit from Yahoo, which is common on Streamlit Cloud.
+                st.error(tr("all_failed"))
 
-    if st.sidebar.button(tr("seed_btn"), use_container_width=True):
+    if st.sidebar.button(tr("seed_btn"), width="stretch"):
         seed_demo_history()
         st.sidebar.success(tr("seed_success"))
         st.rerun()
@@ -1513,7 +1949,7 @@ def main() -> None:
     with t2: render_global_sectors(results)
     with t3: render_category_views(results)
     with t4: render_deep_dive(results)
-    with t5: render_engine_audit()
+    with t5: render_engine_audit(update_prices)
     with t6: render_sell_signals()
 
 if __name__ == "__main__":
