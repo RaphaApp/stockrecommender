@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta
 import numpy as np
 import pandas as pd
 import streamlit as st
+import altair as alt
 
 try:
     import yfinance as yf
@@ -197,6 +198,101 @@ def fetch_reddit_hype(tickers: list) -> dict:
         _LAST_REDDIT_SOURCE = "offline"
         return {t: 0 for t in tickers}
 
+# ----------------------------------------------------------------------------
+# Pluggable, per-market sentiment sources
+# ----------------------------------------------------------------------------
+# Each source declares which MARKETS (TICKER_UNIVERSE region keys) it covers and a
+# fetch fn (tickers, names) -> {ticker: mention_count}. The orchestrator routes each
+# market to the sources that cover it and merges the counts. Reddit handles English
+# names; GDELT's multilingual news index reaches Japanese & Chinese coverage Reddit
+# never sees. The market routing lives here in code (not in the UI), so the blend
+# stays private while the sidebar still lets a user toggle whole sources on/off.
+_LAST_GDELT_STATUS = "offline"
+
+def _sentiment_reddit(tickers: list, names: dict) -> dict:
+    """Reddit r/wallstreetbets mention counts (English/US retail buzz)."""
+    return fetch_reddit_hype(tickers)
+
+def _sentiment_gdelt(tickers: list, names: dict) -> dict:
+    """News-volume buzz per company from GDELT's free DOC API (no API key needed).
+
+    Batches the company names into short OR-queries (one request per ~12 names),
+    aggregates the returned article titles, and counts each name — the same blob-
+    and-count approach as Reddit, but over a 100+ language global news index, so it
+    reaches the Japanese and Chinese coverage Reddit lacks. Fully fail-safe: any
+    network/parse error returns zero mentions. Title matching is on the English name,
+    so native-language-only articles are under-counted (a known, acceptable limit).
+    """
+    global _LAST_GDELT_STATUS
+    counts = {t: 0 for t in tickers}
+    items = [(t, names.get(t, t)) for t in tickers if names.get(t, t)]
+    ua = _get_secret("REDDIT_USER_AGENT", "stockrec-hype/1.0")
+    got_any = False
+    try:
+        for i in range(0, len(items), 12):
+            chunk = items[i:i + 12]
+            or_terms = " OR ".join(f'"{nm}"' for _, nm in chunk)
+            url = ("https://api.gdeltproject.org/api/v2/doc/doc?query="
+                   + urllib.parse.quote(f"({or_terms})")
+                   + "&mode=artlist&format=json&timespan=3d&maxrecords=250&sort=hybridrel")
+            raw = _reddit_get(url, {"User-Agent": ua})
+            try:
+                arts = json.loads(raw).get("articles", [])
+            except Exception:
+                arts = []
+            if arts:
+                got_any = True
+            blob = " ".join(str(a.get("title", "")) for a in arts).upper()
+            for tkr, nm in chunk:
+                counts[tkr] += len(re.findall(r"\b" + re.escape(nm.upper()) + r"\b", blob))
+            time.sleep(0.5)   # GDELT asks for gentle pacing between requests
+        _LAST_GDELT_STATUS = "ok" if got_any else "offline"
+        return counts
+    except Exception:
+        _LAST_GDELT_STATUS = "offline"
+        return {t: 0 for t in tickers}
+
+SENTIMENT_SOURCES = {
+    "reddit": {"label_key": "src_reddit", "markets": {"USA", "Europe"},
+               "fn": _sentiment_reddit},
+    "gdelt":  {"label_key": "src_gdelt",  "markets": {"USA", "Japan", "Europe", "China"},
+               "fn": _sentiment_gdelt},
+}
+DEFAULT_SOURCES = list(SENTIMENT_SOURCES.keys())
+
+# Human-readable summary of what the last hype scan actually used, for the UI.
+_LAST_HYPE_STATUS = ""
+
+def fetch_hype_signals(universe: dict, enabled_sources: list | None = None) -> dict:
+    """Run every enabled sentiment source over the markets it covers and merge the
+    per-ticker mention counts. Returns {ticker: combined_count}; analyze_ticker turns
+    that into the capped hype bonus. Each source is independently fail-safe."""
+    global _LAST_HYPE_STATUS
+    enabled = enabled_sources if enabled_sources is not None else DEFAULT_SOURCES
+    combined = {t: 0 for ticks in universe.values() for t in ticks}
+    status_parts = []
+    for key in enabled:
+        src = SENTIMENT_SOURCES.get(key)
+        if not src:
+            continue
+        sub = [t for region, ticks in universe.items() if region in src["markets"] for t in ticks]
+        if not sub:
+            continue
+        names = {t: COMPANY_NAMES.get(t, t) for t in sub}
+        try:
+            res = src["fn"](sub, names) or {}
+        except Exception:
+            res = {}
+        for t, c in res.items():
+            combined[t] = combined.get(t, 0) + int(c or 0)
+        if key == "reddit":
+            status_parts.append(f"{tr('src_reddit')}: {tr('hype_status_' + _LAST_REDDIT_SOURCE)}")
+        elif key == "gdelt":
+            status_parts.append(f"{tr('src_gdelt')}: {tr('hype_status_' + _LAST_GDELT_STATUS)}")
+    _LAST_HYPE_STATUS = (tr("hype_sources_prefix") + " " + " · ".join(status_parts)) if status_parts else ""
+    return combined
+
+
 
 
 # ----------------------------------------------------------------------------
@@ -237,6 +333,29 @@ TICKER_UNIVERSE = {
 }
 ALL_TICKERS = [ticker for region in TICKER_UNIVERSE.values() for ticker in region]
 
+# Plain-English company names, used by news-based sentiment sources (a ticker like
+# "7203.T" never appears in an article, but "Toyota" does). Edit here to tune what
+# the news scan searches for. Falls back to the ticker itself if a name is missing.
+COMPANY_NAMES = {
+    "AAPL": "Apple", "MSFT": "Microsoft", "NVDA": "Nvidia", "AMZN": "Amazon",
+    "GOOGL": "Alphabet", "TSLA": "Tesla", "META": "Meta Platforms", "JPM": "JPMorgan",
+    "V": "Visa", "WMT": "Walmart", "JNJ": "Johnson & Johnson", "PG": "Procter & Gamble",
+    "XOM": "Exxon Mobil", "KO": "Coca-Cola", "DIS": "Disney", "NFLX": "Netflix",
+    "AMD": "AMD", "BAC": "Bank of America", "PFE": "Pfizer", "CSCO": "Cisco",
+    "MRK": "Merck", "HD": "Home Depot",
+    "7203.T": "Toyota", "6758.T": "Sony", "9984.T": "SoftBank", "6501.T": "Hitachi",
+    "7751.T": "Canon", "8306.T": "Mitsubishi UFJ", "9432.T": "NTT", "6902.T": "Denso",
+    "4063.T": "Shin-Etsu Chemical", "8035.T": "Tokyo Electron", "7267.T": "Honda",
+    "6098.T": "Recruit Holdings", "9433.T": "KDDI", "6954.T": "Fanuc", "8058.T": "Mitsubishi Corp",
+    "ASML": "ASML", "MC.PA": "LVMH", "VOW3.DE": "Volkswagen", "SAP": "SAP",
+    "OR.PA": "L'Oreal", "SIE.DE": "Siemens", "AIR.PA": "Airbus", "ALV.DE": "Allianz",
+    "BMW.DE": "BMW", "BAS.DE": "BASF", "SU.PA": "Schneider Electric",
+    "DTE.DE": "Deutsche Telekom", "AI.PA": "Air Liquide", "RMS.PA": "Hermes",
+    "0700.HK": "Tencent", "9988.HK": "Alibaba", "BABA": "Alibaba", "JD": "JD.com",
+    "BIDU": "Baidu", "1810.HK": "Xiaomi", "3690.HK": "Meituan", "PDD": "Pinduoduo",
+    "NIO": "NIO", "2318.HK": "Ping An", "0939.HK": "China Construction Bank", "1299.HK": "AIA",
+}
+
 # Benchmark index per home market for the walk-forward evaluator. A pick is judged
 # against the index of the exchange it actually trades on (keyed by ticker suffix),
 # so a Tokyo-listed name is measured against the Nikkei rather than the S&P 500.
@@ -244,6 +363,16 @@ ALL_TICKERS = [ticker for region in TICKER_UNIVERSE.values() for ticker in regio
 # no suffix (e.g. BABA, ASML) is benchmarked against SPY, matching its currency and
 # trading calendar. To change a mapping, edit this one dict. Anything not listed
 # falls back to DEFAULT_BENCHMARK.
+#
+# KNOWN ASYMMETRY (accepted): stock returns are dividend-inclusive (auto_adjust=True),
+# but most of these benchmarks are PRICE indices (^N225/^HSI/^FCHI/000300.SS/etc.),
+# while SPY is a dividend-paying ETF (total-return when adjusted) and ^GDAXI is itself
+# a total-return index. So a dividend-paying non-US/non-DE stock is judged slightly
+# generously vs a price-only index. Over the 14-day EVAL_HORIZON_DAYS window the
+# accrued dividend is ~0.1-0.2%, so the bias is marginal; the correct symmetric fix
+# would need total-return indices in each LOCAL currency, which aren't freely
+# available for JP/CN (USD ETFs like EWJ would trade this small bias for a worse
+# currency mismatch), so we accept it rather than introduce that error.
 BENCHMARKS = {
     "":   "SPY",        # US / NYSE / NASDAQ (no suffix)  -> S&P 500 ETF
     "T":  "^N225",      # Tokyo                           -> Nikkei 225
@@ -356,6 +485,16 @@ TRANSLATIONS = {
         "reason_growth": "Top Growth",
         "reason_dividend": "Top Dividend",
         "regions_to_scan": "Regions to Scan",
+        "sentiment_sources": "Sentiment Sources",
+        "src_reddit": "Reddit (r/wallstreetbets)",
+        "src_gdelt": "Global News (GDELT)",
+        "hype_buzz_label": "Social & News Buzz (mentions)",
+        "hype_buzz_caption": "Combined mentions of this stock across the enabled sentiment sources during the last scan (feeds the Hype factor).",
+        "hype_sources_prefix": "Buzz sources —",
+        "hype_status_authenticated": "Reddit API ✓",
+        "hype_status_rss": "RSS feed",
+        "hype_status_ok": "live ✓",
+        "hype_status_offline": "offline (0)",
         "update_hist_prices": "Update Historical Portfolio Prices",
         "no_region_selected": "Select at least one region to scan.",
         "prices_skipped": "Live price update is off — current prices and returns are left blank. Tick 'Update Historical Portfolio Prices' to refresh.",
@@ -503,6 +642,16 @@ TRANSLATIONS = {
         "reason_growth": "成長株トップ",
         "reason_dividend": "高配当トップ",
         "regions_to_scan": "スキャンする地域",
+        "sentiment_sources": "センチメント・ソース",
+        "src_reddit": "Reddit（r/wallstreetbets）",
+        "src_gdelt": "グローバルニュース（GDELT）",
+        "hype_buzz_label": "ソーシャル・ニュース言及数",
+        "hype_buzz_caption": "直近のスキャン時に、有効化したセンチメント・ソース全体でこの銘柄が言及された合計回数（ハイプ・ファクターに反映されます）。",
+        "hype_sources_prefix": "バズの取得元 —",
+        "hype_status_authenticated": "Reddit API ✓",
+        "hype_status_rss": "RSSフィード",
+        "hype_status_ok": "ライブ ✓",
+        "hype_status_offline": "オフライン (0)",
         "update_hist_prices": "履歴ポートフォリオの株価を更新",
         "no_region_selected": "スキャンする地域を1つ以上選択してください。",
         "prices_skipped": "ライブ株価の更新はオフです。現在株価とリターンは空欄です。「履歴ポートフォリオの株価を更新」をオンにすると更新されます。",
@@ -695,8 +844,17 @@ def fmt_big(v: float) -> str:
 # Database layer
 # ----------------------------------------------------------------------------
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # check_same_thread=False because Streamlit serves reruns on a pool of threads;
+    # timeout gives writers up to 10s to wait out a lock instead of erroring out;
+    # WAL journaling lets reads and a writer proceed concurrently, which together
+    # prevent the 'database is locked' OperationalError under multi-session load.
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10.0)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+    except sqlite3.Error:
+        pass   # some network filesystems reject WAL; fall back to default journaling
     return conn
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str,
@@ -742,6 +900,8 @@ def init_db() -> None:
         _ensure_column(conn, "kpi_weights", "quality")
         # Bookkeeping flag so each logged pick feeds the walk-forward loop once.
         _ensure_column(conn, "mock_portfolio", "evaluated", "INTEGER DEFAULT 0")
+        # Company name stored alongside the ticker for a friendlier audit table.
+        _ensure_column(conn, "mock_portfolio", "name", "TEXT")
         conn.commit()
     if get_weight_history().empty:
         save_weights(DEFAULT_WEIGHTS, note="initial defaults")
@@ -826,27 +986,42 @@ def get_recommendations() -> pd.DataFrame:
 # Quantitative Math & Indicators
 # ----------------------------------------------------------------------------
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_history(ticker: str, period: str = "8mo") -> pd.DataFrame | None:
-    """Fetch OHLCV with retry/backoff so a throttled burst doesn't wipe a scan."""
+def fetch_history(ticker: str, period: str = "8mo") -> pd.DataFrame:
+    """Fetch OHLCV with retry/backoff so a throttled burst doesn't wipe a scan.
+
+    RAISES RuntimeError when nothing comes back after the retries. @st.cache_data
+    never caches an exception, so a transient throttle is retried next call instead
+    of being frozen as a permanent None for the whole TTL. Callers that loop over
+    many tickers wrap this in try/except and skip the offending name.
+    """
     if yf is None:
-        return None
+        raise RuntimeError("yfinance unavailable")
+    last_err = None
     for attempt in range(3):
         try:
             df = _ticker(ticker).history(period=period, auto_adjust=True)
             if df is not None and not df.empty and "Close" in df.columns:
                 return df.dropna(subset=["Close"])
-        except Exception:
-            pass
+        except Exception as e:
+            last_err = e
         time.sleep(1.2 * (attempt + 1))   # back off, then retry
-    return None
+    raise RuntimeError(f"no price history for {ticker} after retries") from last_err
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_fundamentals(ticker: str) -> dict:
     out = {"pe": float("nan"), "div_yield": float("nan"), "market_cap": float("nan"),
            "roe": float("nan"), "short_pct": float("nan"), "name": ticker}
     if yf is None: return out
-    try: info = _ticker(ticker).info or {}
-    except Exception: return out
+    # Distinguish a transient failure (rate-limit / network) from a reachable ticker
+    # that simply lacks some fields. On the former we RAISE — @st.cache_data never
+    # caches an exception, so the broken state isn't frozen for the whole TTL and the
+    # next scan retries. Field-level gaps stay as NaN and cache normally.
+    try:
+        info = _ticker(ticker).info
+    except Exception as e:
+        raise RuntimeError(f"fundamentals fetch failed for {ticker} (likely rate-limited)") from e
+    if not info:
+        raise RuntimeError(f"empty fundamentals for {ticker} (likely rate-limited)")
     out["pe"] = safe_float(info.get("trailingPE"))
     out["market_cap"] = safe_float(info.get("marketCap"))
     out["name"] = str(info.get("shortName") or info.get("longName") or ticker)
@@ -918,7 +1093,7 @@ def compute_hype(volume: pd.Series) -> dict:
 
 def clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float: return max(lo, min(hi, v))
 
-def analyze_ticker(ticker: str, region: str, reddit_mentions: int = 0) -> dict | None:
+def analyze_ticker(ticker: str, region: str, hype_mentions: int = 0) -> dict | None:
     hist = fetch_history(ticker)
     if hist is None or len(hist) < 60: return None
     close, volume = hist["Close"], hist.get("Volume", pd.Series(dtype=float))
@@ -952,11 +1127,12 @@ def analyze_ticker(ticker: str, region: str, reddit_mentions: int = 0) -> dict |
     roe = funds["roe"]
     quality_score = 50.0 if math.isnan(roe) else clamp(50 + (roe * 200))
 
-    # WallStreetBets buzz — a live retail-sentiment kicker. Each mention adds 10
+    # Social & news buzz — a live retail/news-sentiment kicker combining every
+    # enabled source for this market (Reddit, GDELT news, …). Each mention adds 10
     # points to the hype score (capped at +35), then the whole score is re-clamped
-    # to 0-100. Zero mentions (or a failed Reddit fetch) leave hype untouched.
-    if reddit_mentions > 0:
-        hype["score"] = clamp(hype["score"] + min(35, reddit_mentions * 10))
+    # to 0-100. Zero mentions (or a failed fetch) leave hype untouched.
+    if hype_mentions > 0:
+        hype["score"] = clamp(hype["score"] + min(35, hype_mentions * 10))
 
     # Short-squeeze modifier — a heavily-shorted name (>10% of float) that is also
     # printing sustained volume breakouts can squeeze violently, so we boost its
@@ -972,7 +1148,7 @@ def analyze_ticker(ticker: str, region: str, reddit_mentions: int = 0) -> dict |
         "market_cap": funds["market_cap"], "roe": roe, "short_pct": short_pct,
         "hype": hype, "momentum": momentum_score, "value": value_score,
         "technical": technical_score, "quality": quality_score,
-        "hype_score": hype["score"], "reddit_mentions": reddit_mentions, "history": hist
+        "hype_score": hype["score"], "hype_mentions": hype_mentions, "history": hist
     }
 
 def score_with_weights(analysis: dict, weights: dict[str, float]) -> dict:
@@ -1009,19 +1185,23 @@ def fetch_analyst_signals(ticker: str) -> dict:
            "target_mean": float("nan"), "currency": "", "changes": []}
     if yf is None:
         return out
+    tk = _ticker(ticker)
+    # RAISE on a failed/empty .info so a rate-limited response isn't cached for the
+    # whole TTL (see fetch_fundamentals). A reachable name with no analyst coverage
+    # returns a populated info dict but NaN fields — that's legitimate and caches.
     try:
-        tk = _ticker(ticker)
-    except Exception:
-        return out
-    try:
-        info = tk.info or {}
-        out["rec_mean"] = safe_float(info.get("recommendationMean"))
-        out["rec_key"] = str(info.get("recommendationKey") or "")
-        out["num_analysts"] = safe_float(info.get("numberOfAnalystOpinions"))
-        out["target_mean"] = safe_float(info.get("targetMeanPrice"))
-        out["currency"] = str(info.get("currency") or "")
-    except Exception:
-        pass
+        info = tk.info
+    except Exception as e:
+        raise RuntimeError(f"analyst fetch failed for {ticker} (likely rate-limited)") from e
+    if not info:
+        raise RuntimeError(f"empty analyst info for {ticker} (likely rate-limited)")
+    out["rec_mean"] = safe_float(info.get("recommendationMean"))
+    out["rec_key"] = str(info.get("recommendationKey") or "")
+    out["num_analysts"] = safe_float(info.get("numberOfAnalystOpinions"))
+    out["target_mean"] = safe_float(info.get("targetMeanPrice"))
+    out["currency"] = str(info.get("currency") or "")
+    # Rating-change history is optional and frequently empty (esp. non-US); its
+    # absence is not a fetch failure, so we swallow errors here rather than raise.
     try:
         ud = tk.upgrades_downgrades
         if ud is not None and not ud.empty:
@@ -1051,10 +1231,13 @@ def fetch_insider_activity(ticker: str) -> dict:
            "rows": [], "available": False}
     if yf is None:
         return out
+    # RAISE when the underlying call throws (transient / rate-limit) so the failure
+    # isn't cached. A successful call that returns an EMPTY frame is a legitimate
+    # 'no insider transactions' result for this name and is cached as such.
     try:
         it = _ticker(ticker).insider_transactions
-    except Exception:
-        return out
+    except Exception as e:
+        raise RuntimeError(f"insider fetch failed for {ticker} (likely rate-limited)") from e
     if it is None or it.empty:
         return out
 
@@ -1224,74 +1407,87 @@ def analyze_sell_signals(ticker: str, hist: pd.DataFrame | None = None) -> dict 
 # ----------------------------------------------------------------------------
 # Backtesting / Evaluation Systems
 # ----------------------------------------------------------------------------
-def evaluate_pending() -> int:
+# NOTE: the OLD recommendations-based gradient (evaluate_pending +
+# update_weights_from_outcomes) was removed deliberately. It wrote the same
+# kpi_weights as walk_forward_update, so the two loops fought each other and muddied
+# the optimisation. walk_forward_update — driven by the curated mock_portfolio KPI
+# snapshots — is now the SINGLE learning loop. evaluate_outcomes_only() below still
+# resolves recommendation win/lose for the audit accuracy panel, but it carries NO
+# gradient and never touches kpi_weights, so it can't reignite that conflict.
+
+def _close_on_or_after(h: pd.DataFrame | None, when) -> float:
+    """First close on or after `when`, compared on pure DATES (both sides normalized)
+    so we align to the right end-of-day bar and never grab an intraday/unclosed price
+    through a timezone mismatch. Shared by the optimiser and the outcome evaluator."""
+    if h is None or h.empty:
+        return float("nan")
+    idx = pd.to_datetime(h.index)
+    try:
+        idx = idx.tz_localize(None)       # strip tz on a tz-aware index
+    except (TypeError, AttributeError):
+        pass                              # already tz-naive
+    dates = idx.normalize()               # 00:00 -> date-level granularity
+    when_ts = pd.Timestamp(when).normalize()
+    sub = h[dates >= when_ts]
+    return safe_float(sub["Close"].iloc[0]) if not sub.empty else float("nan")
+
+def evaluate_outcomes_only() -> int:
+    """Resolve the forward OUTCOME of matured recommendations for the Systems Audit
+    accuracy / win-rate panel — WITHOUT any weight update. This intentionally has no
+    gradient: walk_forward_update() is the single learning loop; this only fills
+    win/lose so the audit reflects live picks rather than only seeded history.
+
+    Win logic mirrors the optimiser exactly: the pick's dividend-inclusive TOTAL
+    return (both endpoints read from one fresh auto_adjusted series) must beat its
+    HOME-market index over the same [rec_date, rec_date+horizon] window.
+    """
     df = get_recommendations()
-    if df.empty: return 0
+    if df.empty:
+        return 0
     cutoff = date.today() - timedelta(days=EVAL_HORIZON_DAYS)
     pending = df[(df["outcome"].isna()) & (df["rec_date"].dt.date <= cutoff)]
-    if pending.empty: return 0
+    if pending.empty:
+        return 0
 
-    # Per-market benchmarking: each pick is judged against its HOME index over the
-    # SAME holding window, so a "Win" means it beat its local market — not merely
-    # the S&P 500. Benchmark histories are fetched once per distinct index and
-    # reused across tickers (fetch_history is also memoised by Streamlit's cache).
     bench_cache: dict[str, pd.DataFrame | None] = {}
-    def bench_hist(symbol: str) -> pd.DataFrame | None:
-        if symbol not in bench_cache:
-            bench_cache[symbol] = fetch_history(symbol, period="1y")
-        return bench_cache[symbol]
-
-    def _close_on_or_after(h: pd.DataFrame | None, when) -> float:
-        if h is None or h.empty: return float("nan")
-        sub = h[h.index.tz_localize(None) >= pd.Timestamp(when)]
-        return safe_float(sub["Close"].iloc[0]) if not sub.empty else float("nan")
+    def bench_hist(sym: str) -> pd.DataFrame | None:
+        if sym not in bench_cache:
+            try:
+                bench_cache[sym] = fetch_history(sym, period="1y")
+            except Exception:
+                bench_cache[sym] = None   # missing benchmark -> absolute-return fallback
+        return bench_cache[sym]
 
     evaluated = 0
     with get_conn() as conn:
         for _, row in pending.iterrows():
-            hist = fetch_history(row["ticker"], period="1y")
-            if hist is None: continue
-            target = row["rec_date"] + timedelta(days=EVAL_HORIZON_DAYS)
-            future = hist[hist.index.tz_localize(None) >= pd.Timestamp(target)]
-            if future.empty: continue
-            price_after = safe_float(future["Close"].iloc[0])
-            price_then = safe_float(row["price_at_rec"])
-            if math.isnan(price_after) or math.isnan(price_then) or price_then <= 0: continue
+            try:
+                hist = fetch_history(row["ticker"], period="1y")
+            except Exception:
+                continue   # transient fetch failure -> skip this name, keep the batch alive
+            rec_dt = row["rec_date"]
+            target = rec_dt + timedelta(days=EVAL_HORIZON_DAYS)
+            price_then = _close_on_or_after(hist, rec_dt)
+            price_after = _close_on_or_after(hist, target)
+            if math.isnan(price_after) or math.isnan(price_then) or price_then <= 0:
+                continue
             stock_ret = price_after / price_then - 1.0
 
-            # Home-market benchmark return over the identical [rec_date, target] window.
             bh = bench_hist(benchmark_for(row["ticker"]))
-            b_then = _close_on_or_after(bh, row["rec_date"])
+            b_then = _close_on_or_after(bh, rec_dt)
             b_after = _close_on_or_after(bh, target)
             if not math.isnan(b_then) and not math.isnan(b_after) and b_then > 0:
-                bench_ret = b_after / b_then - 1.0
-                win = 1 if stock_ret > bench_ret else 0
+                win = 1 if stock_ret > (b_after / b_then - 1.0) else 0
             else:
-                # Benchmark data missing for this window (e.g. very old rec) — fall
-                # back to the original absolute-return test so the record resolves.
-                win = 1 if stock_ret > 0 else 0
+                win = 1 if stock_ret > 0 else 0   # fallback when benchmark window missing
 
-            conn.execute("UPDATE recommendations SET price_after=?, outcome=?, eval_date=? WHERE id=?", (price_after, win, date.today().isoformat(), int(row["id"])))
+            conn.execute(
+                "UPDATE recommendations SET price_after=?, outcome=?, eval_date=? WHERE id=?",
+                (price_after, win, date.today().isoformat(), int(row["id"])),
+            )
             evaluated += 1
         conn.commit()
-    if evaluated: update_weights_from_outcomes()
     return evaluated
-
-def update_weights_from_outcomes() -> None:
-    df = get_recommendations()
-    done = df[df["outcome"].notna()]
-    if len(done) < 4: return
-    weights = get_latest_weights()
-    grad = {f: 0.0 for f in FACTORS}
-    for _, r in done.iterrows():
-        direction = 1.0 if int(r["outcome"]) == 1 else -1.0
-        for f in FACTORS:
-            grad[f] += direction * (safe_float(r[f], 50.0) / 100.0 - 0.5)
-    n = len(done)
-    new = {f: max(MIN_WEIGHT, weights[f] + LEARNING_RATE * grad[f] / n) for f in FACTORS}
-    total = sum(new.values())
-    new = {f: new[f] / total for f in FACTORS}
-    save_weights(new, note=f"Auto-tuned on {n} metrics (Win rate: {100 * done['outcome'].mean():.0f}%)")
 
 # ----------------------------------------------------------------------------
 # Walk-Forward Optimisation: mock portfolio + factor-attribution feedback loop
@@ -1336,15 +1532,15 @@ def save_mock_portfolio(results: list[dict]) -> None:
                 (today, r["ticker"], reason),
             )
             conn.execute(
-                "INSERT INTO mock_portfolio (timestamp, ticker, recommendation_price, reason, kpi_snapshot, evaluated) VALUES (?,?,?,?,?,0)",
-                (ts, r["ticker"], _val(r, "price"), reason, snapshot),
+                "INSERT INTO mock_portfolio (timestamp, ticker, recommendation_price, reason, kpi_snapshot, evaluated, name) VALUES (?,?,?,?,?,0,?)",
+                (ts, r["ticker"], _val(r, "price"), reason, snapshot, str(r.get("name") or r["ticker"])),
             )
         conn.commit()
 
 def get_mock_portfolio() -> pd.DataFrame:
     with get_conn() as conn:
         return pd.read_sql_query(
-            "SELECT timestamp, ticker, recommendation_price, reason FROM mock_portfolio ORDER BY id DESC", conn
+            "SELECT timestamp, ticker, name, recommendation_price, reason FROM mock_portfolio ORDER BY id DESC", conn
         )
 
 def _bulk_history(tickers: list, period: str = "1y") -> dict:
@@ -1452,12 +1648,11 @@ def walk_forward_update() -> int:
     bench_cache: dict[str, pd.DataFrame | None] = {}
     def bench_hist(sym: str) -> pd.DataFrame | None:
         if sym not in bench_cache:
-            bench_cache[sym] = fetch_history(sym, period="1y")
+            try:
+                bench_cache[sym] = fetch_history(sym, period="1y")
+            except Exception:
+                bench_cache[sym] = None   # missing benchmark -> absolute-return fallback
         return bench_cache[sym]
-    def _close_on_or_after(h: pd.DataFrame | None, when) -> float:
-        if h is None or h.empty: return float("nan")
-        sub = h[h.index.tz_localize(None) >= pd.Timestamp(when)]
-        return safe_float(sub["Close"].iloc[0]) if not sub.empty else float("nan")
 
     grad = {f: 0.0 for f in FACTORS}
     evaluated_ids, n = [], 0
@@ -1469,15 +1664,20 @@ def walk_forward_update() -> int:
             snap = json.loads(row["kpi_snapshot"] or "{}")
         except Exception:
             snap = {}
-        hist = fetch_history(row["ticker"], period="1y")
-        if hist is None:
-            continue
+        try:
+            hist = fetch_history(row["ticker"], period="1y")
+        except Exception:
+            continue   # transient fetch failure -> skip this name, keep the batch alive
         target = rec_dt + timedelta(days=EVAL_HORIZON_DAYS)
-        future = hist[hist.index.tz_localize(None) >= pd.Timestamp(target)]
-        if future.empty:
-            continue
-        price_after = safe_float(future["Close"].iloc[0])
-        price_then = safe_float(row["recommendation_price"])
+        # Fix 5 — derive BOTH endpoints from the SAME freshly-fetched, dividend-
+        # adjusted series (fetch_history uses auto_adjust=True, which folds dividends
+        # into the close). That makes stock_ret a proper TOTAL return, so Value /
+        # Dividend picks get credit for payouts. Re-deriving the entry price here
+        # (rather than using the stored recommendation_price) also keeps both ends on
+        # one adjustment baseline — adding a separate dividend-yield term on top would
+        # double-count, since the series is already adjusted.
+        price_then = _close_on_or_after(hist, rec_dt)
+        price_after = _close_on_or_after(hist, target)
         if math.isnan(price_after) or math.isnan(price_then) or price_then <= 0:
             continue
         stock_ret = price_after / price_then - 1.0
@@ -1532,7 +1732,8 @@ def seed_demo_history() -> None:
         save_weights({f: w[f] / tot for f in FACTORS}, note="Demo backfill loop simulation")
 
 def run_engine(limit_per_region: int | None = None,
-               regions: list | None = None) -> tuple[list[dict], list[str]]:
+               regions: list | None = None,
+               sources: list | None = None) -> tuple[list[dict], list[str]]:
     weights = get_latest_weights()
     results, failed = [], []
 
@@ -1546,11 +1747,11 @@ def run_engine(limit_per_region: int | None = None,
         if region in selected
     }
 
-    # Pull WallStreetBets mention counts ONCE for the whole scan (a single RSS
-    # request), then feed each ticker its own count. Fail-safe: a blocked/failed
-    # request returns all-zeros, so the scan proceeds with hype unaffected.
-    scan_tickers = [t for ticks in universe.values() for t in ticks]
-    reddit_counts = fetch_reddit_hype(scan_tickers)
+    # Pull sentiment buzz ONCE for the whole scan, routing each market to the
+    # enabled sources (Reddit for English names, GDELT news for JP/CN, etc.), then
+    # feed each ticker its own combined count. Fully fail-safe: a blocked source
+    # contributes zeros, so the scan proceeds with hype unaffected.
+    hype_counts = fetch_hype_signals(universe, sources)
 
     progress = st.progress(0.0, text=tr("scanning"))
 
@@ -1560,7 +1761,7 @@ def run_engine(limit_per_region: int | None = None,
     for region, tickers in universe.items():
         for t in tickers:
             try:
-                analysis = analyze_ticker(t, region, reddit_counts.get(t, 0))
+                analysis = analyze_ticker(t, region, hype_counts.get(t, 0))
                 if analysis is None:
                     failed.append(f"{t} (no data)")
                 else:
@@ -1664,11 +1865,12 @@ def render_deep_dive(results: list[dict]) -> None:
     })
     st.bar_chart(breakdown)
 
-    mentions = int(r.get("reddit_mentions", 0))
-    st.markdown(metric_card(tr("wsb_mentions"), f"{mentions}",
+    mentions = int(r.get("hype_mentions", 0))
+    st.markdown(metric_card(tr("hype_buzz_label"), f"{mentions}",
                             positive=mentions > 0), unsafe_allow_html=True)
-    st.caption(tr("wsb_caption"))
-    st.caption(tr(f"wsb_source_{_LAST_REDDIT_SOURCE}"))
+    st.caption(tr("hype_buzz_caption"))
+    if _LAST_HYPE_STATUS:
+        st.caption(_LAST_HYPE_STATUS)
 
 def render_engine_audit(update_prices: bool = True) -> None:
     st.markdown(f"### {tr('audit_header_text')}")
@@ -1696,8 +1898,24 @@ def render_engine_audit(update_prices: bool = True) -> None:
     wh = get_weight_history()
     if len(wh) >= 2:
         st.markdown(f"#### {tr('kpi_weight_evolution')}")
-        plot = wh.set_index("update_date")[FACTORS]
-        st.line_chart(plot)
+        plot = wh.copy()
+        plot["update_date"] = pd.to_datetime(plot["update_date"], errors="coerce")
+        long = (plot.melt(id_vars="update_date", value_vars=FACTORS,
+                          var_name="factor", value_name="weight")
+                    .dropna(subset=["update_date"]))
+        # Altair lets us force the x-axis to show the DATE only (not 6AM/6PM ticks).
+        # width="container" keeps it responsive without the deprecated container flag.
+        chart = (
+            alt.Chart(long)
+            .mark_line()
+            .encode(
+                x=alt.X("update_date:T", axis=alt.Axis(format="%Y-%m-%d", title=None)),
+                y=alt.Y("weight:Q", axis=alt.Axis(title=None)),
+                color=alt.Color("factor:N", legend=alt.Legend(title=None)),
+            )
+            .properties(height=320, width="container")
+        )
+        st.altair_chart(chart)
 
     # --- Historical Performance: live return of every logged mock-portfolio pick ---
     st.markdown(f"#### {tr('historical_performance')}")
@@ -1716,13 +1934,14 @@ def render_engine_audit(update_prices: bool = True) -> None:
     mp["current"] = mp["ticker"].map(prices)
     mp["return_pct"] = (mp["current"] / mp["recommendation_price"] - 1.0) * 100.0
     mp["date"] = pd.to_datetime(mp["timestamp"], errors="coerce").dt.date.astype(str)
+    mp["name"] = mp["name"].fillna("")   # older rows logged before names were stored
     reason_map = {"Top Growth": tr("reason_growth"), "Top Dividend": tr("reason_dividend")}
     mp["reason"] = mp["reason"].map(lambda x: reason_map.get(x, x))
 
     ret_col = tr("col_return_pct")
     rec_col, cur_col = tr("col_rec_price"), tr("col_current_price")
-    disp = mp[["date", "ticker", "reason", "recommendation_price", "current", "return_pct"]].rename(columns={
-        "date": tr("col_date"), "ticker": tr("col_ticker"), "reason": tr("col_reason"),
+    disp = mp[["date", "ticker", "name", "reason", "recommendation_price", "current", "return_pct"]].rename(columns={
+        "date": tr("col_date"), "ticker": tr("col_ticker"), "name": tr("col_company"), "reason": tr("col_reason"),
         "recommendation_price": rec_col, "current": cur_col, "return_pct": ret_col,
     })
 
@@ -1884,7 +2103,10 @@ def render_sell_signals() -> None:
         sel = st.selectbox(tr("sell_detail_select"), choices, key="sell_detail_pick")
         if sel:
             with st.spinner(tr("sell_spinner", ticker=sel)):
-                detail = analyze_sell_signals(sel)
+                try:
+                    detail = analyze_sell_signals(sel)
+                except Exception:
+                    detail = None   # a raised (rate-limited) sub-fetch -> show the notice
             if detail is None:
                 st.warning(tr("sell_no_data", ticker=sel))
             else:
@@ -1897,10 +2119,11 @@ def main() -> None:
     init_db()
     inject_css()
 
-    # Auto Execution of background performance auditor calculations
-    try: evaluate_pending()
+    # Resolve matured recommendation outcomes for the audit accuracy panel (no weight
+    # change), then run the single learning loop — the walk-forward optimiser — which
+    # re-tunes kpi_weights from matured mock-portfolio picks.
+    try: evaluate_outcomes_only()
     except Exception: pass
-    # Walk-forward optimiser: re-tunes factor weights from matured mock-portfolio picks.
     try: walk_forward_update()
     except Exception: pass
 
@@ -1915,13 +2138,19 @@ def main() -> None:
                                               default=region_keys, format_func=region_name)
     quick_scan = st.sidebar.toggle(tr("scan_quick_toggle"), value=True, help=tr("scan_quick_help"))
     update_prices = st.sidebar.checkbox(tr("update_hist_prices"), value=True)
+    source_keys = list(SENTIMENT_SOURCES.keys())
+    selected_sources = st.sidebar.multiselect(
+        tr("sentiment_sources"), source_keys, default=source_keys,
+        format_func=lambda k: tr(SENTIMENT_SOURCES[k]["label_key"]),
+    )
     if st.sidebar.button(tr("scan_btn"), width="stretch"):
         if not selected_regions:
             st.sidebar.warning(tr("no_region_selected"))
         else:
             with st.spinner(tr("scan_spinner")):
                 limit = 6 if quick_scan else None
-                res, fail = run_engine(limit_per_region=limit, regions=selected_regions)
+                res, fail = run_engine(limit_per_region=limit, regions=selected_regions,
+                                       sources=selected_sources)
                 st.session_state["results"], st.session_state["failed"] = res, fail
             if res:
                 st.success(tr("scan_success"))
