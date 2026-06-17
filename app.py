@@ -23,6 +23,13 @@ try:
 except Exception:
     yf = None
 
+# Optional companion module (sec_research.py). Powers the US-only Conviction tab from
+# SEC EDGAR fundamentals. Guarded so the app still runs if it's absent.
+try:
+    import sec_research
+except Exception:
+    sec_research = None
+
 # ----------------------------------------------------------------------------
 # Networking — corporate-friendly SSL handling for yfinance
 # ----------------------------------------------------------------------------
@@ -284,7 +291,7 @@ def fetch_hype_signals(universe: dict, enabled_sources: list | None = None) -> d
         except Exception:
             res = {}
         for t, c in res.items():
-            combined[t] = combined.get(t, 0) + int(c or 0)
+            combined[t] = combined.get(t, 0) + float(c or 0)
         if key == "reddit":
             status_parts.append(f"{tr('src_reddit')}: {tr('hype_status_' + _LAST_REDDIT_SOURCE)}")
         elif key == "gdelt":
@@ -514,6 +521,19 @@ TRANSLATIONS = {
         "sell_detail_select": "Select a ticker from your scan",
         # Sell-Signal scanner
         "tab_sell": "🔻 Sell Signals",
+        "tab_us": "🇺🇸 US Conviction",
+        "us_header": "🇺🇸 Top US Conviction Picks (SEC Fundamentals)",
+        "us_spinner": "Pulling audited SEC EDGAR fundamentals…",
+        "us_module_missing": "The sec_research.py companion module isn't available — place it beside app.py.",
+        "us_conviction_suffix": "conviction",
+        "us_caption": "US-listed names only, ranked by a blend of your scan composite (50%) with SEC EDGAR growth (30%) and quality (20%) from audited multi-year filings, plus a capped 13F superinvestor bonus. Isolated from the global factor weights and walk-forward loop. 13F overlay = latest 13F-HR holdings (~45-day lag), matched by company name across 7 tracked managers. Set SEC_USER_AGENT (your email) per SEC's fair-access policy.",
+        "col_us_conviction": "US Conviction",
+        "col_sec_growth": "SEC Growth",
+        "col_sec_quality": "SEC Quality",
+        "col_rev_cagr": "3y Rev CAGR %",
+        "col_eps_yoy": "EPS YoY %",
+        "col_superinvestors": "Superinvestors",
+        "us_held_by": "Held by {n} superinvestor(s)",
         "sell_header": "🔻 Sell-Signal Scanner",
         "sell_disclaimer": "Informational signals only — not financial advice. Data via Yahoo Finance; analyst and insider coverage is richest for US-listed symbols.",
         "sell_input_label": "Enter a ticker symbol",
@@ -671,6 +691,19 @@ TRANSLATIONS = {
         "sell_detail_select": "スキャンした銘柄から選択",
         # 売りシグナル・スキャナー
         "tab_sell": "🔻 売りシグナル",
+        "tab_us": "🇺🇸 米国確信度",
+        "us_header": "🇺🇸 米国 確信度トップ銘柄（SEC財務）",
+        "us_spinner": "SECの監査済み財務データ（EDGAR）を取得中…",
+        "us_module_missing": "コンパニオンモジュール sec_research.py がありません。app.py と同じフォルダに置いてください。",
+        "us_conviction_suffix": "確信度",
+        "us_caption": "米国上場銘柄のみ。スキャンの総合スコア（50%）に、SEC EDGARの監査済み複数年財務に基づく成長性（30%）と品質（20%）、さらに上限付きの13F著名投資家ボーナスを加味してランク付けします。グローバルの重みやウォークフォワード学習からは分離されています。13Fは最新の13F-HR保有（約45日遅延）を7名の著名投資家について会社名でマッチング。SECのフェアアクセス方針に従い SEC_USER_AGENT（メールアドレス）を設定してください。",
+        "col_us_conviction": "米国確信度",
+        "col_sec_growth": "SEC成長性",
+        "col_sec_quality": "SEC品質",
+        "col_rev_cagr": "売上CAGR(3年)%",
+        "col_eps_yoy": "EPS前年比%",
+        "col_superinvestors": "著名投資家数",
+        "us_held_by": "{n}名の著名投資家が保有",
         "sell_header": "🔻 売りシグナル・スキャナー",
         "sell_disclaimer": "本機能は情報提供のみを目的とし、投資助言ではありません。データはYahoo Finance提供。アナリスト・インサイダー情報は米国上場銘柄が最も充実しています。",
         "sell_input_label": "ティッカーシンボルを入力",
@@ -1093,7 +1126,7 @@ def compute_hype(volume: pd.Series) -> dict:
 
 def clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float: return max(lo, min(hi, v))
 
-def analyze_ticker(ticker: str, region: str, hype_mentions: int = 0) -> dict | None:
+def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0) -> dict | None:
     hist = fetch_history(ticker)
     if hist is None or len(hist) < 60: return None
     close, volume = hist["Close"], hist.get("Volume", pd.Series(dtype=float))
@@ -1806,6 +1839,111 @@ def render_daily_top_3(results: list[dict]) -> None:
                 unsafe_allow_html=True,
             )
 
+# --- US Conviction tab (US-only; SEC EDGAR fundamentals) -------------------------
+# Deliberately isolated: it blends each US name's existing scan composite with SEC
+# growth/quality OUTSIDE the global factor model, so this US-only data never enters
+# FACTORS, DEFAULT_WEIGHTS, or the walk-forward gradient.
+US_CONVICTION_WEIGHTS = {"composite": 0.5, "growth": 0.3, "quality": 0.2}
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _sec_fundamentals_cached(ticker: str) -> dict:
+    """SEC fundamentals for one US ticker, cached a day (filings are quarterly). Raises
+    on a transient fetch failure so the broken state isn't frozen for the whole TTL."""
+    ua = _get_secret("SEC_USER_AGENT", "stockrec-research/1.0 (set SEC_USER_AGENT to your email)")
+    return sec_research.sec_fundamentals(ticker, ua=ua)
+
+# 13F superinvestor conviction layer (Phase 2): each manager holding the name adds a few
+# points, capped — so this quarterly, ~45-day-lagged signal tilts the ranking rather than
+# dominating the SEC-fundamentals core.
+SUPERINVESTOR_PT = 4.0
+SUPERINVESTOR_CAP = 3
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _superinvestor_counts_cached(tickers: tuple) -> dict:
+    """How many tracked superinvestors hold each US ticker (latest 13F-HR), cached a day.
+    Raises on a total outage so an all-zero result isn't frozen for the whole TTL."""
+    ua = _get_secret("SEC_USER_AGENT", "stockrec-research/1.0 (set SEC_USER_AGENT to your email)")
+    return sec_research.superinvestor_counts(list(tickers), ua=ua)
+
+def _blend_conviction(comp: float, growth: float, quality: float) -> float:
+    """Weighted, NaN-aware blend. If SEC scores are missing, it renormalises onto the
+    scan composite alone, so a name still ranks (just without the SEC tilt)."""
+    num = den = 0.0
+    for key, val in (("composite", comp), ("growth", growth), ("quality", quality)):
+        if val is not None and not math.isnan(val):
+            num += US_CONVICTION_WEIGHTS[key] * val
+            den += US_CONVICTION_WEIGHTS[key]
+    return num / den if den > 0 else float("nan")
+
+def render_us_conviction(results: list[dict]) -> None:
+    st.subheader(tr("us_header"))
+    if sec_research is None:
+        st.warning(tr("us_module_missing"))
+        return
+    us = [r for r in results if r.get("region") == "USA"]
+    if not us:
+        st.info(tr("need_scan_sidebar"))
+        return
+
+    us_tickers = sorted({r["ticker"] for r in us})
+    rows = []
+    with st.spinner(tr("us_spinner")):
+        try:
+            sci = _superinvestor_counts_cached(tuple(us_tickers))
+        except Exception:
+            sci = {}   # 13F unavailable this run -> no conviction bonus, no crash
+        for r in us:
+            comp = safe_float(r.get("composite"), float("nan"))
+            g = q = rev_cagr = rev_yoy = eps_yoy = float("nan")
+            try:
+                f = _sec_fundamentals_cached(r["ticker"])
+                g, q = f["growth_score"], f["quality_score"]
+                rev_cagr, rev_yoy, eps_yoy = f["rev_cagr_3y"], f["rev_yoy"], f["earnings_yoy"]
+            except Exception:
+                pass   # SEC unavailable for this name -> rank on the composite alone
+            base = _blend_conviction(comp, g, q)
+            n_si = int(sci.get(r["ticker"], 0) or 0)
+            conv = base if math.isnan(base) else clamp(base + SUPERINVESTOR_PT * min(n_si, SUPERINVESTOR_CAP))
+            rows.append({
+                "ticker": r["ticker"], "name": r.get("name", r["ticker"]),
+                "conviction": conv, "composite": comp, "n_si": n_si,
+                "growth": g, "quality": q, "rev_cagr": rev_cagr, "eps_yoy": eps_yoy,
+                "price": safe_float(r.get("price"), float("nan")),
+            })
+    rows.sort(key=lambda x: x["conviction"] if not math.isnan(x["conviction"]) else float("-inf"),
+              reverse=True)
+
+    c1, c2, c3 = st.columns(3)
+    for i, col in enumerate([c1, c2, c3]):
+        if i < len(rows):
+            x = rows[i]
+            conv = "—" if math.isnan(x["conviction"]) else f"{x['conviction']:.1f}/100"
+            cagr = "—" if math.isnan(x["rev_cagr"]) else fmt_pct(x["rev_cagr"] * 100.0)
+            si = f"<br>⭐ {tr('us_held_by', n=x['n_si'])}" if x["n_si"] > 0 else ""
+            col.markdown(metric_card(x["ticker"], f"{conv} {tr('us_conviction_suffix')}",
+                                     f"{tr('price_label')}: {fmt_money(x['price'])}",
+                                     positive=(not math.isnan(x["conviction"]) and x["conviction"] >= BUY_THRESHOLD)),
+                         unsafe_allow_html=True)
+            col.markdown(
+                f"**{tr('company_profile')}:** {x['name']} <br>"
+                f"**{tr('col_sec_growth')}:** {fmt_num(x['growth'], 0)} &nbsp;·&nbsp; "
+                f"**{tr('col_sec_quality')}:** {fmt_num(x['quality'], 0)} <br>"
+                f"**{tr('col_rev_cagr')}:** {cagr}{si}",
+                unsafe_allow_html=True,
+            )
+
+    def _r(v, nd=1):
+        return float("nan") if math.isnan(v) else round(v, nd)
+    table = pd.DataFrame([{
+        tr("col_ticker"): x["ticker"], tr("col_company"): x["name"],
+        tr("col_us_conviction"): _r(x["conviction"]), tr("col_overall_score"): _r(x["composite"]),
+        tr("col_sec_growth"): _r(x["growth"], 0), tr("col_sec_quality"): _r(x["quality"], 0),
+        tr("col_rev_cagr"): _r(x["rev_cagr"] * 100.0), tr("col_eps_yoy"): _r(x["eps_yoy"] * 100.0),
+        tr("col_superinvestors"): x["n_si"],
+    } for x in rows])
+    st.dataframe(table, width="stretch", hide_index=True)
+    st.caption(tr("us_caption"))
+
 def render_category_views(results: list[dict]) -> None:
     if not results:
         st.info(tr("need_run_engine"))
@@ -1865,8 +2003,8 @@ def render_deep_dive(results: list[dict]) -> None:
     })
     st.bar_chart(breakdown)
 
-    mentions = int(r.get("hype_mentions", 0))
-    st.markdown(metric_card(tr("hype_buzz_label"), f"{mentions}",
+    mentions = safe_float(r.get("hype_mentions", 0), 0.0)
+    st.markdown(metric_card(tr("hype_buzz_label"), f"{mentions:g}",
                             positive=mentions > 0), unsafe_allow_html=True)
     st.caption(tr("hype_buzz_caption"))
     if _LAST_HYPE_STATUS:
@@ -2172,7 +2310,7 @@ def main() -> None:
         st.sidebar.warning(tr("skipped", items=", ".join(failed)))
 
     # Main Segment View tabs routing setup
-    t1, t2, t3, t4, t5, t6 = st.tabs([tr("tab_top"), tr("tab_regional"), tr("tab_category"), tr("tab_deep"), tr("tab_audit"), tr("tab_sell")])
+    t1, t2, t3, t4, t5, t6, t7 = st.tabs([tr("tab_top"), tr("tab_regional"), tr("tab_category"), tr("tab_deep"), tr("tab_audit"), tr("tab_sell"), tr("tab_us")])
 
     with t1: render_daily_top_3(results)
     with t2: render_global_sectors(results)
@@ -2180,6 +2318,7 @@ def main() -> None:
     with t4: render_deep_dive(results)
     with t5: render_engine_audit(update_prices)
     with t6: render_sell_signals()
+    with t7: render_us_conviction(results)
 
 if __name__ == "__main__":
     main()

@@ -1,8 +1,5 @@
-# Streamlit Community Cloud installs these automatically on deploy.
-# Version floors (not hard pins) so Cloud can resolve against its Python build.
-# If you hit a Yahoo "Too Many Requests" / rate-limit error, try bumping
-# yfinance to the newest release first — fixes land there frequently.
-streamlit>=1.40
-pandas>=2.0
-numpy>=1.26
-yfinance>=0.2.61
+streamlit
+yfinance
+pandas
+numpy
+altair
