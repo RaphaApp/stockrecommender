@@ -505,6 +505,7 @@ TRANSLATIONS = {
         "update_hist_prices": "Update Historical Portfolio Prices",
         "no_region_selected": "Select at least one region to scan.",
         "prices_skipped": "Live price update is off — current prices and returns are left blank. Tick 'Update Historical Portfolio Prices' to refresh.",
+        "prices_unavailable": "No current price came back this run for: {tickers}. This is usually Yahoo rate-limiting the request (common on shared/Cloud IPs), not bad data — wait a moment and toggle the update again.",
         "sell_privacy_note": "Your portfolio list stays in this session only — it is never saved to the database.",
         "sell_paste_label": "Paste tickers (comma, space, or newline separated)",
         "sell_upload_label": "…or upload a CSV with a 'Ticker' or 'Symbol' column",
@@ -675,6 +676,7 @@ TRANSLATIONS = {
         "update_hist_prices": "履歴ポートフォリオの株価を更新",
         "no_region_selected": "スキャンする地域を1つ以上選択してください。",
         "prices_skipped": "ライブ株価の更新はオフです。現在株価とリターンは空欄です。「履歴ポートフォリオの株価を更新」をオンにすると更新されます。",
+        "prices_unavailable": "今回の更新で現在株価を取得できませんでした：{tickers}。これは通常、データ不良ではなくYahoo側のレート制限（共有IPやクラウドで発生しやすい）です。少し待ってから更新を再実行してください。",
         "sell_privacy_note": "ポートフォリオのリストはこのセッション内にのみ保持され、データベースには保存されません。",
         "sell_paste_label": "ティッカーを貼り付け（カンマ・スペース・改行区切り）",
         "sell_upload_label": "…または「Ticker」「Symbol」列を含むCSVをアップロード",
@@ -1625,37 +1627,56 @@ def _bulk_latest_close(tickers: list) -> dict:
     limiter (crashing the app on Streamlit Cloud). A single `yf.download(...)` for
     the whole list fixes that. Returns {ticker: close} with NaN for anything that
     didn't come back, and never raises.
+
+    Uses a 5-day window and takes each ticker's LAST NON-NaN close (not the single
+    most-recent row) — a mixed US/European batch otherwise leaves the off-calendar
+    market (e.g. MC.PA, ASML) NaN on the last row, which showed up as a blank
+    "Current Price". Any symbol the bulk request drops entirely gets a bounded
+    single-ticker fallback.
     """
     out = {t: float("nan") for t in tickers}
     uniq = list(dict.fromkeys(tickers))
     if yf is None or not uniq:
         return out
-    try:
-        kwargs = dict(period="1d", progress=False, threads=False)
+    kwargs = dict(period="5d", progress=False, threads=False, auto_adjust=True)
+    data = None
+    for attempt in range(2):                  # one retry: Yahoo throttles request bursts
         try:
-            data = yf.download(uniq, session=_YF_SESSION, **kwargs)   # reuse SSL-aware session
-        except TypeError:
-            data = yf.download(uniq, **kwargs)                        # older yfinance: no session kwarg
-    except Exception:
-        return out
-    if data is None or len(data) == 0:
-        return out
-    try:
-        if isinstance(data.columns, pd.MultiIndex):
-            # Multi-ticker frame: column level 0 = field, level 1 = ticker.
-            close = data["Close"].dropna(how="all")
-            if not close.empty:
-                last = close.iloc[-1]
+            try:
+                data = yf.download(uniq, session=_YF_SESSION, **kwargs)   # SSL-aware session
+            except TypeError:
+                data = yf.download(uniq, **kwargs)                        # older yfinance: no session kwarg
+        except Exception:
+            data = None
+        if data is not None and len(data):
+            break
+        if attempt == 0:
+            time.sleep(1.0)                   # brief pause, then one more attempt
+    if data is not None and len(data):
+        try:
+            if isinstance(data.columns, pd.MultiIndex):
+                close = data["Close"]                 # columns = tickers
                 for t in uniq:
-                    if t in last.index:
-                        out[t] = safe_float(last[t])
-        else:
-            # Single-ticker frame: flat columns, 'Close' is a Series.
-            series = data["Close"].dropna()
-            if not series.empty and len(uniq) == 1:
-                out[uniq[0]] = safe_float(series.iloc[-1])
-    except Exception:
-        return out
+                    if t in close.columns:
+                        col = close[t].dropna()       # last VALID close for THIS ticker,
+                        if not col.empty:             # not the global last row
+                            out[t] = safe_float(col.iloc[-1])
+            else:
+                series = data["Close"].dropna()       # single-ticker frame: flat columns
+                if not series.empty and len(uniq) == 1:
+                    out[uniq[0]] = safe_float(series.iloc[-1])
+        except Exception:
+            pass
+    # Per-ticker fallback for anything still unresolved (yfinance can silently omit
+    # symbols from a mixed-exchange batch). Bounded to the misses, so it can't
+    # reintroduce a full per-ticker fetch storm.
+    for t in [t for t in uniq if math.isnan(out[t])]:
+        try:
+            s = fetch_history(t, period="5d")["Close"].dropna()   # has retry/backoff
+            if not s.empty:
+                out[t] = safe_float(s.iloc[-1])
+        except Exception:
+            pass
     return out
 
 def walk_forward_update() -> int:
@@ -2097,6 +2118,10 @@ def render_engine_audit(update_prices: bool = True) -> None:
               .format({rec_col: "{:,.2f}", cur_col: "{:,.2f}", ret_col: "{:+.2f}%"}, na_rep="—"))
     st.dataframe(styled, width="stretch", hide_index=True)
     st.caption(tr("historical_perf_note"))
+    if update_prices:
+        unpriced = sorted({t for t in uniq if pd.isna(prices.get(t, float("nan")))})
+        if unpriced:
+            st.caption(tr("prices_unavailable", tickers=", ".join(unpriced)))
     if not update_prices:
         st.caption(tr("prices_skipped"))
 
