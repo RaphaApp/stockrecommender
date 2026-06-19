@@ -281,32 +281,47 @@ def sec_fundamentals(ticker: str, ua: str = "stockrec-research/1.0 (set SEC_USER
 # ---------------------------------------------------------------------------
 # 13F superinvestor overlap (Phase 2)
 # ---------------------------------------------------------------------------
-def _latest_13f_infotable_url(cik: str, ua: str) -> str | None:
-    """Find a manager's most recent 13F-HR filing and return the URL of its holdings
-    (information-table) XML, or None if not found."""
+def _infotable_url_from_accession(cik_int: int, accn: str, ua: str) -> str | None:
+    """Given a filing's accession (no dashes), return the URL of its 13F holdings
+    (information-table) XML, or None."""
+    base = _ARCHIVES.format(cik=cik_int, accn=accn)
+    idx = _get_json(f"{base}/index.json", ua)
+    names = [str(it.get("name", "")) for it in
+             (idx.get("directory", {}) or {}).get("item", []) or []]
+    xmls = [n for n in names if n.lower().endswith(".xml")]
+    # prefer an obviously-named info table; otherwise any XML that isn't the cover page
+    for n in xmls:
+        low = n.lower()
+        if "primary_doc" not in low and any(k in low for k in ("infotable", "form13f", "table")):
+            return f"{base}/{n}"
+    for n in xmls:
+        if "primary_doc" not in n.lower():
+            return f"{base}/{n}"
+    return None
+
+
+def _recent_13f_infotable_urls(cik: str, ua: str, n: int = 2) -> list[str]:
+    """URLs of the n most recent 13F-HR information tables for a manager, most recent
+    first. Skips 13F-NT notices/amendments. A filing whose index can't be read is
+    skipped rather than aborting the list."""
     sub = _get_json(_SUBMISSIONS_URL.format(cik=cik), ua)
     recent = (sub.get("filings", {}) or {}).get("recent", {}) or {}
     forms = recent.get("form", []) or []
     accns = recent.get("accessionNumber", []) or []
-    for i, form in enumerate(forms):              # arrays are most-recent-first
-        if form != "13F-HR":                      # skip 13F-NT notices, amendments, etc.
+    cik_int = int(cik)
+    urls: list[str] = []
+    for i, form in enumerate(forms):                  # arrays are most-recent-first
+        if form != "13F-HR":
             continue
-        accn = str(accns[i]).replace("-", "")
-        base = _ARCHIVES.format(cik=int(cik), accn=accn)
-        idx = _get_json(f"{base}/index.json", ua)
-        names = [str(it.get("name", "")) for it in
-                 (idx.get("directory", {}) or {}).get("item", []) or []]
-        xmls = [n for n in names if n.lower().endswith(".xml")]
-        # prefer an obviously-named info table; otherwise any XML that isn't the cover page
-        for n in xmls:
-            low = n.lower()
-            if "primary_doc" not in low and any(k in low for k in ("infotable", "form13f", "table")):
-                return f"{base}/{n}"
-        for n in xmls:
-            if "primary_doc" not in n.lower():
-                return f"{base}/{n}"
-        return None
-    return None
+        try:
+            u = _infotable_url_from_accession(cik_int, str(accns[i]).replace("-", ""), ua)
+        except Exception:
+            u = None
+        if u:
+            urls.append(u)
+        if len(urls) >= n:
+            break
+    return urls
 
 
 def _parse_13f_issuers(xml_text: str) -> set:
@@ -326,16 +341,23 @@ def _parse_13f_issuers(xml_text: str) -> set:
 
 
 def superinvestor_counts(tickers: list[str], ua: str = "") -> dict:
-    """How many of SUPERINVESTOR_CIKS hold each ticker in their latest 13F-HR.
+    """How many tracked superinvestors NEWLY ADDED each ticker this quarter.
 
-    13F discloses CUSIPs + issuer NAMES, not tickers, and there's no free official
-    CUSIP->ticker map, so this matches on normalised company name — reliable for the
-    large, well-known holdings these managers report (and that populate a US universe),
-    best-effort at the edges. Quarterly data with a ~45-day filing lag; US tickers only.
+    Quarter-over-quarter tracking: for each manager we read the two most recent 13F-HR
+    filings, parse both holding sets, and credit a ticker only if it appears in
+    `held_latest - held_previous` (a fresh buy). This deliberately ignores long-standing
+    mega-cap positions (e.g. Alphabet held every quarter) so the signal reflects new
+    conviction rather than legacy holdings.
 
-    Fail-safe: a manager whose filing can't be fetched/parsed is skipped. If EVERY
-    manager fails (a total outage) it RAISES, so the caller's cache won't freeze an
-    all-zero result; a partial success returns normally.
+    Matching is on normalised company name (13F has CUSIPs + names, not tickers, and
+    there's no free CUSIP->ticker map) — reliable for large, well-known names, best-effort
+    at the edges. Quarterly data, ~45-day filing lag, US tickers only.
+
+    Fail-safe: a manager is skipped (contributes nothing) unless BOTH quarters are
+    fetched and parsed into non-empty sets — so a missing/unparseable previous quarter
+    can never be misread as 'everything is new'. If no manager can be evaluated at all
+    (total outage) it RAISES, so the caller's cache won't freeze an all-zero result; a
+    quarter where managers genuinely added nothing returns all-zeros normally.
     """
     counts = {t: 0 for t in tickers}
     if not ua:
@@ -348,21 +370,28 @@ def superinvestor_counts(tickers: list[str], ua: str = "") -> dict:
     if not name_to_ticker:
         return counts
 
-    successes = 0
+    evaluated = 0
     for cik in SUPERINVESTOR_CIKS.values():
         try:
-            url = _latest_13f_infotable_url(cik, ua)
-            if not url:
+            urls = _recent_13f_infotable_urls(cik, ua, n=2)
+            if len(urls) < 2:
+                continue   # need two quarters to compute additions -> skip, no credit
+            held_latest = _parse_13f_issuers(_get_raw(urls[0], ua))
+            held_previous = _parse_13f_issuers(_get_raw(urls[1], ua))
+            # Require BOTH to be non-empty. An empty previous set (fetch ok but parse
+            # failed, or a corrupt table) would otherwise make every latest holding look
+            # 'new' — the exact false positive we must avoid. Treat that as unavailable.
+            if not held_latest or not held_previous:
                 continue
-            held = _parse_13f_issuers(_get_raw(url, ua))
-            successes += 1
+            evaluated += 1
+            new_additions = held_latest - held_previous
             for nm, tkr in name_to_ticker.items():
-                if nm in held:
+                if nm in new_additions:
                     counts[tkr] += 1
         except Exception:
             continue                    # this manager unavailable -> skip, keep going
-    if successes == 0:
-        raise RuntimeError("no 13F filings could be retrieved")
+    if evaluated == 0:
+        raise RuntimeError("no 13F quarter-over-quarter data could be retrieved")
     return counts
 
 

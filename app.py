@@ -526,14 +526,14 @@ TRANSLATIONS = {
         "us_spinner": "Pulling audited SEC EDGAR fundamentals…",
         "us_module_missing": "The sec_research.py companion module isn't available — place it beside app.py.",
         "us_conviction_suffix": "conviction",
-        "us_caption": "US-listed names only, ranked by a blend of your scan composite (50%) with SEC EDGAR growth (30%) and quality (20%) from audited multi-year filings, plus a capped 13F superinvestor bonus. Isolated from the global factor weights and walk-forward loop. 13F overlay = latest 13F-HR holdings (~45-day lag), matched by company name across 7 tracked managers. Set SEC_USER_AGENT (your email) per SEC's fair-access policy.",
+        "us_caption": "US-listed names only, ranked by a blend of your scan composite (50%) with SEC EDGAR growth (30%) and quality (20%) from audited multi-year filings, plus a capped bonus for NEW 13F buys. Isolated from the global factor weights and walk-forward loop. 13F overlay = positions newly added quarter-over-quarter (latest vs prior 13F-HR, ~45-day lag), matched by company name across 7 tracked managers — so long-standing mega-cap holdings don't score. Set SEC_USER_AGENT (your email) per SEC's fair-access policy.",
         "col_us_conviction": "US Conviction",
         "col_sec_growth": "SEC Growth",
         "col_sec_quality": "SEC Quality",
         "col_rev_cagr": "3y Rev CAGR %",
         "col_eps_yoy": "EPS YoY %",
-        "col_superinvestors": "Superinvestors",
-        "us_held_by": "Held by {n} superinvestor(s)",
+        "col_superinvestors": "New 13F Buys",
+        "us_held_by": "Newly bought by {n} superinvestor(s)",
         "sell_header": "🔻 Sell-Signal Scanner",
         "sell_disclaimer": "Informational signals only — not financial advice. Data via Yahoo Finance; analyst and insider coverage is richest for US-listed symbols.",
         "sell_input_label": "Enter a ticker symbol",
@@ -696,14 +696,14 @@ TRANSLATIONS = {
         "us_spinner": "SECの監査済み財務データ（EDGAR）を取得中…",
         "us_module_missing": "コンパニオンモジュール sec_research.py がありません。app.py と同じフォルダに置いてください。",
         "us_conviction_suffix": "確信度",
-        "us_caption": "米国上場銘柄のみ。スキャンの総合スコア（50%）に、SEC EDGARの監査済み複数年財務に基づく成長性（30%）と品質（20%）、さらに上限付きの13F著名投資家ボーナスを加味してランク付けします。グローバルの重みやウォークフォワード学習からは分離されています。13Fは最新の13F-HR保有（約45日遅延）を7名の著名投資家について会社名でマッチング。SECのフェアアクセス方針に従い SEC_USER_AGENT（メールアドレス）を設定してください。",
+        "us_caption": "米国上場銘柄のみ。スキャンの総合スコア（50%）に、SEC EDGARの監査済み複数年財務に基づく成長性（30%）と品質（20%）、さらに13Fの新規買いに対する上限付きボーナスを加味してランク付けします。グローバルの重みやウォークフォワード学習からは分離されています。13Fは前四半期比で新規に追加された銘柄（最新と前回の13F-HRの差分、約45日遅延）を7名の著名投資家について会社名でマッチング。長期保有の大型株は加点されません。SECのフェアアクセス方針に従い SEC_USER_AGENT（メールアドレス）を設定してください。",
         "col_us_conviction": "米国確信度",
         "col_sec_growth": "SEC成長性",
         "col_sec_quality": "SEC品質",
         "col_rev_cagr": "売上CAGR(3年)%",
         "col_eps_yoy": "EPS前年比%",
-        "col_superinvestors": "著名投資家数",
-        "us_held_by": "{n}名の著名投資家が保有",
+        "col_superinvestors": "新規買い(13F)",
+        "us_held_by": "{n}名の著名投資家が新規購入",
         "sell_header": "🔻 売りシグナル・スキャナー",
         "sell_disclaimer": "本機能は情報提供のみを目的とし、投資助言ではありません。データはYahoo Finance提供。アナリスト・インサイダー情報は米国上場銘柄が最も充実しています。",
         "sell_input_label": "ティッカーシンボルを入力",
@@ -1852,7 +1852,8 @@ def _sec_fundamentals_cached(ticker: str) -> dict:
     ua = _get_secret("SEC_USER_AGENT", "stockrec-research/1.0 (set SEC_USER_AGENT to your email)")
     return sec_research.sec_fundamentals(ticker, ua=ua)
 
-# 13F superinvestor conviction layer (Phase 2): each manager holding the name adds a few
+# 13F superinvestor conviction layer (Phase 2): each manager that NEWLY BOUGHT the name
+# this quarter (added it quarter-over-quarter) adds a few
 # points, capped — so this quarterly, ~45-day-lagged signal tilts the ranking rather than
 # dominating the SEC-fundamentals core.
 SUPERINVESTOR_PT = 4.0
