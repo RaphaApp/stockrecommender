@@ -472,6 +472,34 @@ TRANSLATIONS = {
         "select_profile": "Select Target Analytics Profile:",
         "history_workspace": "Historical Data Plot Workspace: {ticker}",
         "factor_breakdown": "Factor Breakdown",
+        "why_header": "Why this pick",
+        "why_composite": "Composite score",
+        "why_call": "Call",
+        "why_rank": "Rank in scan",
+        "why_contrib_axis": "Contribution to score (points)",
+        "why_contrib_caption": "Each bar is a factor's score × its weight, and the bars add up to the composite — so the longest bar is the biggest reason this name scored where it did.",
+        "why_rationale": "Top drivers: {d1} ({s1}) and {d2} ({s2}) — together {share}% of the composite. Weakest area: {w} ({sw}).",
+        "why_evidence": "The numbers behind each factor",
+        "col_factor": "Factor",
+        "col_score": "Score /100",
+        "col_weight": "Weight",
+        "col_contribution": "Contribution",
+        "col_share": "Share",
+        "col_metric": "Metric",
+        "col_value": "Value",
+        "price_trend": "Price & moving averages",
+        "evi_ret_1m": "1-month return",
+        "evi_vs_sma50": "Price vs 50-day avg",
+        "evi_macd": "MACD trend",
+        "evi_bullish": "bullish",
+        "evi_bearish": "bearish",
+        "evi_pe": "P/E ratio",
+        "evi_div": "Dividend yield",
+        "evi_rsi": "RSI (14)",
+        "evi_bbpct": "Bollinger %B",
+        "evi_roe": "Return on equity",
+        "evi_mentions": "Social / news mentions",
+        "evi_short": "Short interest (% float)",
         "factor_momentum": "Momentum",
         "factor_value": "Value",
         "factor_technical": "Technical",
@@ -547,6 +575,13 @@ TRANSLATIONS = {
         "sell_verdict_mixed": "MIXED",
         "sell_verdict_low": "LOW",
         "sell_breakdown_title": "Signal Breakdown (higher = more bearish)",
+        "sell_why_header": "Why this is a sell",
+        "sell_why_axis": "Contribution to sell-pressure (points)",
+        "sell_why_caption": "Each bar is a bearish signal's score × its weight (over the signals that had data), and the bars sum to the sell-pressure score — so the longest bar is the biggest red flag.",
+        "sell_why_rationale": "Biggest red flags: {d1} ({s1}) and {d2} ({s2}) — together {share}% of the sell-pressure score.",
+        "sell_why_rationale_one": "Main red flag: {d1} ({s1}) — {share}% of the sell-pressure score.",
+        "sell_not_scored": "Not scored (no data): {items}.",
+        "sell_no_signal_data": "No bearish signals returned data for this ticker, so there's no sell-pressure score to explain.",
         "sell_recent_downgrades": "Recent Analyst Rating Changes",
         "sell_insider_activity": "Recent Insider Transactions",
         "sell_no_analyst": "No recent analyst rating changes available for this symbol.",
@@ -643,6 +678,34 @@ TRANSLATIONS = {
         "select_profile": "分析する銘柄を選択:",
         "history_workspace": "価格履歴チャート: {ticker}",
         "factor_breakdown": "ファクター内訳",
+        "why_header": "選定理由",
+        "why_composite": "総合スコア",
+        "why_call": "判定",
+        "why_rank": "スキャン内順位",
+        "why_contrib_axis": "スコアへの寄与（ポイント）",
+        "why_contrib_caption": "各バーはファクターのスコア×ウェイトで、合計が総合スコアになります。最も長いバーが、この銘柄のスコアを最も押し上げた理由です。",
+        "why_rationale": "主な要因：{d1}（{s1}）と{d2}（{s2}）で総合スコアの{share}%。最も弱い項目：{w}（{sw}）。",
+        "why_evidence": "各ファクターの根拠となる数値",
+        "col_factor": "ファクター",
+        "col_score": "スコア /100",
+        "col_weight": "ウェイト",
+        "col_contribution": "寄与",
+        "col_share": "占有率",
+        "col_metric": "指標",
+        "col_value": "値",
+        "price_trend": "株価と移動平均",
+        "evi_ret_1m": "1か月リターン",
+        "evi_vs_sma50": "株価 対 50日平均",
+        "evi_macd": "MACDトレンド",
+        "evi_bullish": "強気",
+        "evi_bearish": "弱気",
+        "evi_pe": "PER（株価収益率）",
+        "evi_div": "配当利回り",
+        "evi_rsi": "RSI（14）",
+        "evi_bbpct": "ボリンジャー%B",
+        "evi_roe": "ROE（自己資本利益率）",
+        "evi_mentions": "SNS・ニュース言及数",
+        "evi_short": "空売り比率（浮動株%）",
         "factor_momentum": "モメンタム",
         "factor_value": "バリュー",
         "factor_technical": "テクニカル",
@@ -718,6 +781,13 @@ TRANSLATIONS = {
         "sell_verdict_mixed": "中程度",
         "sell_verdict_low": "弱い",
         "sell_breakdown_title": "シグナル内訳（高いほど弱気）",
+        "sell_why_header": "売却シグナルの理由",
+        "sell_why_axis": "売り圧力への寄与（ポイント）",
+        "sell_why_caption": "各バーは弱気シグナルのスコア×ウェイト（データのあるシグナルのみ）で、合計が売り圧力スコアになります。最も長いバーが最大の懸念材料です。",
+        "sell_why_rationale": "主な懸念材料：{d1}（{s1}）と{d2}（{s2}）で売り圧力スコアの{share}%。",
+        "sell_why_rationale_one": "主な懸念材料：{d1}（{s1}）— 売り圧力スコアの{share}%。",
+        "sell_not_scored": "データなしで未評価：{items}。",
+        "sell_no_signal_data": "この銘柄では弱気シグナルのデータが得られず、説明できる売り圧力スコアがありません。",
         "sell_recent_downgrades": "最近のアナリスト格付け変更",
         "sell_insider_activity": "最近のインサイダー取引",
         "sell_no_analyst": "この銘柄の最近のアナリスト格付け変更はありません。",
@@ -2004,30 +2074,122 @@ def render_global_sectors(results: list[dict]) -> None:
         cols[2].markdown(metric_card(tr("card_trading_close"), fmt_money(r["price"])), unsafe_allow_html=True)
         cols[3].markdown(metric_card(tr("card_sustained_hype"), f"{r['hype_score']:.0f}", tr("breakout") if r['hype']['sustained'] else tr("flat"), positive=r['hype']['sustained']), unsafe_allow_html=True)
 
+def _pick_breakdown(r: dict, weights: dict) -> pd.DataFrame:
+    """Per-factor score, weight and weighted contribution to the composite.
+    contribution = weight * factor_score, and the contributions sum to the composite —
+    so this is an exact decomposition of *why* the name scored what it did."""
+    rows = []
+    for f in FACTORS:
+        score = safe_float(r.get("hype_score" if f == "hype" else f), float("nan"))
+        w = float(weights.get(f, 0.0))
+        rows.append({"factor": f, "score": score, "weight": w, "contribution": w * score})
+    return pd.DataFrame(rows)
+
+
+def _evidence_rows(r: dict) -> list:
+    """The actual KPI numbers behind each factor, as (factor, metric, value) rows."""
+    fm, fv, ft, fh, fq = (tr("factor_momentum"), tr("factor_value"), tr("factor_technical"),
+                          tr("factor_hype"), tr("factor_quality"))
+    def _f(x): return safe_float(x, float("nan"))
+    price, sma50 = _f(r.get("price")), _f(r.get("sma50"))
+    vs50 = "—" if (math.isnan(price) or math.isnan(sma50) or sma50 == 0) else f"{(price / sma50 - 1) * 100:+.1f}%"
+    macd = _f(r.get("macd_hist"))
+    macd_s = "—" if math.isnan(macd) else (tr("evi_bullish") if macd > 0 else tr("evi_bearish"))
+    pe, div, rsi, bbp = _f(r.get("pe")), _f(r.get("div_yield")), _f(r.get("rsi")), _f(r.get("bb_pct"))
+    roe, shortp = _f(r.get("roe")), _f(r.get("short_pct"))
+    ret1m = _f(r.get("ret_1m"))
+    return [
+        (fm, tr("evi_ret_1m"),  "—" if math.isnan(ret1m) else f"{ret1m:+.1f}%"),
+        (fm, tr("evi_vs_sma50"), vs50),
+        (fm, tr("evi_macd"),     macd_s),
+        (fv, tr("evi_pe"),       "—" if (math.isnan(pe) or pe <= 0) else f"{pe:,.1f}"),
+        (fv, tr("evi_div"),      "—" if math.isnan(div) else f"{div:.2f}%"),       # div_yield already in %
+        (ft, tr("evi_rsi"),      "—" if math.isnan(rsi) else f"{rsi:.0f}"),
+        (ft, tr("evi_bbpct"),    "—" if math.isnan(bbp) else f"{bbp:.2f}"),
+        (fq, tr("evi_roe"),      "—" if math.isnan(roe) else f"{roe * 100:.1f}%"),  # roe is a fraction
+        (fh, tr("evi_mentions"), f"{safe_float(r.get('hype_mentions'), 0):g}"),
+        (fh, tr("evi_short"),    "—" if math.isnan(shortp) else f"{shortp * 100:.1f}%"),  # fraction of float
+    ]
+
+
 def render_deep_dive(results: list[dict]) -> None:
     if not results:
         st.info(tr("need_run_history"))
         return
+    rank_of = {x["ticker"]: i + 1 for i, x in enumerate(
+        sorted(results, key=lambda x: safe_float(x.get("composite"), float("-inf")), reverse=True))}
+
     pick = st.selectbox(tr("select_profile"), [r["ticker"] for r in results])
     r = next(x for x in results if x["ticker"] == pick)
-
+    weights = get_latest_weights()
     st.markdown(f"### {tr('history_workspace', ticker=r['ticker'])}")
-    chart_df = pd.DataFrame({"Close": r["history"]["Close"], "SMA20": r["history"]["Close"].rolling(20).mean(), "SMA50": r["history"]["Close"].rolling(50).mean()})
+
+    # --- headline: composite, call, rank ---
+    comp = safe_float(r.get("composite"), float("nan"))
+    rec = str(r.get("recommendation", "—"))
+    hc = st.columns(3)
+    hc[0].markdown(metric_card(tr("why_composite"), fmt_num(comp, 1),
+                   positive=(not math.isnan(comp) and comp >= BUY_THRESHOLD)), unsafe_allow_html=True)
+    hc[1].markdown(metric_card(tr("why_call"), rec, positive=(rec == "BUY")), unsafe_allow_html=True)
+    hc[2].markdown(metric_card(tr("why_rank"), f"#{rank_of.get(pick, '—')} / {len(results)}"),
+                   unsafe_allow_html=True)
+
+    # --- why this pick: exact weighted-contribution decomposition ---
+    st.markdown(f"#### {tr('why_header')}")
+    name_map = {"momentum": tr("factor_momentum"), "value": tr("factor_value"),
+                "technical": tr("factor_technical"), "hype": tr("factor_hype"),
+                "quality": tr("factor_quality")}
+    bd = _pick_breakdown(r, weights)
+    bd["label"] = bd["factor"].map(name_map)
+    total = float(bd["contribution"].sum())
+    bd_sorted = bd.sort_values("contribution", ascending=False)
+
+    chart = (alt.Chart(bd_sorted)
+             .mark_bar()
+             .encode(
+                 x=alt.X("contribution:Q", axis=alt.Axis(title=tr("why_contrib_axis"))),
+                 y=alt.Y("label:N", sort="-x", axis=alt.Axis(title=None)),
+                 color=alt.Color("label:N", legend=None),
+                 tooltip=[alt.Tooltip("label:N", title=tr("col_factor")),
+                          alt.Tooltip("score:Q", title=tr("col_score"), format=".0f"),
+                          alt.Tooltip("weight:Q", title=tr("col_weight"), format=".0%"),
+                          alt.Tooltip("contribution:Q", title=tr("col_contribution"), format=".1f")])
+             .properties(height=210, width="container"))
+    st.altair_chart(chart)
+    st.caption(tr("why_contrib_caption"))
+
+    show = (bd_sorted.assign(share=lambda d: (d["contribution"] / total * 100.0) if total else float("nan"))
+            [["label", "score", "weight", "contribution", "share"]]
+            .rename(columns={"label": tr("col_factor"), "score": tr("col_score"),
+                             "weight": tr("col_weight"), "contribution": tr("col_contribution"),
+                             "share": tr("col_share")}))
+    st.dataframe(show.style.format({tr("col_score"): "{:.0f}", tr("col_weight"): "{:.0%}",
+                 tr("col_contribution"): "{:.1f}", tr("col_share"): "{:.0f}%"}, na_rep="—"),
+                 width="stretch", hide_index=True)
+
+    # plain-language rationale: top two contributors as drivers, lowest score as the drag
+    top, second = bd_sorted.iloc[0], bd_sorted.iloc[1]
+    weak = bd.sort_values("score").iloc[0]
+    share2 = ((top["contribution"] + second["contribution"]) / total * 100.0) if total else float("nan")
+    st.info(tr("why_rationale", d1=top["label"], s1=f"{top['score']:.0f}",
+               d2=second["label"], s2=f"{second['score']:.0f}", share=f"{share2:.0f}",
+               w=weak["label"], sw=f"{weak['score']:.0f}"))
+
+    # --- evidence: the real numbers behind each factor ---
+    st.markdown(f"#### {tr('why_evidence')}")
+    ev = pd.DataFrame(_evidence_rows(r), columns=[tr("col_factor"), tr("col_metric"), tr("col_value")])
+    st.dataframe(ev, width="stretch", hide_index=True)
+
+    # --- price context ---
+    st.markdown(f"#### {tr('price_trend')}")
+    chart_df = pd.DataFrame({"Close": r["history"]["Close"],
+                             "SMA20": r["history"]["Close"].rolling(20).mean(),
+                             "SMA50": r["history"]["Close"].rolling(50).mean()})
     st.line_chart(chart_df.dropna())
 
-    st.markdown(f"#### {tr('factor_breakdown')}")
-    breakdown = pd.Series({
-        tr("factor_momentum"): r["momentum"],
-        tr("factor_value"): r["value"],
-        tr("factor_technical"): r["technical"],
-        tr("factor_hype"): r["hype_score"],
-        tr("factor_quality"): r["quality"],
-    })
-    st.bar_chart(breakdown)
-
     mentions = safe_float(r.get("hype_mentions", 0), 0.0)
-    st.markdown(metric_card(tr("hype_buzz_label"), f"{mentions:g}",
-                            positive=mentions > 0), unsafe_allow_html=True)
+    st.markdown(metric_card(tr("hype_buzz_label"), f"{mentions:g}", positive=mentions > 0),
+                unsafe_allow_html=True)
     st.caption(tr("hype_buzz_caption"))
     if _LAST_HYPE_STATUS:
         st.caption(_LAST_HYPE_STATUS)
@@ -2145,10 +2307,58 @@ def _render_sell_detail(data: dict) -> None:
                   unsafe_allow_html=True)
     c[2].markdown(metric_card(tr("price_label"), price_txt), unsafe_allow_html=True)
 
+    # --- why this is a sell: exact weighted-contribution decomposition ---
+    st.markdown(f"#### {tr('sell_why_header')}")
+    scored = [(k, float(s)) for k, s, _ in data["signals"] if s is not None]
+    if not scored:
+        st.caption(tr("sell_no_signal_data"))
+    else:
+        den = sum(SELL_KPI_WEIGHTS[k] for k, _ in scored) or 1.0
+        sb = pd.DataFrame([{
+            "label": tr(f"kpi_{k}"), "score": s, "weight": SELL_KPI_WEIGHTS[k],
+            "contribution": SELL_KPI_WEIGHTS[k] * s / den,    # contributions sum to the composite
+        } for k, s in scored])
+        total = float(sb["contribution"].sum())
+        sb_sorted = sb.sort_values("contribution", ascending=False)
+
+        chart = (alt.Chart(sb_sorted).mark_bar()
+                 .encode(
+                     x=alt.X("contribution:Q", axis=alt.Axis(title=tr("sell_why_axis"))),
+                     y=alt.Y("label:N", sort="-x", axis=alt.Axis(title=None)),
+                     color=alt.Color("label:N", legend=None),
+                     tooltip=[alt.Tooltip("label:N", title=tr("col_kpi")),
+                              alt.Tooltip("score:Q", title=tr("col_score"), format=".0f"),
+                              alt.Tooltip("weight:Q", title=tr("col_weight"), format=".0%"),
+                              alt.Tooltip("contribution:Q", title=tr("col_contribution"), format=".1f")])
+                 .properties(height=210, width="container"))
+        st.altair_chart(chart)
+        st.caption(tr("sell_why_caption"))
+
+        show = (sb_sorted.assign(share=lambda d: (d["contribution"] / total * 100.0) if total else float("nan"))
+                [["label", "score", "weight", "contribution", "share"]]
+                .rename(columns={"label": tr("col_kpi"), "score": tr("col_score"),
+                                 "weight": tr("col_weight"), "contribution": tr("col_contribution"),
+                                 "share": tr("col_share")}))
+        st.dataframe(show.style.format({tr("col_score"): "{:.0f}", tr("col_weight"): "{:.0%}",
+                     tr("col_contribution"): "{:.1f}", tr("col_share"): "{:.0f}%"}, na_rep="—"),
+                     width="stretch", hide_index=True)
+
+        top = sb_sorted.iloc[0]
+        if len(sb_sorted) >= 2:
+            second = sb_sorted.iloc[1]
+            share2 = ((top["contribution"] + second["contribution"]) / total * 100.0) if total else float("nan")
+            st.info(tr("sell_why_rationale", d1=top["label"], s1=f"{top['score']:.0f}",
+                       d2=second["label"], s2=f"{second['score']:.0f}", share=f"{share2:.0f}"))
+        else:
+            share1 = (top["contribution"] / total * 100.0) if total else float("nan")
+            st.info(tr("sell_why_rationale_one", d1=top["label"], s1=f"{top['score']:.0f}",
+                       share=f"{share1:.0f}"))
+
+        skipped = [tr(f"kpi_{k}") for k, s, _ in data["signals"] if s is None]
+        if skipped:
+            st.caption(tr("sell_not_scored", items=", ".join(skipped)))
+
     st.markdown(f"#### {tr('sell_breakdown_title')}")
-    scored = {tr(f"kpi_{k}"): s for k, s, _ in data["signals"] if s is not None}
-    if scored:
-        st.bar_chart(pd.Series(scored))
 
     readings = [{
         tr("col_kpi"): tr(f"kpi_{k}"),
