@@ -131,6 +131,46 @@ def _count_ticker_mentions(blob_upper: str, tickers: list) -> dict:
         counts[t] = len(re.findall(pattern, blob_upper, re.IGNORECASE))
     return counts
 
+# Small finance lexicons for a *gentle* directional tilt on Reddit buzz. Mention count is
+# volume; this nudges it by the bull/bear words appearing near each mention, so a heavily
+# bearish-discussed name doesn't earn the same hype as a bullish one. The tilt is bounded
+# and multiplicative — it can dampen the positive kick toward zero but never manufactures
+# negative hype (the sell scanner owns bearishness). With sparse text it's ~0, i.e. a
+# plain count. Empty either set to disable that side.
+_BULL_WORDS = {"BUY", "BUYING", "BOUGHT", "LONG", "CALL", "CALLS", "MOON", "MOONING",
+               "BULLISH", "BULL", "BREAKOUT", "RALLY", "SQUEEZE", "PUMP", "ROCKET",
+               "UNDERVALUED", "BEAT", "BEATS", "UPGRADE", "UPGRADED", "GAINS", "GREEN",
+               "HODL", "ACCUMULATE", "OVERSOLD", "RIP"}
+_BEAR_WORDS = {"SELL", "SELLING", "SOLD", "SHORT", "SHORTING", "PUT", "PUTS", "CRASH",
+               "CRASHING", "BEARISH", "BEAR", "DUMP", "DUMPING", "DROP", "DROPPING",
+               "OVERVALUED", "MISS", "MISSES", "MISSED", "DOWNGRADE", "DOWNGRADED",
+               "RED", "BAGHOLDER", "PUKE", "TANK", "TANKING", "DEAD"}
+_TONE_WINDOW = 80     # chars of context examined each side of a mention
+_TONE_GAIN = 0.15     # tilt per net (bull - bear) distinct word
+_TONE_CAP = 0.5       # max |tilt|, so buzz is scaled within [0.5x, 1.5x]
+
+def _tone_weighted_counts(blob_upper: str, tickers: list) -> dict:
+    """Mention count per ticker, gently scaled by the bull/bear tone of the text around
+    each mention: volume * (1 + tilt), tilt in [-_TONE_CAP, +_TONE_CAP], floored at 0.
+    Distinct sentiment words per window (so spam can't dominate). Degrades to a plain
+    count when no sentiment words are nearby."""
+    out = {}
+    for t in tickers:
+        pattern = (r"\$" + re.escape(t) + r"\b") if len(t) < 3 else (r"\b" + re.escape(t) + r"\b")
+        matches = list(re.finditer(pattern, blob_upper, re.IGNORECASE))
+        n = len(matches)
+        if n == 0:
+            out[t] = 0.0
+            continue
+        net = 0
+        for m in matches:
+            ctx = blob_upper[max(0, m.start() - _TONE_WINDOW): m.end() + _TONE_WINDOW]
+            words = set(re.findall(r"[A-Z]+", ctx))
+            net += len(words & _BULL_WORDS) - len(words & _BEAR_WORDS)
+        tilt = max(-_TONE_CAP, min(_TONE_CAP, _TONE_GAIN * net))
+        out[t] = max(0.0, n * (1.0 + tilt))
+    return out
+
 def _reddit_get(url: str, headers: dict, data: bytes | None = None) -> str:
     """Single urllib request honouring the app's SSL context. Raises on failure."""
     req = urllib.request.Request(url, data=data, headers=headers)
@@ -158,52 +198,81 @@ def _reddit_oauth_token() -> str | None:
 # Records which path last produced data, for an at-a-glance UI status indicator.
 _LAST_REDDIT_SOURCE = "offline"
 
+# Public finance subreddits polled for the hype signal. More subs = broader coverage
+# but more requests and higher block risk on unauthenticated access, so this is a
+# deliberate handful of high ticker-density communities. Each is polled ONCE per scan
+# (titles + bodies counted across the whole blob), never per ticker — per-ticker search
+# would be one request per ticker per sub and get throttled fast.
+REDDIT_SUBS = ["wallstreetbets", "stocks", "investing", "StockMarket", "options"]
+
+def _reddit_collect(url_fn, headers_fn, parse_fn) -> str | None:
+    """Fetch each REDDIT_SUBS listing, run parse_fn(raw) -> list[str], and join them.
+    Per-sub failures are skipped; returns the combined UPPERCASED text, or None if
+    every subreddit failed (so the caller can drop to the next tier)."""
+    chunks, ok = [], False
+    for sub in REDDIT_SUBS:
+        try:
+            chunks.extend(parse_fn(_reddit_get(url_fn(sub), headers_fn())))
+            ok = True
+        except Exception:
+            continue   # this subreddit unavailable -> skip, keep polling the rest
+        time.sleep(0.3)   # courtesy spacing between public requests
+    return (" ".join(chunks).upper() if ok else None)
+
+def _parse_reddit_json(raw: str) -> list:
+    texts = []
+    for child in json.loads(raw).get("data", {}).get("children", []):
+        d = child.get("data", {})
+        texts.append(str(d.get("title", "")))
+        texts.append(str(d.get("selftext", "")))
+    return texts
+
+def _parse_reddit_rss(raw: str) -> list:
+    blocks = re.findall(r"<title[^>]*>(.*?)</title>", raw, re.DOTALL | re.IGNORECASE)
+    blocks += re.findall(r"<content[^>]*>(.*?)</content>", raw, re.DOTALL | re.IGNORECASE)
+    return blocks if blocks else [raw]
+
 def fetch_reddit_hype(tickers: list) -> dict:
-    """Count r/wallstreetbets mentions per ticker, preferring authenticated access.
+    """Count mentions per ticker across several public finance subreddits, preferring
+    authenticated access.
 
     Three-tier, fully fail-safe:
-      1. Authenticated OAuth (set REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET in
-         Streamlit secrets or env vars) — by far the most reliable from cloud /
-         datacenter IPs, and pulls up to 100 hot posts (title + selftext).
-      2. Public RSS feed via urllib + browser UA — works locally, often blocked
-         on cloud IPs.
+      1. Authenticated OAuth (REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET) — most reliable
+         from cloud IPs; up to 100 hot posts (title + body) per subreddit.
+      2. Public RSS hot feed per subreddit — no account/registration; works locally,
+         often blocked on cloud datacenter IPs.
       3. Zero mentions for every ticker — guarantees the scan never crashes.
-    No extra pip dependencies: base64/json/urllib/ssl are all standard library.
+    Subreddits are polled once each (not per ticker). Standard library only.
     """
     global _LAST_REDDIT_SOURCE
-    counts = {t: 0 for t in tickers}
 
-    # --- Tier 1: authenticated OAuth -------------------------------------------
+    # --- Tier 1: authenticated OAuth across all subs ---------------------------
     try:
         token = _reddit_oauth_token()
         if token:
             ua = _get_secret("REDDIT_USER_AGENT", "stockrec-hype/1.0")
-            raw = _reddit_get("https://oauth.reddit.com/r/wallstreetbets/hot?limit=100",
-                              {"Authorization": f"Bearer {token}", "User-Agent": ua})
-            payload = json.loads(raw)
-            texts = []
-            for child in payload.get("data", {}).get("children", []):
-                d = child.get("data", {})
-                texts.append(str(d.get("title", "")))
-                texts.append(str(d.get("selftext", "")))
-            _LAST_REDDIT_SOURCE = "authenticated"
-            return _count_ticker_mentions(" ".join(texts).upper(), tickers)
+            blob = _reddit_collect(
+                lambda s: f"https://oauth.reddit.com/r/{s}/hot?limit=100",
+                lambda: {"Authorization": f"Bearer {token}", "User-Agent": ua},
+                _parse_reddit_json)
+            if blob is not None:
+                _LAST_REDDIT_SOURCE = "authenticated"
+                return _tone_weighted_counts(blob, tickers)
     except Exception:
         pass   # fall through to the unauthenticated RSS path
 
-    # --- Tier 2: unauthenticated public RSS ------------------------------------
-    try:
-        raw = _reddit_get("https://www.reddit.com/r/wallstreetbets/hot.rss",
-                          {"User-Agent": "Mozilla/5.0"})
-        blocks = re.findall(r"<title[^>]*>(.*?)</title>", raw, re.DOTALL | re.IGNORECASE)
-        blocks += re.findall(r"<content[^>]*>(.*?)</content>", raw, re.DOTALL | re.IGNORECASE)
-        blob = (" ".join(blocks) if blocks else raw).upper()
+    # --- Tier 2: unauthenticated public RSS across all subs --------------------
+    blob = _reddit_collect(
+        lambda s: f"https://www.reddit.com/r/{s}/hot.rss",
+        lambda: {"User-Agent": "Mozilla/5.0"},
+        _parse_reddit_rss)
+    if blob is not None:
         _LAST_REDDIT_SOURCE = "rss"
-        return _count_ticker_mentions(blob, tickers)
-    except Exception:
-        # --- Tier 3: safe zero-mention fallback --------------------------------
-        _LAST_REDDIT_SOURCE = "offline"
-        return {t: 0 for t in tickers}
+        return _tone_weighted_counts(blob, tickers)
+
+    # --- Tier 3: safe zero-mention fallback ------------------------------------
+    _LAST_REDDIT_SOURCE = "offline"
+    return {t: 0 for t in tickers}
 
 # ----------------------------------------------------------------------------
 # Pluggable, per-market sentiment sources
@@ -217,7 +286,7 @@ def fetch_reddit_hype(tickers: list) -> dict:
 _LAST_GDELT_STATUS = "offline"
 
 def _sentiment_reddit(tickers: list, names: dict) -> dict:
-    """Reddit r/wallstreetbets mention counts (English/US retail buzz)."""
+    """Reddit mention counts across several finance subs (English/US retail buzz)."""
     return fetch_reddit_hype(tickers)
 
 def _sentiment_gdelt(tickers: list, names: dict) -> dict:
@@ -269,15 +338,13 @@ DEFAULT_SOURCES = list(SENTIMENT_SOURCES.keys())
 
 # Human-readable summary of what the last hype scan actually used, for the UI.
 _LAST_HYPE_STATUS = ""
+_LAST_HYPE_FETCHED_AT = 0.0   # epoch seconds of the last ACTUAL (cache-miss) hype fetch
 
-def fetch_hype_signals(universe: dict, enabled_sources: list | None = None) -> dict:
-    """Run every enabled sentiment source over the markets it covers and merge the
-    per-ticker mention counts. Returns {ticker: combined_count}; analyze_ticker turns
-    that into the capped hype bonus. Each source is independently fail-safe."""
-    global _LAST_HYPE_STATUS
-    enabled = enabled_sources if enabled_sources is not None else DEFAULT_SOURCES
+def _fetch_hype_uncached(universe: dict, enabled: list) -> tuple:
+    """Run every enabled source over the markets it covers; merge per-ticker counts.
+    Returns (combined, sources_ran). Sets the per-source status globals as a side effect."""
     combined = {t: 0 for ticks in universe.values() for t in ticks}
-    status_parts = []
+    sources_ran = []
     for key in enabled:
         src = SENTIMENT_SOURCES.get(key)
         if not src:
@@ -292,12 +359,38 @@ def fetch_hype_signals(universe: dict, enabled_sources: list | None = None) -> d
             res = {}
         for t, c in res.items():
             combined[t] = combined.get(t, 0) + float(c or 0)
+        sources_ran.append(key)
+    return combined, sources_ran
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _hype_payload_cached(universe_key: tuple, enabled_key: tuple) -> dict:
+    """Cached real fetch (30-min TTL): repeat scans of the same universe + sources reuse
+    this instead of re-hitting Reddit/GDELT. Captures the fetch time and the raw per-source
+    status keys so the wrapper can rebuild a localized status string on cache hits too."""
+    universe = {region: list(tks) for region, tks in universe_key}
+    combined, sources_ran = _fetch_hype_uncached(universe, list(enabled_key))
+    return {"counts": combined, "sources_ran": sources_ran,
+            "reddit": _LAST_REDDIT_SOURCE, "gdelt": _LAST_GDELT_STATUS,
+            "fetched_at": time.time()}
+
+def fetch_hype_signals(universe: dict, enabled_sources: list | None = None) -> dict:
+    """Merged per-ticker hype counts ({ticker: combined_count}); analyze_ticker turns that
+    into the capped hype bonus. Results are cached for 30 min and stamped with a fetch time
+    (shown as 'updated X ago'); each source is independently fail-safe."""
+    global _LAST_HYPE_STATUS, _LAST_HYPE_FETCHED_AT, _LAST_REDDIT_SOURCE, _LAST_GDELT_STATUS
+    enabled = enabled_sources if enabled_sources is not None else DEFAULT_SOURCES
+    universe_key = tuple((region, tuple(ticks)) for region, ticks in sorted(universe.items()))
+    payload = _hype_payload_cached(universe_key, tuple(enabled))
+    _LAST_HYPE_FETCHED_AT = payload["fetched_at"]
+    _LAST_REDDIT_SOURCE, _LAST_GDELT_STATUS = payload["reddit"], payload["gdelt"]
+    status_parts = []
+    for key in payload["sources_ran"]:
         if key == "reddit":
-            status_parts.append(f"{tr('src_reddit')}: {tr('hype_status_' + _LAST_REDDIT_SOURCE)}")
+            status_parts.append(f"{tr('src_reddit')}: {tr('hype_status_' + payload['reddit'])}")
         elif key == "gdelt":
-            status_parts.append(f"{tr('src_gdelt')}: {tr('hype_status_' + _LAST_GDELT_STATUS)}")
+            status_parts.append(f"{tr('src_gdelt')}: {tr('hype_status_' + payload['gdelt'])}")
     _LAST_HYPE_STATUS = (tr("hype_sources_prefix") + " " + " · ".join(status_parts)) if status_parts else ""
-    return combined
+    return payload["counts"]
 
 
 
@@ -521,11 +614,12 @@ TRANSLATIONS = {
         "reason_dividend": "Top Dividend",
         "regions_to_scan": "Regions to Scan",
         "sentiment_sources": "Sentiment Sources",
-        "src_reddit": "Reddit (r/wallstreetbets)",
+        "src_reddit": "Reddit (finance subs)",
         "src_gdelt": "Global News (GDELT)",
         "hype_buzz_label": "Social & News Buzz (mentions)",
         "hype_buzz_caption": "Combined mentions of this stock across the enabled sentiment sources during the last scan (feeds the Hype factor).",
         "hype_sources_prefix": "Buzz sources —",
+        "hype_updated": "Sentiment updated {ago} ago",
         "hype_status_authenticated": "Reddit API ✓",
         "hype_status_rss": "RSS feed",
         "hype_status_ok": "live ✓",
@@ -727,11 +821,12 @@ TRANSLATIONS = {
         "reason_dividend": "高配当トップ",
         "regions_to_scan": "スキャンする地域",
         "sentiment_sources": "センチメント・ソース",
-        "src_reddit": "Reddit（r/wallstreetbets）",
+        "src_reddit": "Reddit（金融系サブレディット）",
         "src_gdelt": "グローバルニュース（GDELT）",
         "hype_buzz_label": "ソーシャル・ニュース言及数",
         "hype_buzz_caption": "直近のスキャン時に、有効化したセンチメント・ソース全体でこの銘柄が言及された合計回数（ハイプ・ファクターに反映されます）。",
         "hype_sources_prefix": "バズの取得元 —",
+        "hype_updated": "センチメント更新：{ago}前",
         "hype_status_authenticated": "Reddit API ✓",
         "hype_status_rss": "RSSフィード",
         "hype_status_ok": "ライブ ✓",
@@ -2074,6 +2169,17 @@ def render_global_sectors(results: list[dict]) -> None:
         cols[2].markdown(metric_card(tr("card_trading_close"), fmt_money(r["price"])), unsafe_allow_html=True)
         cols[3].markdown(metric_card(tr("card_sustained_hype"), f"{r['hype_score']:.0f}", tr("breakout") if r['hype']['sustained'] else tr("flat"), positive=r['hype']['sustained']), unsafe_allow_html=True)
 
+def _ago(epoch: float) -> str:
+    """Compact 'time since' label, e.g. '<1m', '12m', '2h 5m'. Unit suffixes only, so
+    the surrounding 'updated … ago' phrasing handles localization."""
+    mins = max(0, int(time.time() - epoch)) // 60
+    if mins < 1:
+        return "<1m"
+    if mins < 60:
+        return f"{mins}m"
+    return f"{mins // 60}h {mins % 60}m"
+
+
 def _pick_breakdown(r: dict, weights: dict) -> pd.DataFrame:
     """Per-factor score, weight and weighted contribution to the composite.
     contribution = weight * factor_score, and the contributions sum to the composite —
@@ -2193,6 +2299,8 @@ def render_deep_dive(results: list[dict]) -> None:
     st.caption(tr("hype_buzz_caption"))
     if _LAST_HYPE_STATUS:
         st.caption(_LAST_HYPE_STATUS)
+    if _LAST_HYPE_FETCHED_AT:
+        st.caption(tr("hype_updated", ago=_ago(_LAST_HYPE_FETCHED_AT)))
 
 def render_engine_audit(update_prices: bool = True) -> None:
     st.markdown(f"### {tr('audit_header_text')}")
