@@ -605,6 +605,10 @@ TRANSLATIONS = {
         "wsb_source_offline": "⚪ Source: offline — Reddit was unreachable, so mentions counted as 0.",
         "historical_performance": "Historical Performance (Mock Portfolio)",
         "historical_perf_note": "Return % is the live price vs. the price when the pick was logged. Green = ahead, red = behind. These curated picks also feed the walk-forward weight optimizer.",
+        "audit_one_per_stock": "One row per stock (development since first pick)",
+        "audit_one_per_note": "Each stock appears once. Return % is measured from its FIRST recommendation (live price vs. that price), so it shows how the call has aged. 'Times picked' = how often the engine has flagged it. Untick to see every individual pick.",
+        "col_first_rec": "First recommended",
+        "col_times": "Times picked",
         "no_portfolio_picks": "No saved picks yet — run a scan to start logging the mock portfolio.",
         "col_reason": "Reason",
         "col_rec_price": "Rec. Price",
@@ -812,6 +816,10 @@ TRANSLATIONS = {
         "wsb_source_offline": "⚪ ソース：オフライン（Redditに接続できず、言及数は0としてカウント）。",
         "historical_performance": "ヒストリカル・パフォーマンス（模擬ポートフォリオ）",
         "historical_perf_note": "リターン％は、記録時の株価に対する現在株価の変化です。緑＝プラス、赤＝マイナス。これらの厳選銘柄はウォークフォワード重み最適化にも反映されます。",
+        "audit_one_per_stock": "銘柄ごとに1行（初回推奨からの推移）",
+        "audit_one_per_note": "各銘柄は1回のみ表示。リターン％は初回推奨時の株価を基準に算出（現在株価との比較）し、推奨の経過を示します。「推奨回数」はエンジンが選出した回数です。チェックを外すと個別の推奨をすべて表示します。",
+        "col_first_rec": "初回推奨日",
+        "col_times": "推奨回数",
         "no_portfolio_picks": "保存された推奨はまだありません。スキャンを実行すると模擬ポートフォリオの記録が始まります。",
         "col_reason": "理由",
         "col_rec_price": "推奨時株価",
@@ -2225,10 +2233,12 @@ def render_deep_dive(results: list[dict]) -> None:
     rank_of = {x["ticker"]: i + 1 for i, x in enumerate(
         sorted(results, key=lambda x: safe_float(x.get("composite"), float("-inf")), reverse=True))}
 
-    pick = st.selectbox(tr("select_profile"), [r["ticker"] for r in results])
+    names = {r["ticker"]: r.get("name", r["ticker"]) for r in results}
+    pick = st.selectbox(tr("select_profile"), [r["ticker"] for r in results],
+                        format_func=lambda t: f"{t} — {names.get(t, t)}")
     r = next(x for x in results if x["ticker"] == pick)
     weights = get_latest_weights()
-    st.markdown(f"### {tr('history_workspace', ticker=r['ticker'])}")
+    st.markdown(f"### {r['ticker']} — {r.get('name', r['ticker'])}")
 
     # --- headline: composite, call, rank ---
     comp = safe_float(r.get("composite"), float("nan"))
@@ -2353,27 +2363,46 @@ def render_engine_audit(update_prices: bool = True) -> None:
     if mp.empty:
         st.caption(tr("no_portfolio_picks"))
         return
-    mp = mp.head(40)
-    uniq = list(mp["ticker"].unique())
+    mp["date"] = pd.to_datetime(mp["timestamp"], errors="coerce")
+    one_per = st.checkbox(tr("audit_one_per_stock"), value=True)
+
+    if one_per:
+        # one row per stock: anchor on its FIRST recommendation (so return reflects the
+        # full development since the engine first flagged it) and count how often picked
+        view = mp.sort_values("date").drop_duplicates("ticker", keep="first").copy()
+        view["times"] = view["ticker"].map(mp.groupby("ticker").size()).astype(int)
+    else:
+        view = mp.head(40).copy()
+
+    uniq = list(view["ticker"].unique())
     if update_prices:
-        # SINGLE bulk request for every unique ticker — replaces the per-ticker
-        # fetch storm that was tripping Yahoo's rate limiter and crashing the app.
+        # SINGLE bulk request for every unique ticker — replaces the per-ticker fetch
+        # storm that was tripping Yahoo's rate limiter and crashing the app.
         prices = _bulk_latest_close(uniq)
     else:
         prices = {t: float("nan") for t in uniq}   # checkbox off -> leave prices blank
-    mp["current"] = mp["ticker"].map(prices)
-    mp["return_pct"] = (mp["current"] / mp["recommendation_price"] - 1.0) * 100.0
-    mp["date"] = pd.to_datetime(mp["timestamp"], errors="coerce").dt.date.astype(str)
-    mp["name"] = mp["name"].fillna("")   # older rows logged before names were stored
+    view["current"] = view["ticker"].map(prices)
+    view["return_pct"] = (view["current"] / view["recommendation_price"] - 1.0) * 100.0
+    view["date_str"] = view["date"].dt.date.astype(str)
+    view["name"] = view["name"].fillna("")   # older rows logged before names were stored
     reason_map = {"Top Growth": tr("reason_growth"), "Top Dividend": tr("reason_dividend")}
-    mp["reason"] = mp["reason"].map(lambda x: reason_map.get(x, x))
+    view["reason"] = view["reason"].map(lambda x: reason_map.get(x, x))
 
     ret_col = tr("col_return_pct")
     rec_col, cur_col = tr("col_rec_price"), tr("col_current_price")
-    disp = mp[["date", "ticker", "name", "reason", "recommendation_price", "current", "return_pct"]].rename(columns={
-        "date": tr("col_date"), "ticker": tr("col_ticker"), "name": tr("col_company"), "reason": tr("col_reason"),
-        "recommendation_price": rec_col, "current": cur_col, "return_pct": ret_col,
-    })
+    if one_per:
+        view = view.sort_values("return_pct", ascending=False, na_position="last")
+        disp = view[["date_str", "ticker", "name", "reason", "times",
+                     "recommendation_price", "current", "return_pct"]].rename(columns={
+            "date_str": tr("col_first_rec"), "ticker": tr("col_ticker"), "name": tr("col_company"),
+            "reason": tr("col_reason"), "times": tr("col_times"),
+            "recommendation_price": rec_col, "current": cur_col, "return_pct": ret_col})
+    else:
+        disp = view[["date_str", "ticker", "name", "reason",
+                     "recommendation_price", "current", "return_pct"]].rename(columns={
+            "date_str": tr("col_date"), "ticker": tr("col_ticker"), "name": tr("col_company"),
+            "reason": tr("col_reason"),
+            "recommendation_price": rec_col, "current": cur_col, "return_pct": ret_col})
 
     def _style_returns(series):
         styles = []
@@ -2387,12 +2416,12 @@ def render_engine_audit(update_prices: bool = True) -> None:
               .apply(_style_returns, subset=[ret_col])
               .format({rec_col: "{:,.2f}", cur_col: "{:,.2f}", ret_col: "{:+.2f}%"}, na_rep="—"))
     st.dataframe(styled, width="stretch", hide_index=True)
-    st.caption(tr("historical_perf_note"))
+    st.caption(tr("audit_one_per_note") if one_per else tr("historical_perf_note"))
     if update_prices:
         unpriced = sorted({t for t in uniq if pd.isna(prices.get(t, float("nan")))})
         if unpriced:
             st.caption(tr("prices_unavailable", tickers=", ".join(unpriced)))
-    if not update_prices:
+    else:
         st.caption(tr("prices_skipped"))
 
 def _sell_pill(verdict: str) -> str:
@@ -2535,6 +2564,7 @@ def render_sell_signals() -> None:
 
     if st.button(tr("sell_scan_btn"), width="stretch", disabled=not portfolio):
         rows = []
+        details = {}
         # OPTIMISATION: one bulk yf.download for every name's history up front, so
         # the per-ticker loop reuses it instead of making a history request each.
         with st.spinner(tr("sell_bulk_fetch", total=len(portfolio))):
@@ -2549,12 +2579,14 @@ def render_sell_signals() -> None:
                 rows.append({"ticker": data["ticker"], "price": data["price"],
                              "composite": data["composite"],
                              "verdict": tr(f"sell_verdict_{data['verdict']}")})
+                details[data["ticker"]] = data   # keep the full breakdown for the drill-down
             else:
                 rows.append({"ticker": tk, "price": float("nan"),
                              "composite": float("nan"), "verdict": tr("sell_verdict_na")})
             prog.progress(i / len(portfolio), text=tr("sell_scan_progress", done=i, total=len(portfolio)))
         prog.empty()
         st.session_state["portfolio_results"] = rows
+        st.session_state["portfolio_details"] = details
 
     results = st.session_state.get("portfolio_results", [])
     if not results:
@@ -2579,20 +2611,22 @@ def render_sell_signals() -> None:
               .format({price_col: "{:,.2f}", comp_col: "{:.0f}"}, na_rep="—"))
     st.dataframe(styled, width="stretch", hide_index=True)
 
-    # Optional drill-down: full breakdown for any one scanned ticker.
+    # Drill-down: show the full breakdown computed during the scan — no re-fetch, so it
+    # works for any number of stocks (re-fetching here got rate-limited after a big scan).
     with st.expander(tr("sell_detail_expander")):
         choices = [r["ticker"] for r in results]
         sel = st.selectbox(tr("sell_detail_select"), choices, key="sell_detail_pick")
-        if sel:
+        detail = st.session_state.get("portfolio_details", {}).get(sel)
+        if detail is None and sel:        # fallback (e.g. results from an older session)
             with st.spinner(tr("sell_spinner", ticker=sel)):
                 try:
                     detail = analyze_sell_signals(sel)
                 except Exception:
                     detail = None   # a raised (rate-limited) sub-fetch -> show the notice
-            if detail is None:
-                st.warning(tr("sell_no_data", ticker=sel))
-            else:
-                _render_sell_detail(detail)
+        if detail is None:
+            st.warning(tr("sell_no_data", ticker=sel))
+        else:
+            _render_sell_detail(detail)
 
 # ----------------------------------------------------------------------------
 # Main Application Controller Setup
@@ -2652,6 +2686,12 @@ def main() -> None:
 
     if failed:
         st.sidebar.warning(tr("skipped", items=", ".join(failed)))
+
+    # Global sentiment telemetry: surface the buzz sources + freshness once a scan has
+    # run, so it's visible app-wide rather than only inside the Deep-Dive tab.
+    if _LAST_HYPE_FETCHED_AT:
+        _msg = tr("hype_updated", ago=_ago(_LAST_HYPE_FETCHED_AT))
+        st.caption(f"{_LAST_HYPE_STATUS} · {_msg}" if _LAST_HYPE_STATUS else _msg)
 
     # Main Segment View tabs routing setup
     t1, t2, t3, t4, t5, t6, t7 = st.tabs([tr("tab_top"), tr("tab_regional"), tr("tab_category"), tr("tab_deep"), tr("tab_audit"), tr("tab_sell"), tr("tab_us")])
