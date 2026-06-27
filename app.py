@@ -418,9 +418,13 @@ SELL_THRESHOLD = 45.0
 # Expanded global universe. Trim any list to speed up scans (each symbol adds
 # a price fetch + a fundamentals call, so ~60 tickers takes a couple of minutes).
 TICKER_UNIVERSE = {
-    "USA": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "TSLA", "META",
-            "JPM", "V", "WMT", "JNJ", "PG", "XOM", "KO", "DIS",
-            "NFLX", "AMD", "BAC", "PFE", "CSCO", "MRK", "HD"],
+    # Ordered so the first ~10 give every THEME a representative (NVDA→AI/semis,
+    # TSLA→EV/clean, LMT→defense, XOM→energy, JNJ→healthcare, JPM→financials,
+    # AMZN→consumer), so a Quick scan (first N per region) still covers the Themes tab.
+    "USA": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "TSLA", "JPM", "LMT", "XOM", "JNJ",
+            "META", "V", "WMT", "PG", "KO", "DIS", "NFLX", "AMD", "BAC", "PFE",
+            "CSCO", "MRK", "HD", "RTX", "NOC", "GD", "BA", "CVX", "COP", "SLB",
+            "NEE", "ENPH", "FSLR", "LLY", "UNH"],
     "Japan": ["7203.T", "6758.T", "9984.T", "6501.T", "7751.T",
               "8306.T", "9432.T", "6902.T", "4063.T", "8035.T",
               "7267.T", "6098.T", "9433.T", "6954.T", "8058.T"],
@@ -443,6 +447,11 @@ COMPANY_NAMES = {
     "XOM": "Exxon Mobil", "KO": "Coca-Cola", "DIS": "Disney", "NFLX": "Netflix",
     "AMD": "AMD", "BAC": "Bank of America", "PFE": "Pfizer", "CSCO": "Cisco",
     "MRK": "Merck", "HD": "Home Depot",
+    "LMT": "Lockheed Martin", "RTX": "RTX Raytheon", "NOC": "Northrop Grumman",
+    "GD": "General Dynamics", "BA": "Boeing", "CVX": "Chevron",
+    "COP": "ConocoPhillips", "SLB": "SLB Schlumberger", "NEE": "NextEra Energy",
+    "ENPH": "Enphase Energy", "FSLR": "First Solar", "LLY": "Eli Lilly",
+    "UNH": "UnitedHealth",
     "7203.T": "Toyota", "6758.T": "Sony", "9984.T": "SoftBank", "6501.T": "Hitachi",
     "7751.T": "Canon", "8306.T": "Mitsubishi UFJ", "9432.T": "NTT", "6902.T": "Denso",
     "4063.T": "Shin-Etsu Chemical", "8035.T": "Tokyo Electron", "7267.T": "Honda",
@@ -454,6 +463,25 @@ COMPANY_NAMES = {
     "0700.HK": "Tencent", "9988.HK": "Alibaba", "BABA": "Alibaba", "JD": "JD.com",
     "BIDU": "Baidu", "1810.HK": "Xiaomi", "3690.HK": "Meituan", "PDD": "Pinduoduo",
     "NIO": "NIO", "2318.HK": "Ping An", "0939.HK": "China Construction Bank", "1299.HK": "AIA",
+}
+
+# Curated, cross-region theme baskets. Members are drawn from TICKER_UNIVERSE so the
+# Themes tab reads straight from scan results (no extra fetching) — full coverage simply
+# means running a full (non-quick) scan. A name can sit in several themes (e.g. NVDA in
+# both AI and Semiconductors); that's intentional. Edit these lists to taste.
+THEMES = {
+    "Artificial Intelligence": ["NVDA", "MSFT", "GOOGL", "META", "AMD", "AMZN", "ASML",
+                                 "8035.T", "9984.T", "BIDU"],
+    "Semiconductors": ["NVDA", "AMD", "ASML", "8035.T", "4063.T"],
+    "Defense & Aerospace": ["LMT", "RTX", "NOC", "GD", "BA", "AIR.PA"],
+    "Energy (Oil & Gas)": ["XOM", "CVX", "COP", "SLB"],
+    "Clean Energy": ["NEE", "ENPH", "FSLR", "TSLA"],
+    "EV & Mobility": ["TSLA", "NIO", "7203.T", "7267.T", "VOW3.DE", "BMW.DE"],
+    "Financials": ["JPM", "V", "BAC", "8306.T", "ALV.DE", "2318.HK", "0939.HK", "1299.HK"],
+    "Consumer & Luxury": ["AMZN", "WMT", "KO", "PG", "HD", "MC.PA", "OR.PA", "RMS.PA",
+                          "NFLX", "DIS"],
+    "China Internet": ["0700.HK", "9988.HK", "JD", "BIDU", "3690.HK", "PDD", "1810.HK"],
+    "Healthcare": ["JNJ", "PFE", "MRK", "LLY", "UNH"],
 }
 
 # Benchmark index per home market for the walk-forward evaluator. A pick is judged
@@ -516,7 +544,7 @@ TRANSLATIONS = {
         "seed_success": "Synthetic data arrays appended to tracking engine database.",
         "skipped": "Skipped tickers: {items}",
         "scan_quick_toggle": "⚡ Quick scan (recommended on Cloud)",
-        "scan_quick_help": "Scans only the first few tickers per region — faster and far less likely to be rate-limited by Yahoo Finance.",
+        "scan_quick_help": "Scans the first 10 tickers per region (ordered so each theme gets a representative) — faster and far less likely to be rate-limited by Yahoo Finance. Untick for the full universe.",
         "all_failed": "Every fetch failed. Yahoo Finance is most likely rate-limiting this server's IP — this is common on Streamlit Cloud. Wait a few minutes and retry, or run the app locally.",
         "persistence_note": "ℹ️ On Streamlit Community Cloud, saved history is not guaranteed to persist — it resets whenever the app reboots or sleeps (after 12h idle). Use the seed button to repopulate the demo, or wire up an external database for permanent storage.",
         "benchmark_note": "📈 Accuracy is benchmark-relative: each pick counts as a win only if it beat its home market over the holding window (US→S&P 500, Japan→Nikkei 225, Hong Kong→Hang Seng, France→CAC 40, Germany→DAX).",
@@ -649,6 +677,29 @@ TRANSLATIONS = {
         # Sell-Signal scanner
         "tab_sell": "🔻 Sell Signals",
         "tab_us": "🇺🇸 US Conviction",
+        "tab_themes": "🧭 Themes",
+        "themes_caption": "Industries through three lenses — Momentum (what's strong now), Attention (hype/sentiment volume), and Smart-money buys (superinvestor 13F NEW positions). Triangulate, don't predict: none forecasts the future, momentum and attention reverse, attention skews to retail-favorite megacaps, and smart-money is US-only and ~45 days lagged. Not financial advice.",
+        "themes_bubble_caption": "Each bubble is a theme — right = stronger momentum, up = more attention, bigger = more superinvestor new-buys. Bottom-right (strong but quiet) can mean early institutional interest; top-left (loud but weak) is usually retail hype.",
+        "themes_rank_by": "Rank themes by",
+        "themes_rank_momentum": "Momentum",
+        "themes_rank_hype": "Attention",
+        "themes_rank_smart": "Smart-money buys",
+        "themes_momentum_axis": "Avg momentum score (0–100)",
+        "themes_hype_axis": "Avg attention score (0–100)",
+        "themes_smart_axis": "New 13F buys (US members)",
+        "themes_smart_unavailable": "Smart-money column unavailable (SEC fetch off or failed) — set SEC_USER_AGENT and rescan.",
+        "themes_coverage_note": "Computed from the current scan — 'Coverage' shows how many of each theme's names were scanned (Smart-money covers all US members regardless). Untick Quick scan (and select all regions) for full coverage. Themes with nothing scanned are hidden.",
+        "themes_no_coverage": "None of the theme names were in this scan. Untick Quick scan and select all regions, then rescan.",
+        "themes_top_header": "Top stocks in the selected theme",
+        "themes_select": "Drill into a theme",
+        "col_theme": "Theme",
+        "col_theme_momentum": "Momentum",
+        "col_theme_hype": "Attention",
+        "col_theme_smart": "Smart $ buys",
+        "col_theme_strength": "Strength",
+        "col_theme_ret1m": "Avg 1M %",
+        "col_theme_buys": "BUYs",
+        "col_theme_coverage": "Coverage",
         "us_header": "🇺🇸 Top US Conviction Picks (SEC Fundamentals)",
         "us_spinner": "Pulling audited SEC EDGAR fundamentals…",
         "us_module_missing": "The sec_research.py companion module isn't available — place it beside app.py.",
@@ -727,7 +778,7 @@ TRANSLATIONS = {
         "seed_success": "サンプルデータをトラッキングDBに追加しました。",
         "skipped": "スキップした銘柄: {items}",
         "scan_quick_toggle": "⚡ クイックスキャン（クラウド推奨）",
-        "scan_quick_help": "各地域の先頭数銘柄のみをスキャンします。高速で、Yahoo Finance のレート制限にかかりにくくなります。",
+        "scan_quick_help": "各地域の先頭10銘柄をスキャンします（各テーマの代表が含まれるよう並び替え済み）。高速でレート制限にかかりにくくなります。全銘柄はチェックを外してください。",
         "all_failed": "すべての取得に失敗しました。Yahoo Finance がこのサーバーのIPをレート制限している可能性が高いです（Streamlit Cloud ではよくあります）。数分待って再試行するか、ローカルで実行してください。",
         "persistence_note": "ℹ️ Streamlit Community Cloud では、保存された履歴は永続化が保証されません。アプリの再起動やスリープ（12時間無操作）のたびにリセットされます。シードボタンでデモを再生成するか、外部データベースを接続して永続保存してください。",
         "benchmark_note": "📈 的中率はベンチマーク相対です。各推奨は保有期間中に自国市場を上回った場合のみ「勝ち」と判定されます（米国→S&P500、日本→日経225、香港→ハンセン、フランス→CAC40、ドイツ→DAX）。",
@@ -860,6 +911,29 @@ TRANSLATIONS = {
         # 売りシグナル・スキャナー
         "tab_sell": "🔻 売りシグナル",
         "tab_us": "🇺🇸 米国確信度",
+        "tab_themes": "🧭 テーマ",
+        "themes_caption": "業界を3つの視点で見ます — モメンタム（今の強さ）、注目度（ハイプ/言及量）、スマートマネー買い（著名投資家の13F新規ポジション）。予測ではなく多角的な確認に使ってください：いずれも将来を予測するものではなく、モメンタムと注目度は反転し、注目度は個人投資家好みの大型株に偏り、スマートマネーは米国のみ・約45日遅延です。投資助言ではありません。",
+        "themes_bubble_caption": "各バブルがテーマです — 右ほどモメンタムが強く、上ほど注目度が高く、大きいほど著名投資家の新規買いが多いことを示します。右下（強いが静か）は機関投資家の初期関心の可能性、左上（騒がしいが弱い）は個人の過熱を示すことが多いです。",
+        "themes_rank_by": "並び替え基準",
+        "themes_rank_momentum": "モメンタム",
+        "themes_rank_hype": "注目度",
+        "themes_rank_smart": "スマートマネー買い",
+        "themes_momentum_axis": "平均モメンタムスコア（0〜100）",
+        "themes_hype_axis": "平均注目度スコア（0〜100）",
+        "themes_smart_axis": "13F新規買い（米国銘柄）",
+        "themes_smart_unavailable": "スマートマネー列は利用できません（SEC取得がオフまたは失敗）。SEC_USER_AGENT を設定して再スキャンしてください。",
+        "themes_coverage_note": "現在のスキャン結果から算出。「カバレッジ」は各テーマの銘柄のうちスキャン済みの数です（スマートマネーは全米国銘柄を対象）。完全なカバレッジにはクイックスキャンを外し全地域を選択してください。スキャンされた銘柄がないテーマは非表示です。",
+        "themes_no_coverage": "今回のスキャンにテーマ銘柄が含まれていません。クイックスキャンを外し全地域を選択して再スキャンしてください。",
+        "themes_top_header": "選択テーマの上位銘柄",
+        "themes_select": "テーマを掘り下げる",
+        "col_theme": "テーマ",
+        "col_theme_momentum": "モメンタム",
+        "col_theme_hype": "注目度",
+        "col_theme_smart": "スマート買い",
+        "col_theme_strength": "総合力",
+        "col_theme_ret1m": "平均1か月%",
+        "col_theme_buys": "BUY数",
+        "col_theme_coverage": "カバレッジ",
         "us_header": "🇺🇸 米国 確信度トップ銘柄（SEC財務）",
         "us_spinner": "SECの監査済み財務データ（EDGAR）を取得中…",
         "us_module_missing": "コンパニオンモジュール sec_research.py がありません。app.py と同じフォルダに置いてください。",
@@ -2226,6 +2300,124 @@ def _evidence_rows(r: dict) -> list:
     ]
 
 
+def render_themes(results: list[dict]) -> None:
+    if not results:
+        st.info(tr("need_run_engine"))
+        return
+    by_ticker = {r["ticker"]: r for r in results}
+
+    def _avg(present, key):
+        vals = [safe_float(x.get(key), float("nan")) for x in present]
+        vals = [v for v in vals if not math.isnan(v)]
+        return sum(vals) / len(vals) if vals else float("nan")
+
+    # Smart-money overlay: superinvestor 13F NEW buys, summed per theme. US-only and
+    # ~45-day lagged by nature; cached a day. Independent of the yfinance scan, so it
+    # covers every US member regardless of quick-scan. Fail-safe -> NaN if unavailable.
+    sci = {}
+    if sec_research is not None:
+        all_us = sorted({t for ticks in THEMES.values() for t in ticks if "." not in t})
+        try:
+            sci = _superinvestor_counts_cached(tuple(all_us))
+        except Exception:
+            sci = {}
+    smart_ok = bool(sci)
+
+    rows = []
+    for theme, ticks in THEMES.items():
+        present = [by_ticker[t] for t in ticks if t in by_ticker]
+        if not present:
+            continue   # nothing from this theme was scanned -> omit (coverage note explains)
+        smart = float(sum(int(sci.get(t, 0) or 0) for t in ticks)) if smart_ok else float("nan")
+        rows.append({"theme": theme,
+                     "momentum": _avg(present, "momentum"),
+                     "hype": _avg(present, "hype_score"),
+                     "smart": smart,
+                     "composite": _avg(present, "composite"),
+                     "ret1m": _avg(present, "ret_1m"),
+                     "n": len(present), "cover": len(ticks)})
+    if not rows:
+        st.warning(tr("themes_no_coverage"))
+        return
+    df = pd.DataFrame(rows)
+
+    st.caption(tr("themes_caption"))
+
+    # Multi-lens bubble: momentum (x) vs attention (y), bubble size = smart-money buys
+    # (falls back to coverage when 13F is unavailable). Lets you read quadrants at a
+    # glance — strong-but-quiet (right/low) vs loud-but-weak (left/high).
+    size_field, size_title = (("smart", tr("col_theme_smart")) if smart_ok
+                              else ("n", tr("col_theme_coverage")))
+    bubble = (alt.Chart(df).mark_circle(opacity=0.7).encode(
+        x=alt.X("momentum:Q", axis=alt.Axis(title=tr("themes_momentum_axis"))),
+        y=alt.Y("hype:Q", axis=alt.Axis(title=tr("themes_hype_axis"))),
+        size=alt.Size(f"{size_field}:Q", title=size_title, scale=alt.Scale(range=[80, 900])),
+        color=alt.Color("theme:N", legend=None),
+        tooltip=[alt.Tooltip("theme:N", title=tr("col_theme")),
+                 alt.Tooltip("momentum:Q", title=tr("col_theme_momentum"), format=".0f"),
+                 alt.Tooltip("hype:Q", title=tr("col_theme_hype"), format=".0f"),
+                 alt.Tooltip("smart:Q", title=tr("col_theme_smart"), format=".0f"),
+                 alt.Tooltip("composite:Q", title=tr("col_theme_strength"), format=".0f")])
+        .properties(height=380, width="container"))
+    st.altair_chart(bubble)
+    st.caption(tr("themes_bubble_caption"))
+
+    # Rank-by lens: momentum (strong now), attention (hype volume), or smart-money (13F
+    # new buys). Triangulation, not prediction — see the caption caveats.
+    lenses = {tr("themes_rank_momentum"): ("momentum", tr("themes_momentum_axis")),
+              tr("themes_rank_hype"): ("hype", tr("themes_hype_axis")),
+              tr("themes_rank_smart"): ("smart", tr("themes_smart_axis"))}
+    choice = st.radio(tr("themes_rank_by"), list(lenses.keys()), horizontal=True)
+    sort_key, axis_title = lenses[choice]
+    df = df.sort_values(sort_key, ascending=False, na_position="last")
+
+    chart = (alt.Chart(df).mark_bar()
+             .encode(
+                 x=alt.X(f"{sort_key}:Q", axis=alt.Axis(title=axis_title)),
+                 y=alt.Y("theme:N", sort="-x", axis=alt.Axis(title=None)),
+                 color=alt.Color("theme:N", legend=None),
+                 tooltip=[alt.Tooltip("theme:N", title=tr("col_theme")),
+                          alt.Tooltip("momentum:Q", title=tr("col_theme_momentum"), format=".0f"),
+                          alt.Tooltip("hype:Q", title=tr("col_theme_hype"), format=".0f"),
+                          alt.Tooltip("smart:Q", title=tr("col_theme_smart"), format=".0f"),
+                          alt.Tooltip("composite:Q", title=tr("col_theme_strength"), format=".0f")])
+             .properties(height=max(180, 28 * len(df)), width="container"))
+    st.altair_chart(chart)
+
+    table = df.assign(coverage=lambda d: d["n"].astype(str) + "/" + d["cover"].astype(str))[
+        ["theme", "momentum", "hype", "smart", "composite", "ret1m", "coverage"]].rename(columns={
+        "theme": tr("col_theme"), "momentum": tr("col_theme_momentum"),
+        "hype": tr("col_theme_hype"), "smart": tr("col_theme_smart"),
+        "composite": tr("col_theme_strength"), "ret1m": tr("col_theme_ret1m"),
+        "coverage": tr("col_theme_coverage")})
+    st.dataframe(table.style.format({tr("col_theme_momentum"): "{:.0f}", tr("col_theme_hype"): "{:.0f}",
+                 tr("col_theme_smart"): "{:.0f}", tr("col_theme_strength"): "{:.0f}",
+                 tr("col_theme_ret1m"): "{:+.1f}%"}, na_rep="—"),
+                 width="stretch", hide_index=True)
+    st.caption(tr("themes_coverage_note"))
+    if not smart_ok:
+        st.caption(tr("themes_smart_unavailable"))
+
+    # drill into one theme -> its scanned stocks, with per-name smart-money buys
+    st.markdown(f"#### {tr('themes_top_header')}")
+    pick = st.selectbox(tr("themes_select"), list(df["theme"]))
+    members = sorted([by_ticker[t] for t in THEMES[pick] if t in by_ticker],
+                     key=lambda x: safe_float(x.get("composite"), float("-inf")), reverse=True)
+    mdf = pd.DataFrame([{
+        tr("col_ticker"): x["ticker"], tr("col_company"): x.get("name", x["ticker"]),
+        tr("col_theme_strength"): safe_float(x.get("composite"), float("nan")),
+        tr("col_theme_momentum"): safe_float(x.get("momentum"), float("nan")),
+        tr("col_theme_hype"): safe_float(x.get("hype_score"), float("nan")),
+        tr("col_theme_smart"): float(int(sci.get(x["ticker"], 0) or 0)) if smart_ok else float("nan"),
+        tr("col_theme_ret1m"): safe_float(x.get("ret_1m"), float("nan")),
+        tr("why_call"): str(x.get("recommendation", "—")),
+    } for x in members])
+    st.dataframe(mdf.style.format({tr("col_theme_strength"): "{:.0f}", tr("col_theme_momentum"): "{:.0f}",
+                 tr("col_theme_hype"): "{:.0f}", tr("col_theme_smart"): "{:.0f}",
+                 tr("col_theme_ret1m"): "{:+.1f}%"}, na_rep="—"),
+                 width="stretch", hide_index=True)
+
+
 def render_deep_dive(results: list[dict]) -> None:
     if not results:
         st.info(tr("need_run_history"))
@@ -2664,7 +2856,7 @@ def main() -> None:
             st.sidebar.warning(tr("no_region_selected"))
         else:
             with st.spinner(tr("scan_spinner")):
-                limit = 6 if quick_scan else None
+                limit = 10 if quick_scan else None
                 res, fail = run_engine(limit_per_region=limit, regions=selected_regions,
                                        sources=selected_sources)
                 st.session_state["results"], st.session_state["failed"] = res, fail
@@ -2694,7 +2886,7 @@ def main() -> None:
         st.caption(f"{_LAST_HYPE_STATUS} · {_msg}" if _LAST_HYPE_STATUS else _msg)
 
     # Main Segment View tabs routing setup
-    t1, t2, t3, t4, t5, t6, t7 = st.tabs([tr("tab_top"), tr("tab_regional"), tr("tab_category"), tr("tab_deep"), tr("tab_audit"), tr("tab_sell"), tr("tab_us")])
+    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([tr("tab_top"), tr("tab_regional"), tr("tab_category"), tr("tab_deep"), tr("tab_audit"), tr("tab_sell"), tr("tab_us"), tr("tab_themes")])
 
     with t1: render_daily_top_3(results)
     with t2: render_global_sectors(results)
@@ -2703,6 +2895,7 @@ def main() -> None:
     with t5: render_engine_audit(update_prices)
     with t6: render_sell_signals()
     with t7: render_us_conviction(results)
+    with t8: render_themes(results)
 
 if __name__ == "__main__":
     main()
