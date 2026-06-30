@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import math
 import os
 import re
@@ -29,6 +30,8 @@ try:
     import sec_research
 except Exception:
     sec_research = None
+
+logger = logging.getLogger("alpha_quant")
 
 # ----------------------------------------------------------------------------
 # Networking — corporate-friendly SSL handling for yfinance
@@ -415,104 +418,21 @@ EVAL_HORIZON_DAYS = 14
 BUY_THRESHOLD = 65.0
 SELL_THRESHOLD = 45.0
 
-# Expanded global universe. Trim any list to speed up scans (each symbol adds
-# a price fetch + a fundamentals call, so ~60 tickers takes a couple of minutes).
-TICKER_UNIVERSE = {
-    # Ordered so the first ~10 give every THEME a representative (NVDA→AI/semis,
-    # TSLA→EV/clean, LMT→defense, XOM→energy, JNJ→healthcare, JPM→financials,
-    # AMZN→consumer), so a Quick scan (first N per region) still covers the Themes tab.
-    "USA": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "TSLA", "JPM", "LMT", "XOM", "JNJ",
-            "META", "V", "WMT", "PG", "KO", "DIS", "NFLX", "AMD", "BAC", "PFE",
-            "CSCO", "MRK", "HD", "RTX", "NOC", "GD", "BA", "CVX", "COP", "SLB",
-            "NEE", "ENPH", "FSLR", "LLY", "UNH"],
-    "Japan": ["7203.T", "6758.T", "9984.T", "6501.T", "7751.T",
-              "8306.T", "9432.T", "6902.T", "4063.T", "8035.T",
-              "7267.T", "6098.T", "9433.T", "6954.T", "8058.T"],
-    "Europe": ["ASML", "MC.PA", "VOW3.DE", "SAP", "OR.PA",
-               "SIE.DE", "AIR.PA", "ALV.DE", "BMW.DE", "BAS.DE",
-               "SU.PA", "DTE.DE", "AI.PA", "RMS.PA"],
-    "China": ["0700.HK", "9988.HK", "BABA", "JD", "BIDU",
-              "1810.HK", "3690.HK", "PDD", "NIO", "2318.HK",
-              "0939.HK", "1299.HK"]
-}
+from config import (
+    TICKER_UNIVERSE, COMPANY_NAMES, THEMES, BENCHMARKS, TRANSLATIONS,
+    DEEP_FINALISTS, DEEP_US_TICKERS, JP_DEEP_TICKERS, CN_DEEP_TICKERS, DEEP_UNIVERSES,
+)
+from indicators import (
+    compute_rsi, compute_macd, compute_bollinger, compute_hype, clamp,
+)
 ALL_TICKERS = [ticker for region in TICKER_UNIVERSE.values() for ticker in region]
 
-# Plain-English company names, used by news-based sentiment sources (a ticker like
-# "7203.T" never appears in an article, but "Toyota" does). Edit here to tune what
-# the news scan searches for. Falls back to the ticker itself if a name is missing.
-COMPANY_NAMES = {
-    "AAPL": "Apple", "MSFT": "Microsoft", "NVDA": "Nvidia", "AMZN": "Amazon",
-    "GOOGL": "Alphabet", "TSLA": "Tesla", "META": "Meta Platforms", "JPM": "JPMorgan",
-    "V": "Visa", "WMT": "Walmart", "JNJ": "Johnson & Johnson", "PG": "Procter & Gamble",
-    "XOM": "Exxon Mobil", "KO": "Coca-Cola", "DIS": "Disney", "NFLX": "Netflix",
-    "AMD": "AMD", "BAC": "Bank of America", "PFE": "Pfizer", "CSCO": "Cisco",
-    "MRK": "Merck", "HD": "Home Depot",
-    "LMT": "Lockheed Martin", "RTX": "RTX Raytheon", "NOC": "Northrop Grumman",
-    "GD": "General Dynamics", "BA": "Boeing", "CVX": "Chevron",
-    "COP": "ConocoPhillips", "SLB": "SLB Schlumberger", "NEE": "NextEra Energy",
-    "ENPH": "Enphase Energy", "FSLR": "First Solar", "LLY": "Eli Lilly",
-    "UNH": "UnitedHealth",
-    "7203.T": "Toyota", "6758.T": "Sony", "9984.T": "SoftBank", "6501.T": "Hitachi",
-    "7751.T": "Canon", "8306.T": "Mitsubishi UFJ", "9432.T": "NTT", "6902.T": "Denso",
-    "4063.T": "Shin-Etsu Chemical", "8035.T": "Tokyo Electron", "7267.T": "Honda",
-    "6098.T": "Recruit Holdings", "9433.T": "KDDI", "6954.T": "Fanuc", "8058.T": "Mitsubishi Corp",
-    "ASML": "ASML", "MC.PA": "LVMH", "VOW3.DE": "Volkswagen", "SAP": "SAP",
-    "OR.PA": "L'Oreal", "SIE.DE": "Siemens", "AIR.PA": "Airbus", "ALV.DE": "Allianz",
-    "BMW.DE": "BMW", "BAS.DE": "BASF", "SU.PA": "Schneider Electric",
-    "DTE.DE": "Deutsche Telekom", "AI.PA": "Air Liquide", "RMS.PA": "Hermes",
-    "0700.HK": "Tencent", "9988.HK": "Alibaba", "BABA": "Alibaba", "JD": "JD.com",
-    "BIDU": "Baidu", "1810.HK": "Xiaomi", "3690.HK": "Meituan", "PDD": "Pinduoduo",
-    "NIO": "NIO", "2318.HK": "Ping An", "0939.HK": "China Construction Bank", "1299.HK": "AIA",
-}
 
-# Curated, cross-region theme baskets. Members are drawn from TICKER_UNIVERSE so the
-# Themes tab reads straight from scan results (no extra fetching) — full coverage simply
-# means running a full (non-quick) scan. A name can sit in several themes (e.g. NVDA in
-# both AI and Semiconductors); that's intentional. Edit these lists to taste.
-THEMES = {
-    "Artificial Intelligence": ["NVDA", "MSFT", "GOOGL", "META", "AMD", "AMZN", "ASML",
-                                 "8035.T", "9984.T", "BIDU"],
-    "Semiconductors": ["NVDA", "AMD", "ASML", "8035.T", "4063.T"],
-    "Defense & Aerospace": ["LMT", "RTX", "NOC", "GD", "BA", "AIR.PA"],
-    "Energy (Oil & Gas)": ["XOM", "CVX", "COP", "SLB"],
-    "Clean Energy": ["NEE", "ENPH", "FSLR", "TSLA"],
-    "EV & Mobility": ["TSLA", "NIO", "7203.T", "7267.T", "VOW3.DE", "BMW.DE"],
-    "Financials": ["JPM", "V", "BAC", "8306.T", "ALV.DE", "2318.HK", "0939.HK", "1299.HK"],
-    "Consumer & Luxury": ["AMZN", "WMT", "KO", "PG", "HD", "MC.PA", "OR.PA", "RMS.PA",
-                          "NFLX", "DIS"],
-    "China Internet": ["0700.HK", "9988.HK", "JD", "BIDU", "3690.HK", "PDD", "1810.HK"],
-    "Healthcare": ["JNJ", "PFE", "MRK", "LLY", "UNH"],
-}
 
-# Benchmark index per home market for the walk-forward evaluator. A pick is judged
-# against the index of the exchange it actually trades on (keyed by ticker suffix),
-# so a Tokyo-listed name is measured against the Nikkei rather than the S&P 500.
-# Suffix-based mapping also handles dual listings correctly: a US-listed ADR with
-# no suffix (e.g. BABA, ASML) is benchmarked against SPY, matching its currency and
-# trading calendar. To change a mapping, edit this one dict. Anything not listed
-# falls back to DEFAULT_BENCHMARK.
-#
-# KNOWN ASYMMETRY (accepted): stock returns are dividend-inclusive (auto_adjust=True),
-# but most of these benchmarks are PRICE indices (^N225/^HSI/^FCHI/000300.SS/etc.),
-# while SPY is a dividend-paying ETF (total-return when adjusted) and ^GDAXI is itself
-# a total-return index. So a dividend-paying non-US/non-DE stock is judged slightly
-# generously vs a price-only index. Over the 14-day EVAL_HORIZON_DAYS window the
-# accrued dividend is ~0.1-0.2%, so the bias is marginal; the correct symmetric fix
-# would need total-return indices in each LOCAL currency, which aren't freely
-# available for JP/CN (USD ETFs like EWJ would trade this small bias for a worse
-# currency mismatch), so we accept it rather than introduce that error.
-BENCHMARKS = {
-    "":   "SPY",        # US / NYSE / NASDAQ (no suffix)  -> S&P 500 ETF
-    "T":  "^N225",      # Tokyo                           -> Nikkei 225
-    "HK": "^HSI",       # Hong Kong                       -> Hang Seng
-    "PA": "^FCHI",      # Paris                           -> CAC 40
-    "DE": "^GDAXI",     # Frankfurt / Xetra               -> DAX
-    "SS": "000300.SS",  # Shanghai (A-shares)             -> CSI 300
-    "SZ": "000300.SS",  # Shenzhen (A-shares)             -> CSI 300
-    "SI": "^STI",       # Singapore                       -> Straits Times
-    "JK": "^JKSE",      # Jakarta                         -> IDX Composite
-    "L":  "^FTSE",      # London                          -> FTSE 100
-}
+
+
+
+
 DEFAULT_BENCHMARK = "SPY"
 
 def benchmark_for(ticker: str) -> str:
@@ -533,476 +453,6 @@ REGION_NAMES = {
     "ja": {"USA": "アメリカ", "Japan": "日本", "Europe": "ヨーロッパ", "China": "中国"},
 }
 
-TRANSLATIONS = {
-    "en": {
-        # Sidebar
-        "console_title": "🎛️ Engine Console",
-        "scan_btn": "⚙️ Execute Market Analysis Scan",
-        "scan_spinner": "Compiling cross-market indices...",
-        "scan_success": "Global tracking array sync completed.",
-        "seed_btn": "🧪 Seed Simulated Audit Dataset",
-        "seed_success": "Synthetic data arrays appended to tracking engine database.",
-        "skipped": "Skipped tickers: {items}",
-        "scan_quick_toggle": "⚡ Quick scan (recommended on Cloud)",
-        "scan_quick_help": "Scans the first 10 tickers per region (ordered so each theme gets a representative) — faster and far less likely to be rate-limited by Yahoo Finance. Untick for the full universe.",
-        "all_failed": "Every fetch failed. Yahoo Finance is most likely rate-limiting this server's IP — this is common on Streamlit Cloud. Wait a few minutes and retry, or run the app locally.",
-        "persistence_note": "ℹ️ On Streamlit Community Cloud, saved history is not guaranteed to persist — it resets whenever the app reboots or sleeps (after 12h idle). Use the seed button to repopulate the demo, or wire up an external database for permanent storage.",
-        "benchmark_note": "📈 Accuracy is benchmark-relative: each pick counts as a win only if it beat its home market over the holding window (US→S&P 500, Japan→Nikkei 225, Hong Kong→Hang Seng, France→CAC 40, Germany→DAX).",
-        # Tabs
-        "tab_top": "🔥 Top Selections",
-        "tab_regional": "📊 Regional Desks",
-        "tab_category": "⚡ Category Screening",
-        "tab_deep": "🔍 Chart Deep Dive",
-        "tab_audit": "🧠 Systems Audit",
-        # Engine progress
-        "scanning": "Scanning Global Markets...",
-        "processing": "Processing {ticker} ({region})...",
-        # Top 3
-        "top3_header": "🔥 Top 3 System Picks Across All Global Regions",
-        "need_scan_sidebar": "Please process market metrics in the sidebar analyzer.",
-        "score_suffix": "Score",
-        "price_label": "Price",
-        "company_profile": "Company Profile",
-        "trend_return_1m": "Trend Return (1M)",
-        "pe_ratio": "P/E Ratio",
-        "dividend_yield": "Dividend Yield",
-        # Category views
-        "need_run_engine": "Run the calculations engine in the sidebar.",
-        "subtab_growth": "🚀 Top Weekly Growth Selections",
-        "subtab_dividend": "💰 High-Yield Dividend Picks",
-        "growth_header_text": "Highest Weekly Capital Expansion Momentum",
-        "dividend_header_text": "Balanced Top Recommendations with Dividends > 1.5%",
-        "no_dividend_match": "No active candidates matched dividend targets in this cycle.",
-        "col_ticker": "Ticker",
-        "col_company": "Company",
-        "col_region": "Region",
-        "col_price": "Price",
-        "col_momentum_1m": "1M Momentum %",
-        "col_overall_score": "Overall Score",
-        "col_dividend_return": "Dividend Return %",
-        # Regional desks
-        "need_activate": "Activate engine matrix to sort international regional distributions.",
-        "select_region": "Select Geographical Workspace Focus:",
-        "card_system_rating": "System Rating",
-        "card_trading_close": "Trading Close",
-        "card_sustained_hype": "Sustained Hype",
-        "breakout": "Breakout",
-        "flat": "Flat",
-        # Deep dive
-        "need_run_history": "Run the engine to inspect price history.",
-        "select_profile": "Select Target Analytics Profile:",
-        "history_workspace": "Historical Data Plot Workspace: {ticker}",
-        "factor_breakdown": "Factor Breakdown",
-        "why_header": "Why this pick",
-        "why_composite": "Composite score",
-        "why_call": "Call",
-        "why_rank": "Rank in scan",
-        "why_contrib_axis": "Contribution to score (points)",
-        "why_contrib_caption": "Each bar is a factor's score × its weight, and the bars add up to the composite — so the longest bar is the biggest reason this name scored where it did.",
-        "why_rationale": "Top drivers: {d1} ({s1}) and {d2} ({s2}) — together {share}% of the composite. Weakest area: {w} ({sw}).",
-        "why_evidence": "The numbers behind each factor",
-        "col_factor": "Factor",
-        "col_score": "Score /100",
-        "col_weight": "Weight",
-        "col_contribution": "Contribution",
-        "col_share": "Share",
-        "col_metric": "Metric",
-        "col_value": "Value",
-        "price_trend": "Price & moving averages",
-        "evi_ret_1m": "1-month return",
-        "evi_vs_sma50": "Price vs 50-day avg",
-        "evi_macd": "MACD trend",
-        "evi_bullish": "bullish",
-        "evi_bearish": "bearish",
-        "evi_pe": "P/E ratio",
-        "evi_div": "Dividend yield",
-        "evi_rsi": "RSI (14)",
-        "evi_bbpct": "Bollinger %B",
-        "evi_roe": "Return on equity",
-        "evi_mentions": "Social / news mentions",
-        "evi_short": "Short interest (% float)",
-        "factor_momentum": "Momentum",
-        "factor_value": "Value",
-        "factor_technical": "Technical",
-        "factor_hype": "Hype",
-        "factor_quality": "Quality",
-        "wsb_mentions": "WallStreetBets Mentions",
-        "wsb_caption": "Live mention count for this ticker in r/wallstreetbets hot posts during the last scan (feeds the Hype factor).",
-        "wsb_source_authenticated": "🟢 Source: authenticated Reddit API (most reliable).",
-        "wsb_source_rss": "🟡 Source: public RSS feed — may be blocked or throttled on cloud hosts.",
-        "wsb_source_offline": "⚪ Source: offline — Reddit was unreachable, so mentions counted as 0.",
-        "historical_performance": "Historical Performance (Mock Portfolio)",
-        "historical_perf_note": "Return % is the live price vs. the price when the pick was logged. Green = ahead, red = behind. These curated picks also feed the walk-forward weight optimizer.",
-        "audit_one_per_stock": "One row per stock (development since first pick)",
-        "audit_one_per_note": "Each stock appears once. Return % is measured from its FIRST recommendation (live price vs. that price), so it shows how the call has aged. 'Times picked' = how often the engine has flagged it. Untick to see every individual pick.",
-        "col_first_rec": "First recommended",
-        "col_times": "Times picked",
-        "no_portfolio_picks": "No saved picks yet — run a scan to start logging the mock portfolio.",
-        "col_reason": "Reason",
-        "col_rec_price": "Rec. Price",
-        "col_current_price": "Current Price",
-        "col_return_pct": "Return %",
-        "reason_growth": "Top Growth",
-        "reason_dividend": "Top Dividend",
-        "regions_to_scan": "Regions to Scan",
-        "sentiment_sources": "Sentiment Sources",
-        "src_reddit": "Reddit (finance subs)",
-        "src_gdelt": "Global News (GDELT)",
-        "hype_buzz_label": "Social & News Buzz (mentions)",
-        "hype_buzz_caption": "Combined mentions of this stock across the enabled sentiment sources during the last scan (feeds the Hype factor).",
-        "hype_sources_prefix": "Buzz sources —",
-        "hype_updated": "Sentiment updated {ago} ago",
-        "hype_status_authenticated": "Reddit API ✓",
-        "hype_status_rss": "RSS feed",
-        "hype_status_ok": "live ✓",
-        "hype_status_offline": "offline (0)",
-        "update_hist_prices": "Update Historical Portfolio Prices",
-        "no_region_selected": "Select at least one region to scan.",
-        "prices_skipped": "Live price update is off — current prices and returns are left blank. Tick 'Update Historical Portfolio Prices' to refresh.",
-        "prices_unavailable": "No current price came back this run for: {tickers}. This is usually Yahoo rate-limiting the request (common on shared/Cloud IPs), not bad data — wait a moment and toggle the update again.",
-        "sell_privacy_note": "Your portfolio list stays in this session only — it is never saved to the database.",
-        "sell_paste_label": "Paste tickers (comma, space, or newline separated)",
-        "sell_upload_label": "…or upload a CSV with a 'Ticker' or 'Symbol' column",
-        "sell_csv_nocol": "No 'Ticker' or 'Symbol' column found in that CSV.",
-        "sell_csv_error": "Couldn't read that CSV file.",
-        "sell_loaded": "{n} ticker(s) loaded: {tickers}",
-        "sell_scan_btn": "Scan Portfolio",
-        "sell_bulk_fetch": "Bulk-fetching price history for {total} tickers in one request…",
-        "sell_scan_progress": "Scanning {done}/{total}…",
-        "sell_need_portfolio": "Paste tickers or upload a CSV above, then press Scan Portfolio.",
-        "sell_verdict_na": "NO DATA",
-        "col_verdict": "Verdict",
-        "sell_detail_expander": "🔎 View full breakdown for one ticker",
-        "sell_detail_select": "Select a ticker from your scan",
-        # Sell-Signal scanner
-        "tab_sell": "🔻 Sell Signals",
-        "tab_us": "🇺🇸 US Conviction",
-        "tab_themes": "🧭 Themes",
-        "themes_caption": "Industries through three lenses — Momentum (what's strong now), Attention (hype/sentiment volume), and Smart-money buys (superinvestor 13F NEW positions). Triangulate, don't predict: none forecasts the future, momentum and attention reverse, attention skews to retail-favorite megacaps, and smart-money is US-only and ~45 days lagged. Not financial advice.",
-        "themes_bubble_caption": "Each bubble is a theme — right = stronger momentum, up = more attention, bigger = more superinvestor new-buys. Bottom-right (strong but quiet) can mean early institutional interest; top-left (loud but weak) is usually retail hype.",
-        "themes_rank_by": "Rank themes by",
-        "themes_rank_momentum": "Momentum",
-        "themes_rank_hype": "Attention",
-        "themes_rank_smart": "Smart-money buys",
-        "themes_momentum_axis": "Avg momentum score (0–100)",
-        "themes_hype_axis": "Avg attention score (0–100)",
-        "themes_smart_axis": "New 13F buys (US members)",
-        "themes_smart_unavailable": "Smart-money column unavailable (SEC fetch off or failed) — set SEC_USER_AGENT and rescan.",
-        "themes_coverage_note": "Computed from the current scan — 'Coverage' shows how many of each theme's names were scanned (Smart-money covers all US members regardless). Untick Quick scan (and select all regions) for full coverage. Themes with nothing scanned are hidden.",
-        "themes_no_coverage": "None of the theme names were in this scan. Untick Quick scan and select all regions, then rescan.",
-        "themes_top_header": "Top stocks in the selected theme",
-        "themes_select": "Drill into a theme",
-        "col_theme": "Theme",
-        "col_theme_momentum": "Momentum",
-        "col_theme_hype": "Attention",
-        "col_theme_smart": "Smart $ buys",
-        "col_theme_strength": "Strength",
-        "col_theme_ret1m": "Avg 1M %",
-        "col_theme_buys": "BUYs",
-        "col_theme_coverage": "Coverage",
-        "us_header": "🇺🇸 Top US Conviction Picks (SEC Fundamentals)",
-        "us_spinner": "Pulling audited SEC EDGAR fundamentals…",
-        "us_module_missing": "The sec_research.py companion module isn't available — place it beside app.py.",
-        "us_conviction_suffix": "conviction",
-        "us_caption": "US-listed names only, ranked by a blend of your scan composite (50%) with SEC EDGAR growth (30%) and quality (20%) from audited multi-year filings, plus a capped bonus for NEW 13F buys. Isolated from the global factor weights and walk-forward loop. 13F overlay = positions newly added quarter-over-quarter (latest vs prior 13F-HR, ~45-day lag), matched by company name across 7 tracked managers — so long-standing mega-cap holdings don't score. Set SEC_USER_AGENT (your email) per SEC's fair-access policy.",
-        "col_us_conviction": "US Conviction",
-        "col_sec_growth": "SEC Growth",
-        "col_sec_quality": "SEC Quality",
-        "col_rev_cagr": "3y Rev CAGR %",
-        "col_eps_yoy": "EPS YoY %",
-        "col_superinvestors": "New 13F Buys",
-        "us_held_by": "Newly bought by {n} superinvestor(s)",
-        "sell_header": "🔻 Sell-Signal Scanner",
-        "sell_disclaimer": "Informational signals only — not financial advice. Data via Yahoo Finance; analyst and insider coverage is richest for US-listed symbols.",
-        "sell_input_label": "Enter a ticker symbol",
-        "sell_btn": "Analyze",
-        "sell_spinner": "Scanning sell signals for {ticker}...",
-        "sell_need_input": "Type a ticker symbol above (e.g. AAPL, MSFT, ABBV) to scan for sell signals.",
-        "sell_no_data": "Couldn't retrieve price data for '{ticker}'. Check the symbol — for the richest analyst and insider data, try the US listing (e.g. ABBV instead of 4AB, MSFT instead of MSF).",
-        "sell_pressure": "Sell Pressure",
-        "sell_verdict_high": "ELEVATED",
-        "sell_verdict_mixed": "MIXED",
-        "sell_verdict_low": "LOW",
-        "sell_breakdown_title": "Signal Breakdown (higher = more bearish)",
-        "sell_why_header": "Why this is a sell",
-        "sell_why_axis": "Contribution to sell-pressure (points)",
-        "sell_why_caption": "Each bar is a bearish signal's score × its weight (over the signals that had data), and the bars sum to the sell-pressure score — so the longest bar is the biggest red flag.",
-        "sell_why_rationale": "Biggest red flags: {d1} ({s1}) and {d2} ({s2}) — together {share}% of the sell-pressure score.",
-        "sell_why_rationale_one": "Main red flag: {d1} ({s1}) — {share}% of the sell-pressure score.",
-        "sell_not_scored": "Not scored (no data): {items}.",
-        "sell_no_signal_data": "No bearish signals returned data for this ticker, so there's no sell-pressure score to explain.",
-        "sell_recent_downgrades": "Recent Analyst Rating Changes",
-        "sell_insider_activity": "Recent Insider Transactions",
-        "sell_no_analyst": "No recent analyst rating changes available for this symbol.",
-        "sell_no_insider": "No insider transactions reported for this symbol.",
-        "kpi_analyst": "Analyst Consensus",
-        "kpi_downgrades": "Rating Changes",
-        "kpi_target": "Price-Target Downside",
-        "kpi_insider": "Insider Selling",
-        "kpi_technical": "Technical Breakdown",
-        "kpi_momentum": "Momentum Trend",
-        "kpi_short": "Short Interest",
-        "col_kpi": "Indicator",
-        "col_signal": "Signal (0-100)",
-        "col_reading": "Reading",
-        "col_date": "Date",
-        "col_firm": "Firm",
-        "col_from": "From",
-        "col_to": "To",
-        "col_action": "Action",
-        "col_insider": "Insider",
-        "col_transaction": "Transaction",
-        "col_shares": "Shares",
-        "col_value": "Value",
-        # Audit
-        "audit_header_text": "🧠 Machine Weight Analytics & Historical Integrity",
-        "no_tracks": "No calculation tracks logged yet.",
-        "card_archived_calls": "Archived Calls",
-        "card_perf_verified": "Performance Verified",
-        "card_accuracy": "Historical Accuracy Score",
-        "winrate_over_time": "Win rate over time",
-        "winrate_col": "Win Rate %",
-        "kpi_weight_evolution": "KPI weight evolution",
-        # Recommendation pills
-        "rec_BUY": "BUY",
-        "rec_HOLD": "HOLD",
-        "rec_SELL": "SELL",
-    },
-    "ja": {
-        # サイドバー
-        "console_title": "🎛️ エンジンコンソール",
-        "scan_btn": "⚙️ 市場分析スキャンを実行",
-        "scan_spinner": "市場横断インデックスを集計中...",
-        "scan_success": "グローバル追跡データの同期が完了しました。",
-        "seed_btn": "🧪 監査用サンプルデータを生成",
-        "seed_success": "サンプルデータをトラッキングDBに追加しました。",
-        "skipped": "スキップした銘柄: {items}",
-        "scan_quick_toggle": "⚡ クイックスキャン（クラウド推奨）",
-        "scan_quick_help": "各地域の先頭10銘柄をスキャンします（各テーマの代表が含まれるよう並び替え済み）。高速でレート制限にかかりにくくなります。全銘柄はチェックを外してください。",
-        "all_failed": "すべての取得に失敗しました。Yahoo Finance がこのサーバーのIPをレート制限している可能性が高いです（Streamlit Cloud ではよくあります）。数分待って再試行するか、ローカルで実行してください。",
-        "persistence_note": "ℹ️ Streamlit Community Cloud では、保存された履歴は永続化が保証されません。アプリの再起動やスリープ（12時間無操作）のたびにリセットされます。シードボタンでデモを再生成するか、外部データベースを接続して永続保存してください。",
-        "benchmark_note": "📈 的中率はベンチマーク相対です。各推奨は保有期間中に自国市場を上回った場合のみ「勝ち」と判定されます（米国→S&P500、日本→日経225、香港→ハンセン、フランス→CAC40、ドイツ→DAX）。",
-        # タブ
-        "tab_top": "🔥 トップ銘柄",
-        "tab_regional": "📊 地域別デスク",
-        "tab_category": "⚡ カテゴリ別スクリーニング",
-        "tab_deep": "🔍 チャート詳細分析",
-        "tab_audit": "🧠 システム監査",
-        # 進捗
-        "scanning": "グローバル市場をスキャン中...",
-        "processing": "{ticker}（{region}）を処理中...",
-        # トップ3
-        "top3_header": "🔥 全地域から選んだトップ3銘柄",
-        "need_scan_sidebar": "サイドバーのアナライザーで市場データを処理してください。",
-        "score_suffix": "スコア",
-        "price_label": "価格",
-        "company_profile": "企業プロフィール",
-        "trend_return_1m": "トレンドリターン（1ヶ月）",
-        "pe_ratio": "PER（株価収益率）",
-        "dividend_yield": "配当利回り",
-        # カテゴリ別
-        "need_run_engine": "サイドバーで計算エンジンを実行してください。",
-        "subtab_growth": "🚀 週間グロース上位銘柄",
-        "subtab_dividend": "💰 高配当銘柄",
-        "growth_header_text": "週間モメンタム上位銘柄",
-        "dividend_header_text": "配当利回り1.5%超のおすすめ銘柄",
-        "no_dividend_match": "今回のサイクルでは配当条件に合う銘柄がありませんでした。",
-        "col_ticker": "銘柄",
-        "col_company": "会社名",
-        "col_region": "地域",
-        "col_price": "価格",
-        "col_momentum_1m": "1ヶ月モメンタム %",
-        "col_overall_score": "総合スコア",
-        "col_dividend_return": "配当利回り %",
-        # 地域別デスク
-        "need_activate": "エンジンを実行して地域別の分布を表示してください。",
-        "select_region": "対象地域を選択:",
-        "card_system_rating": "システム評価",
-        "card_trading_close": "終値",
-        "card_sustained_hype": "継続的な注目度",
-        "breakout": "急騰",
-        "flat": "横ばい",
-        # 詳細分析
-        "need_run_history": "エンジンを実行すると価格履歴を確認できます。",
-        "select_profile": "分析する銘柄を選択:",
-        "history_workspace": "価格履歴チャート: {ticker}",
-        "factor_breakdown": "ファクター内訳",
-        "why_header": "選定理由",
-        "why_composite": "総合スコア",
-        "why_call": "判定",
-        "why_rank": "スキャン内順位",
-        "why_contrib_axis": "スコアへの寄与（ポイント）",
-        "why_contrib_caption": "各バーはファクターのスコア×ウェイトで、合計が総合スコアになります。最も長いバーが、この銘柄のスコアを最も押し上げた理由です。",
-        "why_rationale": "主な要因：{d1}（{s1}）と{d2}（{s2}）で総合スコアの{share}%。最も弱い項目：{w}（{sw}）。",
-        "why_evidence": "各ファクターの根拠となる数値",
-        "col_factor": "ファクター",
-        "col_score": "スコア /100",
-        "col_weight": "ウェイト",
-        "col_contribution": "寄与",
-        "col_share": "占有率",
-        "col_metric": "指標",
-        "col_value": "値",
-        "price_trend": "株価と移動平均",
-        "evi_ret_1m": "1か月リターン",
-        "evi_vs_sma50": "株価 対 50日平均",
-        "evi_macd": "MACDトレンド",
-        "evi_bullish": "強気",
-        "evi_bearish": "弱気",
-        "evi_pe": "PER（株価収益率）",
-        "evi_div": "配当利回り",
-        "evi_rsi": "RSI（14）",
-        "evi_bbpct": "ボリンジャー%B",
-        "evi_roe": "ROE（自己資本利益率）",
-        "evi_mentions": "SNS・ニュース言及数",
-        "evi_short": "空売り比率（浮動株%）",
-        "factor_momentum": "モメンタム",
-        "factor_value": "バリュー",
-        "factor_technical": "テクニカル",
-        "factor_hype": "ハイプ",
-        "factor_quality": "クオリティ",
-        "wsb_mentions": "WallStreetBets 言及数",
-        "wsb_caption": "直近のスキャン時に r/wallstreetbets の人気投稿でこの銘柄が言及された回数（ハイプ・ファクターに反映されます）。",
-        "wsb_source_authenticated": "🟢 ソース：認証済み Reddit API（最も安定）。",
-        "wsb_source_rss": "🟡 ソース：公開RSSフィード（クラウド環境ではブロック・制限される場合があります）。",
-        "wsb_source_offline": "⚪ ソース：オフライン（Redditに接続できず、言及数は0としてカウント）。",
-        "historical_performance": "ヒストリカル・パフォーマンス（模擬ポートフォリオ）",
-        "historical_perf_note": "リターン％は、記録時の株価に対する現在株価の変化です。緑＝プラス、赤＝マイナス。これらの厳選銘柄はウォークフォワード重み最適化にも反映されます。",
-        "audit_one_per_stock": "銘柄ごとに1行（初回推奨からの推移）",
-        "audit_one_per_note": "各銘柄は1回のみ表示。リターン％は初回推奨時の株価を基準に算出（現在株価との比較）し、推奨の経過を示します。「推奨回数」はエンジンが選出した回数です。チェックを外すと個別の推奨をすべて表示します。",
-        "col_first_rec": "初回推奨日",
-        "col_times": "推奨回数",
-        "no_portfolio_picks": "保存された推奨はまだありません。スキャンを実行すると模擬ポートフォリオの記録が始まります。",
-        "col_reason": "理由",
-        "col_rec_price": "推奨時株価",
-        "col_current_price": "現在株価",
-        "col_return_pct": "リターン %",
-        "reason_growth": "成長株トップ",
-        "reason_dividend": "高配当トップ",
-        "regions_to_scan": "スキャンする地域",
-        "sentiment_sources": "センチメント・ソース",
-        "src_reddit": "Reddit（金融系サブレディット）",
-        "src_gdelt": "グローバルニュース（GDELT）",
-        "hype_buzz_label": "ソーシャル・ニュース言及数",
-        "hype_buzz_caption": "直近のスキャン時に、有効化したセンチメント・ソース全体でこの銘柄が言及された合計回数（ハイプ・ファクターに反映されます）。",
-        "hype_sources_prefix": "バズの取得元 —",
-        "hype_updated": "センチメント更新：{ago}前",
-        "hype_status_authenticated": "Reddit API ✓",
-        "hype_status_rss": "RSSフィード",
-        "hype_status_ok": "ライブ ✓",
-        "hype_status_offline": "オフライン (0)",
-        "update_hist_prices": "履歴ポートフォリオの株価を更新",
-        "no_region_selected": "スキャンする地域を1つ以上選択してください。",
-        "prices_skipped": "ライブ株価の更新はオフです。現在株価とリターンは空欄です。「履歴ポートフォリオの株価を更新」をオンにすると更新されます。",
-        "prices_unavailable": "今回の更新で現在株価を取得できませんでした：{tickers}。これは通常、データ不良ではなくYahoo側のレート制限（共有IPやクラウドで発生しやすい）です。少し待ってから更新を再実行してください。",
-        "sell_privacy_note": "ポートフォリオのリストはこのセッション内にのみ保持され、データベースには保存されません。",
-        "sell_paste_label": "ティッカーを貼り付け（カンマ・スペース・改行区切り）",
-        "sell_upload_label": "…または「Ticker」「Symbol」列を含むCSVをアップロード",
-        "sell_csv_nocol": "そのCSVに「Ticker」または「Symbol」列が見つかりませんでした。",
-        "sell_csv_error": "そのCSVファイルを読み込めませんでした。",
-        "sell_loaded": "{n} 銘柄を読み込みました：{tickers}",
-        "sell_scan_btn": "ポートフォリオをスキャン",
-        "sell_bulk_fetch": "{total} 銘柄の価格履歴を一括取得中…",
-        "sell_scan_progress": "スキャン中 {done}/{total}…",
-        "sell_need_portfolio": "上にティッカーを貼り付けるかCSVをアップロードし、「ポートフォリオをスキャン」を押してください。",
-        "sell_verdict_na": "データなし",
-        "col_verdict": "判定",
-        "sell_detail_expander": "🔎 個別銘柄の詳細を表示",
-        "sell_detail_select": "スキャンした銘柄から選択",
-        # 売りシグナル・スキャナー
-        "tab_sell": "🔻 売りシグナル",
-        "tab_us": "🇺🇸 米国確信度",
-        "tab_themes": "🧭 テーマ",
-        "themes_caption": "業界を3つの視点で見ます — モメンタム（今の強さ）、注目度（ハイプ/言及量）、スマートマネー買い（著名投資家の13F新規ポジション）。予測ではなく多角的な確認に使ってください：いずれも将来を予測するものではなく、モメンタムと注目度は反転し、注目度は個人投資家好みの大型株に偏り、スマートマネーは米国のみ・約45日遅延です。投資助言ではありません。",
-        "themes_bubble_caption": "各バブルがテーマです — 右ほどモメンタムが強く、上ほど注目度が高く、大きいほど著名投資家の新規買いが多いことを示します。右下（強いが静か）は機関投資家の初期関心の可能性、左上（騒がしいが弱い）は個人の過熱を示すことが多いです。",
-        "themes_rank_by": "並び替え基準",
-        "themes_rank_momentum": "モメンタム",
-        "themes_rank_hype": "注目度",
-        "themes_rank_smart": "スマートマネー買い",
-        "themes_momentum_axis": "平均モメンタムスコア（0〜100）",
-        "themes_hype_axis": "平均注目度スコア（0〜100）",
-        "themes_smart_axis": "13F新規買い（米国銘柄）",
-        "themes_smart_unavailable": "スマートマネー列は利用できません（SEC取得がオフまたは失敗）。SEC_USER_AGENT を設定して再スキャンしてください。",
-        "themes_coverage_note": "現在のスキャン結果から算出。「カバレッジ」は各テーマの銘柄のうちスキャン済みの数です（スマートマネーは全米国銘柄を対象）。完全なカバレッジにはクイックスキャンを外し全地域を選択してください。スキャンされた銘柄がないテーマは非表示です。",
-        "themes_no_coverage": "今回のスキャンにテーマ銘柄が含まれていません。クイックスキャンを外し全地域を選択して再スキャンしてください。",
-        "themes_top_header": "選択テーマの上位銘柄",
-        "themes_select": "テーマを掘り下げる",
-        "col_theme": "テーマ",
-        "col_theme_momentum": "モメンタム",
-        "col_theme_hype": "注目度",
-        "col_theme_smart": "スマート買い",
-        "col_theme_strength": "総合力",
-        "col_theme_ret1m": "平均1か月%",
-        "col_theme_buys": "BUY数",
-        "col_theme_coverage": "カバレッジ",
-        "us_header": "🇺🇸 米国 確信度トップ銘柄（SEC財務）",
-        "us_spinner": "SECの監査済み財務データ（EDGAR）を取得中…",
-        "us_module_missing": "コンパニオンモジュール sec_research.py がありません。app.py と同じフォルダに置いてください。",
-        "us_conviction_suffix": "確信度",
-        "us_caption": "米国上場銘柄のみ。スキャンの総合スコア（50%）に、SEC EDGARの監査済み複数年財務に基づく成長性（30%）と品質（20%）、さらに13Fの新規買いに対する上限付きボーナスを加味してランク付けします。グローバルの重みやウォークフォワード学習からは分離されています。13Fは前四半期比で新規に追加された銘柄（最新と前回の13F-HRの差分、約45日遅延）を7名の著名投資家について会社名でマッチング。長期保有の大型株は加点されません。SECのフェアアクセス方針に従い SEC_USER_AGENT（メールアドレス）を設定してください。",
-        "col_us_conviction": "米国確信度",
-        "col_sec_growth": "SEC成長性",
-        "col_sec_quality": "SEC品質",
-        "col_rev_cagr": "売上CAGR(3年)%",
-        "col_eps_yoy": "EPS前年比%",
-        "col_superinvestors": "新規買い(13F)",
-        "us_held_by": "{n}名の著名投資家が新規購入",
-        "sell_header": "🔻 売りシグナル・スキャナー",
-        "sell_disclaimer": "本機能は情報提供のみを目的とし、投資助言ではありません。データはYahoo Finance提供。アナリスト・インサイダー情報は米国上場銘柄が最も充実しています。",
-        "sell_input_label": "ティッカーシンボルを入力",
-        "sell_btn": "分析",
-        "sell_spinner": "{ticker} の売りシグナルを分析中...",
-        "sell_need_input": "上の欄にティッカー（例：AAPL、MSFT、ABBV）を入力すると売りシグナルを分析します。",
-        "sell_no_data": "'{ticker}' の価格データを取得できませんでした。シンボルをご確認ください。アナリスト・インサイダー情報を充実させるには米国上場銘柄（例：4AB→ABBV、MSF→MSFT）をお試しください。",
-        "sell_pressure": "売り圧力",
-        "sell_verdict_high": "強い",
-        "sell_verdict_mixed": "中程度",
-        "sell_verdict_low": "弱い",
-        "sell_breakdown_title": "シグナル内訳（高いほど弱気）",
-        "sell_why_header": "売却シグナルの理由",
-        "sell_why_axis": "売り圧力への寄与（ポイント）",
-        "sell_why_caption": "各バーは弱気シグナルのスコア×ウェイト（データのあるシグナルのみ）で、合計が売り圧力スコアになります。最も長いバーが最大の懸念材料です。",
-        "sell_why_rationale": "主な懸念材料：{d1}（{s1}）と{d2}（{s2}）で売り圧力スコアの{share}%。",
-        "sell_why_rationale_one": "主な懸念材料：{d1}（{s1}）— 売り圧力スコアの{share}%。",
-        "sell_not_scored": "データなしで未評価：{items}。",
-        "sell_no_signal_data": "この銘柄では弱気シグナルのデータが得られず、説明できる売り圧力スコアがありません。",
-        "sell_recent_downgrades": "最近のアナリスト格付け変更",
-        "sell_insider_activity": "最近のインサイダー取引",
-        "sell_no_analyst": "この銘柄の最近のアナリスト格付け変更はありません。",
-        "sell_no_insider": "この銘柄のインサイダー取引は報告されていません。",
-        "kpi_analyst": "アナリスト・コンセンサス",
-        "kpi_downgrades": "格付け変更",
-        "kpi_target": "目標株価との乖離",
-        "kpi_insider": "インサイダー売却",
-        "kpi_technical": "テクニカルの崩れ",
-        "kpi_momentum": "モメンタム動向",
-        "kpi_short": "空売り比率",
-        "col_kpi": "指標",
-        "col_signal": "シグナル (0-100)",
-        "col_reading": "内容",
-        "col_date": "日付",
-        "col_firm": "証券会社",
-        "col_from": "変更前",
-        "col_to": "変更後",
-        "col_action": "アクション",
-        "col_insider": "インサイダー",
-        "col_transaction": "取引",
-        "col_shares": "株数",
-        "col_value": "金額",
-        # 監査
-        "audit_header_text": "🧠 重み学習の分析と過去実績",
-        "no_tracks": "まだ記録された計算履歴はありません。",
-        "card_archived_calls": "記録された判定",
-        "card_perf_verified": "結果検証済み",
-        "card_accuracy": "過去の的中率",
-        "winrate_over_time": "勝率の推移",
-        "winrate_col": "勝率 %",
-        "kpi_weight_evolution": "重み（KPI）の推移",
-        # 推奨ピル
-        "rec_BUY": "買い",
-        "rec_HOLD": "中立",
-        "rec_SELL": "売り",
-    },
-}
 
 def get_lang() -> str:
     return st.session_state.get("lang", "en")
@@ -1268,6 +718,56 @@ def get_recommendations() -> pd.DataFrame:
 # Quantitative Math & Indicators
 # ----------------------------------------------------------------------------
 @st.cache_data(ttl=600, show_spinner=False)
+def _stooq_symbol(ticker: str) -> str | None:
+    """Map a US ticker to its Stooq symbol (AAPL -> aapl.us). None for suffixed/non-US
+    tickers — Stooq is our US-only, keyless price fallback."""
+    return None if "." in ticker else ticker.lower() + ".us"
+
+
+def _period_to_days(period: str) -> int | None:
+    m = re.match(r"(\d+)\s*(d|wk|mo|y)?", str(period).strip().lower())
+    if not m:
+        return None
+    n, unit = int(m.group(1)), (m.group(2) or "d")
+    return {"d": 1, "wk": 7, "mo": 30, "y": 365}.get(unit, 1) * n
+
+
+def fetch_history_stooq(ticker: str, period: str = "8mo") -> "pd.DataFrame | None":
+    """Free, keyless EOD price history from Stooq, used as a fallback when yfinance is
+    throttled (US tickers only). Returns a yfinance-shaped frame (Date index, OHLCV with
+    a 'Close' column) trimmed to `period`, or None. Never raises."""
+    sym = _stooq_symbol(ticker)
+    if sym is None:
+        return None
+    try:
+        raw = _reddit_get(f"https://stooq.com/q/d/l/?s={sym}&i=d", {"User-Agent": "Mozilla/5.0"})
+    except Exception:
+        return None
+    lines = raw.strip().splitlines()
+    if not lines or not lines[0].lower().startswith("date"):
+        return None   # '<no data>', error page, or a block — degrade quietly
+    recs = []
+    for line in lines[1:]:
+        p = line.split(",")
+        if len(p) < 5:
+            continue
+        try:
+            d = pd.to_datetime(p[0])
+            o, h, l, c = float(p[1]), float(p[2]), float(p[3]), float(p[4])
+        except Exception:
+            continue
+        v = float(p[5]) if len(p) > 5 and p[5] not in ("", "N/D") else float("nan")
+        recs.append((d, o, h, l, c, v))
+    if not recs:
+        return None
+    df = (pd.DataFrame(recs, columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+          .set_index("Date").sort_index())
+    days = _period_to_days(period)
+    if days:
+        df = df[df.index >= (df.index.max() - pd.Timedelta(days=days))]
+    return df if not df.empty else None
+
+
 def fetch_history(ticker: str, period: str = "8mo") -> pd.DataFrame:
     """Fetch OHLCV with retry/backoff so a throttled burst doesn't wipe a scan.
 
@@ -1287,9 +787,56 @@ def fetch_history(ticker: str, period: str = "8mo") -> pd.DataFrame:
         except Exception as e:
             last_err = e
         time.sleep(1.2 * (attempt + 1))   # back off, then retry
+    # yfinance exhausted -> try the free Stooq fallback (US tickers) before giving up,
+    # so a Yahoo throttle degrades to EOD data instead of dropping the name entirely.
+    stq = fetch_history_stooq(ticker, period)
+    if stq is not None and not stq.empty and "Close" in stq.columns:
+        return stq.dropna(subset=["Close"])
     raise RuntimeError(f"no price history for {ticker} after retries") from last_err
 
 @st.cache_data(ttl=1800, show_spinner=False)
+def _fmp_fundamentals(ticker: str) -> dict:
+    """Optional secondary fundamentals from Financial Modeling Prep, used only when
+    yfinance fails or returns empty (its `.info` is the flakiest source in the app).
+    Enabled by setting FMP_API_KEY (st.secrets or env); otherwise a no-op. Free-tier
+    coverage is US-focused, so suffixed/non-US tickers are skipped. Fail-safe -> {}.
+    Values are normalized to the app's conventions: roe as a fraction, div_yield as a
+    percent. short_pct isn't available from these endpoints, so it stays NaN."""
+    key = _get_secret("FMP_API_KEY")
+    if not key or "." in ticker:
+        return {}
+    base = "https://financialmodelingprep.com/api/v3"
+    hdr = {"User-Agent": "Mozilla/5.0"}
+    out = {"pe": float("nan"), "div_yield": float("nan"), "market_cap": float("nan"),
+           "roe": float("nan"), "short_pct": float("nan"), "name": ticker}
+    got = False
+    try:
+        prof = json.loads(_reddit_get(f"{base}/profile/{ticker}?apikey={key}", hdr))
+        if isinstance(prof, list) and prof:
+            p = prof[0]
+            out["market_cap"] = safe_float(p.get("mktCap"))
+            out["pe"] = safe_float(p.get("pe"))
+            out["name"] = str(p.get("companyName") or ticker)
+            got = True
+    except Exception as e:
+        logger.warning("FMP profile fallback failed for %s: %s", ticker, e)
+    try:
+        rat = json.loads(_reddit_get(f"{base}/ratios-ttm/{ticker}?apikey={key}", hdr))
+        if isinstance(rat, list) and rat:
+            r = rat[0]
+            pe = r.get("peRatioTTM", r.get("priceEarningsRatioTTM"))
+            if pe is not None and math.isnan(out["pe"]):
+                out["pe"] = safe_float(pe)
+            out["roe"] = safe_float(r.get("returnOnEquityTTM", r.get("roeTTM")))   # fraction
+            dy = r.get("dividendYieldTTM")
+            if dy is not None:
+                out["div_yield"] = safe_float(dy) * 100.0   # FMP fraction -> app percent
+            got = True
+    except Exception as e:
+        logger.warning("FMP ratios fallback failed for %s: %s", ticker, e)
+    return out if got else {}
+
+
 def fetch_fundamentals(ticker: str) -> dict:
     out = {"pe": float("nan"), "div_yield": float("nan"), "market_cap": float("nan"),
            "roe": float("nan"), "short_pct": float("nan"), "name": ticker}
@@ -1301,8 +848,16 @@ def fetch_fundamentals(ticker: str) -> dict:
     try:
         info = _ticker(ticker).info
     except Exception as e:
+        fb = _fmp_fundamentals(ticker)   # secondary source kicks in only on failure
+        if fb:
+            logger.info("fundamentals for %s served by FMP fallback (yfinance error)", ticker)
+            return fb
         raise RuntimeError(f"fundamentals fetch failed for {ticker} (likely rate-limited)") from e
     if not info:
+        fb = _fmp_fundamentals(ticker)
+        if fb:
+            logger.info("fundamentals for %s served by FMP fallback (empty yfinance)", ticker)
+            return fb
         raise RuntimeError(f"empty fundamentals for {ticker} (likely rate-limited)")
     out["pe"] = safe_float(info.get("trailingPE"))
     out["market_cap"] = safe_float(info.get("marketCap"))
@@ -1338,42 +893,6 @@ def resolve_div_yield(info: dict) -> float:
         return float("nan")
     return dy
 
-def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain, loss = delta.clip(lower=0), -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line, macd_line - signal_line
-
-def compute_bollinger(close: pd.Series, window: int = 20, num_std: float = 2.0):
-    mid = close.rolling(window).mean()
-    std = close.rolling(window).std()
-    upper, lower = mid + num_std * std, mid - num_std * std
-    pct_b = (close - lower) / (upper - lower).replace(0, np.nan)
-    return mid, upper, lower, pct_b
-
-def compute_hype(volume: pd.Series) -> dict:
-    result = {"score": 0.0, "breakout_days": 0, "avg_ratio": float("nan"), "sustained": False}
-    vol = volume.dropna()
-    if len(vol) < 33: return result
-    baseline = float(vol.iloc[-33:-3].mean())
-    if baseline <= 0: return result
-    ratios = vol.iloc[-3:] / baseline
-    breakout_days = int((ratios > 1.5).sum())
-    avg_ratio = float(ratios.mean())
-    raw = (breakout_days / 3) * 60 + min(max(avg_ratio - 1.0, 0.0), 2.0) / 2.0 * 40
-    result.update(score=float(min(raw, 100.0)), breakout_days=breakout_days, avg_ratio=avg_ratio, sustained=breakout_days == 3)
-    return result
-
-def clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float: return max(lo, min(hi, v))
 
 def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0) -> dict | None:
     hist = fetch_history(ticker)
@@ -2300,6 +1819,97 @@ def _evidence_rows(r: dict) -> list:
     ]
 
 
+def _screen_rank(histories: dict, n: int) -> list:
+    """Stage-1 price screen: rank tickers by a blended 1M/3M/6M momentum from their
+    history, return the top n as [(ticker, blend_pct, ret_1m_pct), ...]. Pure function."""
+    scored = []
+    for t, h in histories.items():
+        close = h["Close"].dropna()
+        if len(close) < 30:
+            continue
+        last = float(close.iloc[-1])
+        def _ret(k):
+            return (last / float(close.iloc[-k - 1]) - 1.0) if len(close) > k else float("nan")
+        rets = [_ret(21), _ret(63), _ret(126)]
+        vals = [r for r in rets if not math.isnan(r)]
+        if not vals:
+            continue
+        blend = sum(vals) / len(vals)
+        scored.append((t, blend * 100.0, rets[0] * 100.0 if not math.isnan(rets[0]) else float("nan")))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:n]
+
+
+def run_deep_scan(region: str) -> tuple[list, int]:
+    """Deep scan funnel for one market. Stage 1: ONE bulk price download for that
+    market's deep list, screened on momentum. Stage 2: full fundamental scoring on the
+    top finalists only — Yahoo sees ~1 bulk request + DEEP_FINALISTS per-ticker calls."""
+    tickers = DEEP_UNIVERSES.get(region, [])
+    histories = _bulk_history(tickers, period="8mo")
+    n_screened = len(histories)
+    finalists = _screen_rank(histories, DEEP_FINALISTS)
+    weights = get_latest_weights()
+    results = []
+    prog = st.progress(0.0, text=tr("deep_scan_scoring"))
+    for i, (t, blend, _r1) in enumerate(finalists, start=1):
+        try:
+            a = analyze_ticker(t, region, 0.0)   # hype skipped on the deep scan (price+fundamentals)
+            if a:
+                a.update(score_with_weights(a, weights))
+                a["screen_blend"] = blend
+                results.append(a)
+        except Exception:
+            pass   # a throttled finalist is dropped, not fatal
+        prog.progress(i / max(1, len(finalists)), text=tr("deep_scan_scoring"))
+    prog.empty()
+    results.sort(key=lambda x: safe_float(x.get("composite"), float("-inf")), reverse=True)
+    return results, n_screened
+
+
+def render_deep_scan() -> None:
+    st.caption(tr("deep_scan_intro"))
+    region_labels = {tr("deep_region_us"): "USA", tr("deep_region_jp"): "Japan",
+                     tr("deep_region_cn"): "China"}
+    choice = st.radio(tr("deep_region_label"), list(region_labels.keys()),
+                      horizontal=True, key="deep_region")
+    region = region_labels[choice]
+    if region != "USA":
+        st.caption(tr("deep_scan_jpcn_note"))
+    if st.button(tr("deep_scan_btn"), key="deep_scan_run"):
+        with st.spinner(tr("deep_scan_running")):
+            res, n = run_deep_scan(region)
+        st.session_state[f"deep_results_{region}"] = res
+        st.session_state[f"deep_screened_{region}"] = n
+    res = st.session_state.get(f"deep_results_{region}")
+    if not res:
+        st.info(tr("deep_scan_hint"))
+        return
+    st.caption(tr("deep_scan_done", screened=st.session_state.get(f"deep_screened_{region}", 0),
+               total=len(DEEP_UNIVERSES.get(region, [])), finalists=len(res)))
+
+    cols = st.columns(3)
+    for i, item in enumerate(res[:3]):
+        comp = safe_float(item.get("composite"), float("nan"))
+        with cols[i]:
+            st.markdown(metric_card(f"{item['ticker']} · {item.get('name', item['ticker'])}",
+                        fmt_num(comp, 1), positive=(not math.isnan(comp) and comp >= BUY_THRESHOLD)),
+                        unsafe_allow_html=True)
+            st.markdown(rec_pill(str(item.get("recommendation", ""))), unsafe_allow_html=True)
+
+    df = pd.DataFrame([{
+        tr("col_ticker"): x["ticker"], tr("col_company"): x.get("name", x["ticker"]),
+        tr("col_theme_strength"): safe_float(x.get("composite"), float("nan")),
+        tr("why_call"): str(x.get("recommendation", "—")),
+        tr("col_theme_momentum"): safe_float(x.get("momentum"), float("nan")),
+        tr("deep_col_screen"): safe_float(x.get("screen_blend"), float("nan")),
+        tr("pe_ratio"): safe_float(x.get("pe"), float("nan")),
+    } for x in res])
+    st.dataframe(df.style.format({tr("col_theme_strength"): "{:.0f}", tr("col_theme_momentum"): "{:.0f}",
+                 tr("deep_col_screen"): "{:+.1f}%", tr("pe_ratio"): "{:,.1f}"}, na_rep="—"),
+                 width="stretch", hide_index=True)
+    st.caption(tr("deep_scan_note"))
+
+
 def render_themes(results: list[dict]) -> None:
     if not results:
         st.info(tr("need_run_engine"))
@@ -2886,7 +2496,7 @@ def main() -> None:
         st.caption(f"{_LAST_HYPE_STATUS} · {_msg}" if _LAST_HYPE_STATUS else _msg)
 
     # Main Segment View tabs routing setup
-    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([tr("tab_top"), tr("tab_regional"), tr("tab_category"), tr("tab_deep"), tr("tab_audit"), tr("tab_sell"), tr("tab_us"), tr("tab_themes")])
+    t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs([tr("tab_top"), tr("tab_regional"), tr("tab_category"), tr("tab_deep"), tr("tab_audit"), tr("tab_sell"), tr("tab_us"), tr("tab_themes"), tr("tab_deep_scan")])
 
     with t1: render_daily_top_3(results)
     with t2: render_global_sectors(results)
@@ -2896,6 +2506,7 @@ def main() -> None:
     with t6: render_sell_signals()
     with t7: render_us_conviction(results)
     with t8: render_themes(results)
+    with t9: render_deep_scan()
 
 if __name__ == "__main__":
     main()
