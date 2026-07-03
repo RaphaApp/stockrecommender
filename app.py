@@ -422,8 +422,20 @@ from config import (
     TICKER_UNIVERSE, COMPANY_NAMES, THEMES, BENCHMARKS, TRANSLATIONS,
     DEEP_FINALISTS, DEEP_US_TICKERS, JP_DEEP_TICKERS, CN_DEEP_TICKERS, DEEP_UNIVERSES,
 )
+# Deep-scan promotion settings (new). getattr-style fallback so an older config.py
+# without these blocks still runs — promotions just start empty with the 5/3/2 quota.
+try:
+    from config import PROMOTED_TICKERS, PROMOTION_QUOTA
+except ImportError:
+    PROMOTED_TICKERS = {"USA": [], "Japan": [], "China": []}
+    PROMOTION_QUOTA = {"USA": 5, "Japan": 3, "China": 2}
+# Live-universe + theme-bridge settings (new); fallbacks keep an older config.py running.
+try:
+    from config import DYNAMIC_UNIVERSE_SPEC, DYNAMIC_ALLOWED_SUFFIXES, THEME_INDUSTRY_KEYWORDS
+except ImportError:
+    DYNAMIC_UNIVERSE_SPEC, DYNAMIC_ALLOWED_SUFFIXES, THEME_INDUSTRY_KEYWORDS = {}, {}, []
 from indicators import (
-    compute_rsi, compute_macd, compute_bollinger, compute_hype, clamp,
+    compute_rsi, compute_macd, compute_bollinger, compute_hype, clamp, screen_metrics,
 )
 ALL_TICKERS = [ticker for region in TICKER_UNIVERSE.values() for ticker in region]
 
@@ -624,6 +636,23 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL, factor_name TEXT NOT NULL, current_weight REAL
             )""")
+        # Deep-scan winners promoted into the main scan universe. NOTE: on Streamlit
+        # Cloud this file-backed table is wiped on restart/redeploy — the persistent
+        # layer is PROMOTED_TICKERS in config.py (the app offers a paste-able snippet).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS promoted_tickers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                region TEXT NOT NULL, ticker TEXT NOT NULL, name TEXT,
+                composite REAL, promoted_at TEXT NOT NULL
+            )""")
+        # Live screener names merged into each market's deep-scan universe (rotates
+        # on every "Refresh universe" click; curated lists remain the quality floor).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS dynamic_universe (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                region TEXT NOT NULL, ticker TEXT NOT NULL,
+                rank INTEGER, fetched_at TEXT NOT NULL
+            )""")
         # --- Safe migration for pre-existing stock_engine.db files ---
         # Databases created before the "quality" factor existed are missing the
         # column. Add it (defaulting old rows to 0.0) only when absent, so this is
@@ -713,6 +742,171 @@ def get_recommendations() -> pd.DataFrame:
         df = pd.read_sql_query("SELECT * FROM recommendations ORDER BY rec_date DESC, id DESC", conn)
     if not df.empty: df["rec_date"] = pd.to_datetime(df["rec_date"], errors="coerce")
     return df
+
+# ----------------------------------------------------------------------------
+# Deep-scan promotions — a small rotating layer of deep-scan winners that rides
+# along with the standard TICKER_UNIVERSE on every main scan (quota: US 5 / JP 3 /
+# CN 2). Two layers, merged: the SQLite table (written by the Deep Scan tab's
+# Promote button; ephemeral on Streamlit Cloud) takes priority, then the
+# PROMOTED_TICKERS block in config.py (the persistent, hand-pasted layer). Names
+# already anywhere in the base universe are dropped, and each region is capped to
+# its quota — so the total scan is at most base + 10.
+# ----------------------------------------------------------------------------
+_BASE_UNIVERSE_SET = {t for ticks in TICKER_UNIVERSE.values() for t in ticks}
+
+def get_promoted_universe() -> dict[str, list[str]]:
+    db_layer: dict[str, list[str]] = {}
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT region, ticker FROM promoted_tickers ORDER BY id ASC").fetchall()
+        for r in rows:
+            db_layer.setdefault(r["region"], []).append(r["ticker"])
+    except Exception:
+        pass   # a missing/locked DB must never break universe assembly
+    out: dict[str, list[str]] = {}
+    for region, quota in PROMOTION_QUOTA.items():
+        merged, seen = [], set()
+        for t in db_layer.get(region, []) + list(PROMOTED_TICKERS.get(region, [])):
+            if t and t not in seen and t not in _BASE_UNIVERSE_SET:
+                merged.append(t); seen.add(t)
+            if len(merged) >= quota:
+                break
+        if merged:
+            out[region] = merged
+    return out
+
+def save_promotions(region: str, picks: list[tuple[str, str, float]]) -> None:
+    """Replace `region`'s DB promotion layer with `picks` [(ticker, name, composite)]."""
+    ts = datetime.now().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        conn.execute("DELETE FROM promoted_tickers WHERE region=?", (region,))
+        conn.executemany(
+            "INSERT INTO promoted_tickers (region, ticker, name, composite, promoted_at) VALUES (?,?,?,?,?)",
+            [(region, t, n, safe_float(c, 0.0), ts) for t, n, c in picks],
+        )
+        conn.commit()
+
+def clear_promotions() -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM promoted_tickers")
+        conn.commit()
+
+def effective_universe() -> dict[str, list[str]]:
+    """Base TICKER_UNIVERSE plus the promoted deep-scan layer, per region, deduped."""
+    promoted = get_promoted_universe()
+    out = {}
+    for region, ticks in TICKER_UNIVERSE.items():
+        extra = [t for t in promoted.get(region, []) if t not in ticks]
+        out[region] = list(ticks) + extra
+    return out
+
+def promotions_config_snippet() -> str:
+    """Ready-to-paste config.py block reflecting the CURRENT merged promotions, so a
+    Streamlit Cloud user can persist them locally before a redeploy wipes the DB."""
+    promoted = get_promoted_universe()
+    lines = ["PROMOTED_TICKERS = {"]
+    for region in PROMOTION_QUOTA:
+        ticks = ", ".join(f'"{t}"' for t in promoted.get(region, []))
+        lines.append(f'    "{region}": [{ticks}],')
+    lines.append("}")
+    return "\n".join(lines)
+
+# ----------------------------------------------------------------------------
+# LIVE deep-universe layer — Yahoo screener (top market cap + biggest movers)
+# merged with the hand-curated deep lists, so the funnel's INPUT rotates with the
+# market instead of being frozen at the knowledge cutoff. Curated lists are the
+# quality floor and always remain; the screener adds churn: new listings, names
+# that grew into the cap floor, and the day's genuine movers. Fully fail-safe —
+# the screener is an unofficial endpoint and is often blocked on cloud IPs, in
+# which case the deep scan simply runs on the curated list as before.
+# ----------------------------------------------------------------------------
+def refresh_dynamic_universe(region: str) -> list[str]:
+    """Query Yahoo's screener for `region`. Two pulls per Yahoo region code:
+    top-N by market cap (stability, data quality) and top movers above the same
+    cap floor (discovery). Returns deduped symbols filtered to the market's
+    expected listing suffixes; [] on any failure. Never raises."""
+    spec = DYNAMIC_UNIVERSE_SPEC.get(region)
+    if not spec or yf is None or not hasattr(yf, "screen") or not hasattr(yf, "EquityQuery"):
+        return []
+    allowed = DYNAMIC_ALLOWED_SUFFIXES.get(region, {""})
+    symbols, seen = [], set()
+
+    def _take(resp) -> None:
+        for q in (resp or {}).get("quotes", []):
+            sym = str(q.get("symbol") or "").upper().strip()
+            if not sym or sym in seen or "=" in sym or "^" in sym:
+                continue
+            if q.get("quoteType") not in (None, "EQUITY"):
+                continue
+            suffix = "." + sym.rsplit(".", 1)[1] if "." in sym else ""
+            if suffix not in allowed:
+                continue
+            seen.add(sym)
+            symbols.append(sym)
+
+    for code in spec["regions"]:
+        base = yf.EquityQuery("and", [
+            yf.EquityQuery("eq", ["region", code]),
+            yf.EquityQuery("gt", ["intradaymarketcap", spec["min_cap"]]),
+        ])
+        try:   # largest names first: keeps data quality high and the list current
+            _take(yf.screen(base, sortField="intradaymarketcap", sortAsc=False,
+                            size=spec["top_cap"]))
+        except Exception as e:
+            logger.warning("screener market-cap pull failed for %s/%s: %s", region, code, e)
+        try:   # movers overlay: today's biggest gainers above the same cap floor
+            _take(yf.screen(base, sortField="percentchange", sortAsc=False,
+                            size=spec["movers"]))
+        except Exception as e:
+            logger.warning("screener movers pull failed for %s/%s: %s", region, code, e)
+    return symbols
+
+def save_dynamic_universe(region: str, tickers: list[str]) -> None:
+    ts = datetime.now().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        conn.execute("DELETE FROM dynamic_universe WHERE region=?", (region,))
+        conn.executemany(
+            "INSERT INTO dynamic_universe (region, ticker, rank, fetched_at) VALUES (?,?,?,?)",
+            [(region, t, i, ts) for i, t in enumerate(tickers)],
+        )
+        conn.commit()
+
+def get_dynamic_universe(region: str) -> tuple[list[str], str | None]:
+    """This market's stored screener names and when they were fetched (ISO), if any."""
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT ticker, fetched_at FROM dynamic_universe WHERE region=? ORDER BY rank ASC",
+                (region,)).fetchall()
+    except Exception:
+        return [], None
+    if not rows:
+        return [], None
+    return [r["ticker"] for r in rows], rows[0]["fetched_at"]
+
+def deep_universe_for(region: str) -> tuple[list[str], int]:
+    """Curated deep list + live screener names (deduped). Returns (tickers, n_live)."""
+    curated = list(DEEP_UNIVERSES.get(region, []))
+    dyn, _ = get_dynamic_universe(region)
+    cur_set = set(curated)
+    extra = [t for t in dyn if t not in cur_set]
+    return curated + extra, len(extra)
+
+def match_theme(region: str, sector: str | None, industry: str | None) -> str | None:
+    """Classify a stock into one of the THEMES baskets from its Yahoo sector/industry
+    (captured for free during stage-2 fundamentals). First keyword match wins,
+    specific industries before catch-alls; China + internet routes to China Internet.
+    Returns None when nothing fits — not every stock belongs to a theme."""
+    blob = f"{sector or ''} {industry or ''}".lower().strip()
+    if not blob:
+        return None
+    if region == "China" and any(k in blob for k in ("internet", "e-commerce", "online")):
+        return "China Internet"
+    for theme, kws in THEME_INDUSTRY_KEYWORDS:
+        if any(k in blob for k in kws):
+            return theme
+    return None
 
 # ----------------------------------------------------------------------------
 # Quantitative Math & Indicators
@@ -808,7 +1002,8 @@ def _fmp_fundamentals(ticker: str) -> dict:
     base = "https://financialmodelingprep.com/api/v3"
     hdr = {"User-Agent": "Mozilla/5.0"}
     out = {"pe": float("nan"), "div_yield": float("nan"), "market_cap": float("nan"),
-           "roe": float("nan"), "short_pct": float("nan"), "name": ticker}
+           "roe": float("nan"), "short_pct": float("nan"), "name": ticker,
+           "sector": "", "industry": ""}
     got = False
     try:
         prof = json.loads(_reddit_get(f"{base}/profile/{ticker}?apikey={key}", hdr))
@@ -817,6 +1012,8 @@ def _fmp_fundamentals(ticker: str) -> dict:
             out["market_cap"] = safe_float(p.get("mktCap"))
             out["pe"] = safe_float(p.get("pe"))
             out["name"] = str(p.get("companyName") or ticker)
+            out["sector"] = str(p.get("sector") or "")
+            out["industry"] = str(p.get("industry") or "")
             got = True
     except Exception as e:
         logger.warning("FMP profile fallback failed for %s: %s", ticker, e)
@@ -839,7 +1036,8 @@ def _fmp_fundamentals(ticker: str) -> dict:
 
 def fetch_fundamentals(ticker: str) -> dict:
     out = {"pe": float("nan"), "div_yield": float("nan"), "market_cap": float("nan"),
-           "roe": float("nan"), "short_pct": float("nan"), "name": ticker}
+           "roe": float("nan"), "short_pct": float("nan"), "name": ticker,
+           "sector": "", "industry": ""}
     if yf is None: return out
     # Distinguish a transient failure (rate-limit / network) from a reachable ticker
     # that simply lacks some fields. On the former we RAISE — @st.cache_data never
@@ -867,6 +1065,10 @@ def fetch_fundamentals(ticker: str) -> dict:
     # keeps these as NaN when yfinance omits them, so downstream scoring never breaks.
     out["roe"] = safe_float(info.get("returnOnEquity"))
     out["short_pct"] = safe_float(info.get("shortPercentOfFloat"))
+    # Sector/industry ride along for free from the same .info call — they feed the
+    # Deep Scan <-> Themes bridge (match_theme) at zero extra API cost.
+    out["sector"] = str(info.get("sector") or "")
+    out["industry"] = str(info.get("industry") or "")
     return out
 
 def resolve_div_yield(info: dict) -> float:
@@ -906,7 +1108,9 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0) -> dict
     rsi = safe_float(compute_rsi(close).iloc[-1])
     macd_line, signal_line, hist_macd = compute_macd(close)
     _, bb_up, bb_lo, bb_pct = compute_bollinger(close)
-    ret_1m = safe_float((price / close.iloc[-21] - 1) * 100) if len(close) > 21 else float("nan")
+    # 1-month return = 21 TRADING days back, i.e. iloc[-22] relative to the last
+    # bar (iloc[-21] was only 20 days back — a subtle off-by-one).
+    ret_1m = safe_float((price / close.iloc[-22] - 1) * 100) if len(close) >= 22 else float("nan")
     hype = compute_hype(volume)
 
     # Scoring Engine Logic
@@ -947,6 +1151,7 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0) -> dict
         "sma20": sma20, "sma50": sma50, "rsi": rsi, "macd_hist": safe_float(hist_macd.iloc[-1]),
         "bb_pct": pct_b, "ret_1m": ret_1m, "pe": pe, "div_yield": funds["div_yield"],
         "market_cap": funds["market_cap"], "roe": roe, "short_pct": short_pct,
+        "sector": funds.get("sector", ""), "industry": funds.get("industry", ""),
         "hype": hype, "momentum": momentum_score, "value": value_score,
         "technical": technical_score, "quality": quality_score,
         "hype_score": hype["score"], "hype_mentions": hype_mentions, "history": hist
@@ -1104,8 +1309,8 @@ def analyze_sell_signals(ticker: str, hist: pd.DataFrame | None = None) -> dict 
     sma200 = safe_float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else float("nan")
     _, _, macd_hist = compute_macd(close)
     macd_h = safe_float(macd_hist.iloc[-1])
-    ret_1m = safe_float((price / close.iloc[-21] - 1) * 100) if len(close) > 21 else float("nan")
-    ret_3m = safe_float((price / close.iloc[-63] - 1) * 100) if len(close) > 63 else float("nan")
+    ret_1m = safe_float((price / close.iloc[-22] - 1) * 100) if len(close) >= 22 else float("nan")
+    ret_3m = safe_float((price / close.iloc[-64] - 1) * 100) if len(close) >= 64 else float("nan")
 
     signals: list[tuple[str, float | None, str]] = []
 
@@ -1560,12 +1765,18 @@ def run_engine(limit_per_region: int | None = None,
     # Only scan the regions the user selected (defaults to all). On a quick scan,
     # also cap to the first N tickers per region — fewer requests means a faster
     # run and a much lower chance of Yahoo rate-limiting the server's IP.
+    # Promoted deep-scan names (US 5 / JP 3 / CN 2 max) ride along AFTER the cap,
+    # so even a quick scan always covers the current promotion layer.
     selected = regions if regions else list(TICKER_UNIVERSE.keys())
-    universe = {
-        region: (ticks[:limit_per_region] if limit_per_region else ticks)
-        for region, ticks in TICKER_UNIVERSE.items()
-        if region in selected
-    }
+    promoted_map = get_promoted_universe()
+    promoted_set = {t for ticks in promoted_map.values() for t in ticks}
+    universe = {}
+    for region, ticks in TICKER_UNIVERSE.items():
+        if region not in selected:
+            continue
+        base = ticks[:limit_per_region] if limit_per_region else list(ticks)
+        extra = [t for t in promoted_map.get(region, []) if t not in base]
+        universe[region] = base + extra
 
     # Pull sentiment buzz ONCE for the whole scan, routing each market to the
     # enabled sources (Reddit for English names, GDELT news for JP/CN, etc.), then
@@ -1585,6 +1796,11 @@ def run_engine(limit_per_region: int | None = None,
                 if analysis is None:
                     failed.append(f"{t} (no data)")
                 else:
+                    analysis["promoted"] = t in promoted_set
+                    if analysis["promoted"]:
+                        # Star the display name so promoted ride-alongs are
+                        # recognisable in every tab without new columns.
+                        analysis["name"] = f"⭐ {analysis.get('name') or t}"
                     analysis.update(score_with_weights(analysis, weights))
                     save_recommendation(analysis)
                     results.append(analysis)
@@ -1820,43 +2036,44 @@ def _evidence_rows(r: dict) -> list:
 
 
 def _screen_rank(histories: dict, n: int) -> list:
-    """Stage-1 price screen: rank tickers by a blended 1M/3M/6M momentum from their
-    history, return the top n as [(ticker, blend_pct, ret_1m_pct), ...]. Pure function."""
+    """Stage-1 price screen: rank tickers by the multi-factor screen score from
+    indicators.screen_metrics (momentum blend + volume surge + 52w-high proximity,
+    with a falling-knife cap). Returns the top n as [(ticker, metrics_dict), ...].
+    Pure function over the bulk histories — still zero extra API calls."""
     scored = []
     for t, h in histories.items():
-        close = h["Close"].dropna()
-        if len(close) < 30:
-            continue
-        last = float(close.iloc[-1])
-        def _ret(k):
-            return (last / float(close.iloc[-k - 1]) - 1.0) if len(close) > k else float("nan")
-        rets = [_ret(21), _ret(63), _ret(126)]
-        vals = [r for r in rets if not math.isnan(r)]
-        if not vals:
-            continue
-        blend = sum(vals) / len(vals)
-        scored.append((t, blend * 100.0, rets[0] * 100.0 if not math.isnan(rets[0]) else float("nan")))
-    scored.sort(key=lambda x: x[1], reverse=True)
+        vol = h["Volume"] if "Volume" in h.columns else None
+        m = screen_metrics(h["Close"], vol)
+        if m is not None:
+            scored.append((t, m))
+    scored.sort(key=lambda x: x[1]["score"], reverse=True)
     return scored[:n]
 
 
 def run_deep_scan(region: str) -> tuple[list, int]:
-    """Deep scan funnel for one market. Stage 1: ONE bulk price download for that
-    market's deep list, screened on momentum. Stage 2: full fundamental scoring on the
-    top finalists only — Yahoo sees ~1 bulk request + DEEP_FINALISTS per-ticker calls."""
-    tickers = DEEP_UNIVERSES.get(region, [])
+    """Deep scan funnel for one market. Stage 1: ONE bulk price download for the
+    market's curated deep list MERGED with any live screener names (see
+    deep_universe_for), ranked on the multi-factor screen score. Stage 2: full
+    fundamental scoring on the top finalists only — Yahoo sees ~1 bulk request +
+    DEEP_FINALISTS per-ticker calls. Finalists also get a theme classification
+    from the sector/industry that stage 2 fetches anyway."""
+    tickers, _n_live = deep_universe_for(region)
     histories = _bulk_history(tickers, period="8mo")
     n_screened = len(histories)
     finalists = _screen_rank(histories, DEEP_FINALISTS)
     weights = get_latest_weights()
     results = []
     prog = st.progress(0.0, text=tr("deep_scan_scoring"))
-    for i, (t, blend, _r1) in enumerate(finalists, start=1):
+    for i, (t, m) in enumerate(finalists, start=1):
         try:
             a = analyze_ticker(t, region, 0.0)   # hype skipped on the deep scan (price+fundamentals)
             if a:
                 a.update(score_with_weights(a, weights))
-                a["screen_blend"] = blend
+                a["screen_score"] = m["score"]
+                a["screen_blend"] = m["blend_pct"]
+                a["screen_dhigh"] = m["dist_high_pct"]
+                a["screen_vsurge"] = m["vol_surge"]
+                a["theme_match"] = match_theme(region, a.get("sector"), a.get("industry"))
                 results.append(a)
         except Exception:
             pass   # a throttled finalist is dropped, not fatal
@@ -1868,6 +2085,19 @@ def run_deep_scan(region: str) -> tuple[list, int]:
 
 def render_deep_scan() -> None:
     st.caption(tr("deep_scan_intro"))
+    # Current promotion layer — visible up front, with the persistence snippet and a
+    # clear button, so the state of "what rides along with the main scan" is obvious.
+    promoted_now = get_promoted_universe()
+    if any(promoted_now.values()):
+        items = " · ".join(
+            f"{region_name(r)}: {', '.join(ts)}" for r, ts in promoted_now.items() if ts)
+        st.caption(tr("promoted_current", items=items))
+        with st.expander(tr("promote_snippet_hint")):
+            st.code(promotions_config_snippet(), language="python")
+        if st.button(tr("promote_clear"), key="promote_clear_btn"):
+            clear_promotions()
+            st.info(tr("promote_clear_note"))
+            st.rerun()
     region_labels = {tr("deep_region_us"): "USA", tr("deep_region_jp"): "Japan",
                      tr("deep_region_cn"): "China"}
     choice = st.radio(tr("deep_region_label"), list(region_labels.keys()),
@@ -1875,7 +2105,28 @@ def render_deep_scan() -> None:
     region = region_labels[choice]
     if region != "USA":
         st.caption(tr("deep_scan_jpcn_note"))
-    if st.button(tr("deep_scan_btn"), key="deep_scan_run"):
+    # Universe status: curated floor + live screener overlay, with freshness.
+    _dyn, _dyn_ts = get_dynamic_universe(region)
+    _curated_n = len(DEEP_UNIVERSES.get(region, []))
+    _live_n = deep_universe_for(region)[1]
+    _ago_part = ""
+    if _dyn_ts:
+        try:
+            _ago_part = f" · {_ago(pd.Timestamp(_dyn_ts).timestamp())}"
+        except Exception:
+            pass
+    st.caption(tr("dyn_universe_status", curated=_curated_n, dynamic=_live_n, ago=_ago_part))
+    col_run, col_refresh = st.columns(2)
+    if col_refresh.button(tr("dyn_refresh_btn"), key=f"dyn_refresh_{region}"):
+        with st.spinner(tr("deep_scan_running")):
+            syms = refresh_dynamic_universe(region)
+        if syms:
+            save_dynamic_universe(region, syms)
+            st.success(tr("dyn_refresh_done", n=len(syms)))
+            st.rerun()
+        else:
+            st.warning(tr("dyn_refresh_fail"))
+    if col_run.button(tr("deep_scan_btn"), key="deep_scan_run"):
         with st.spinner(tr("deep_scan_running")):
             res, n = run_deep_scan(region)
         st.session_state[f"deep_results_{region}"] = res
@@ -1885,7 +2136,7 @@ def render_deep_scan() -> None:
         st.info(tr("deep_scan_hint"))
         return
     st.caption(tr("deep_scan_done", screened=st.session_state.get(f"deep_screened_{region}", 0),
-               total=len(DEEP_UNIVERSES.get(region, [])), finalists=len(res)))
+               total=len(deep_universe_for(region)[0]), finalists=len(res)))
 
     cols = st.columns(3)
     for i, item in enumerate(res[:3]):
@@ -1900,14 +2151,39 @@ def render_deep_scan() -> None:
         tr("col_ticker"): x["ticker"], tr("col_company"): x.get("name", x["ticker"]),
         tr("col_theme_strength"): safe_float(x.get("composite"), float("nan")),
         tr("why_call"): str(x.get("recommendation", "—")),
-        tr("col_theme_momentum"): safe_float(x.get("momentum"), float("nan")),
-        tr("deep_col_screen"): safe_float(x.get("screen_blend"), float("nan")),
+        tr("deep_col_score"): safe_float(x.get("screen_score"), float("nan")),
+        tr("deep_col_dhigh"): safe_float(x.get("screen_dhigh"), float("nan")),
+        tr("deep_col_vsurge"): safe_float(x.get("screen_vsurge"), float("nan")),
+        tr("deep_col_theme"): x.get("theme_match") or "—",
         tr("pe_ratio"): safe_float(x.get("pe"), float("nan")),
     } for x in res])
-    st.dataframe(df.style.format({tr("col_theme_strength"): "{:.0f}", tr("col_theme_momentum"): "{:.0f}",
-                 tr("deep_col_screen"): "{:+.1f}%", tr("pe_ratio"): "{:,.1f}"}, na_rep="—"),
+    st.dataframe(df.style.format({tr("col_theme_strength"): "{:.0f}", tr("deep_col_score"): "{:.0f}",
+                 tr("deep_col_dhigh"): "{:+.1f}%", tr("deep_col_vsurge"): "{:.1f}×",
+                 tr("pe_ratio"): "{:,.1f}"}, na_rep="—"),
                  width="stretch", hide_index=True)
     st.caption(tr("deep_scan_note"))
+
+    # Promote this market's best finalists (US 5 / JP 3 / CN 2) into the main scan.
+    # Ranked by composite; names already in the base TICKER_UNIVERSE are skipped so
+    # promotion never double-scans a name. Replaces this region's previous
+    # promotions — re-running deep scans naturally rotates the layer.
+    quota = PROMOTION_QUOTA.get(region, 0)
+    if quota and st.button(tr("promote_btn", n=quota), key=f"promote_{region}"):
+        picks, skipped = [], 0
+        for x in res:
+            if len(picks) >= quota:
+                break
+            t = x["ticker"]
+            if t in _BASE_UNIVERSE_SET:
+                skipped += 1
+                continue
+            picks.append((t, str(x.get("name") or t), safe_float(x.get("composite"), 0.0)))
+        if picks:
+            save_promotions(region, picks)
+            st.success(tr("promote_done", added=len(picks), skipped=skipped))
+            st.rerun()
+        else:
+            st.info(tr("promote_none"))
 
 
 def render_themes(results: list[dict]) -> None:
@@ -2005,6 +2281,7 @@ def render_themes(results: list[dict]) -> None:
                  tr("col_theme_ret1m"): "{:+.1f}%"}, na_rep="—"),
                  width="stretch", hide_index=True)
     st.caption(tr("themes_coverage_note"))
+
     if not smart_ok:
         st.caption(tr("themes_smart_unavailable"))
 
@@ -2026,6 +2303,41 @@ def render_themes(results: list[dict]) -> None:
                  tr("col_theme_hype"): "{:.0f}", tr("col_theme_smart"): "{:.0f}",
                  tr("col_theme_ret1m"): "{:+.1f}%"}, na_rep="—"),
                  width="stretch", hide_index=True)
+
+    # Deep-scan echo: cross-reference the latest deep-scan finalists (any market,
+    # pulled from session state — no new fetching) against these theme baskets via
+    # their Yahoo sector/industry. This is the Themes <-> Deep Scan bridge: theme
+    # heat measured on the curated basket, confirmed or contradicted by the top
+    # names from the much wider deep universe — including names the baskets don't
+    # know about, which is exactly the discovery the curated lists can't provide.
+    # NOTE: placed at the very end of the tab (nothing else follows), so an empty
+    # state here can never skip the leaderboard or drill-down rendered above.
+    deep_all = []
+    for reg in DEEP_UNIVERSES:
+        deep_all.extend(st.session_state.get(f"deep_results_{reg}") or [])
+    st.markdown(f"##### {tr('themes_deep_echo')}")
+    if not deep_all:
+        st.caption(tr("themes_deep_echo_hint"))
+    else:
+        echo_rows = [{
+            tr("col_theme"): x["theme_match"],
+            tr("col_ticker"): x["ticker"],
+            tr("col_company"): x.get("name", x["ticker"]),
+            "_region": region_name(x.get("region", "")),
+            tr("col_theme_strength"): safe_float(x.get("composite"), float("nan")),
+            tr("deep_col_score"): safe_float(x.get("screen_score"), float("nan")),
+        } for x in deep_all if x.get("theme_match")]
+        if not echo_rows:
+            st.caption(tr("themes_deep_echo_none"))
+        else:
+            edf = (pd.DataFrame(echo_rows)
+                   .sort_values([tr("col_theme"), tr("col_theme_strength")], ascending=[True, False])
+                   .groupby(tr("col_theme"), sort=False).head(3)
+                   .rename(columns={"_region": tr("regions_to_scan")}))
+            st.dataframe(edf.style.format({tr("col_theme_strength"): "{:.0f}",
+                         tr("deep_col_score"): "{:.0f}"}, na_rep="—"),
+                         width="stretch", hide_index=True)
+            st.caption(tr("themes_deep_echo_note"))
 
 
 def render_deep_dive(results: list[dict]) -> None:
@@ -2440,10 +2752,16 @@ def main() -> None:
     # Resolve matured recommendation outcomes for the audit accuracy panel (no weight
     # change), then run the single learning loop — the walk-forward optimiser — which
     # re-tunes kpi_weights from matured mock-portfolio picks.
-    try: evaluate_outcomes_only()
-    except Exception: pass
-    try: walk_forward_update()
-    except Exception: pass
+    # Guarded to ONCE PER SESSION: Streamlit reruns main() on every widget
+    # interaction, and both loops hit the network when matured picks exist — a
+    # persistently-failing ticker (e.g. delisted) would otherwise re-block the UI
+    # for several seconds on every single click.
+    if not st.session_state.get("_maintenance_done"):
+        try: evaluate_outcomes_only()
+        except Exception: pass
+        try: walk_forward_update()
+        except Exception: pass
+        st.session_state["_maintenance_done"] = True
 
     # Sidebar Interface Controller Layout 
     # Language menu first, so changing it re-renders the whole UI in the chosen language.
@@ -2454,6 +2772,9 @@ def main() -> None:
     region_keys = list(TICKER_UNIVERSE.keys())
     selected_regions = st.sidebar.multiselect(tr("regions_to_scan"), region_keys,
                                               default=region_keys, format_func=region_name)
+    _n_promoted = sum(len(v) for v in get_promoted_universe().values())
+    if _n_promoted:
+        st.sidebar.caption(tr("promoted_sidebar", n=_n_promoted))
     quick_scan = st.sidebar.toggle(tr("scan_quick_toggle"), value=True, help=tr("scan_quick_help"))
     update_prices = st.sidebar.checkbox(tr("update_hist_prices"), value=True)
     source_keys = list(SENTIMENT_SOURCES.keys())

@@ -9,7 +9,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from indicators import compute_rsi, compute_macd, compute_bollinger, compute_hype, clamp
+from indicators import (compute_rsi, compute_macd, compute_bollinger, compute_hype,
+                        clamp, screen_metrics)
 
 
 # --------------------------------------------------------------------------- clamp
@@ -122,3 +123,49 @@ def test_hype_single_spike_partial():
     assert out["breakout_days"] == 1
     assert out["sustained"] is False
     assert 0.0 < out["score"] < 60.0
+
+
+# ------------------------------------------------------------------- screen_metrics
+def test_screen_too_short_is_none():
+    assert screen_metrics(_series([100.0] * 20)) is None
+
+
+def test_screen_uptrend_near_high_beats_downtrend():
+    up = _series(np.linspace(100, 160, 200))          # steady climb, sits at its high
+    down = _series(np.linspace(160, 100, 200))        # steady bleed, far from high
+    s_up = screen_metrics(up)
+    s_down = screen_metrics(down)
+    assert s_up["score"] > s_down["score"]
+    assert s_up["dist_high_pct"] == pytest.approx(0.0, abs=1e-9)   # at the 52w high
+    assert s_down["dist_high_pct"] < -30
+
+
+def test_screen_falling_knife_capped():
+    # big 6-month run-up (4x), then a ~20% collapse in the final month: the old
+    # momentum-blend loved these; the new screen caps them at 40.
+    vals = list(np.linspace(100, 400, 178)) + list(np.linspace(400, 320, 22))
+    s = screen_metrics(_series(vals))
+    assert s["ret_1m_pct"] < -15
+    assert s["score"] <= 40.0
+    assert s["blend_pct"] > 0                          # tail momentum is still positive…
+    # …which is exactly why the cap (not the blend) has to do the work here.
+
+
+def test_screen_volume_surge_raises_score():
+    close = _series(np.linspace(100, 130, 200))
+    flat_vol = _series([1e6] * 200)
+    surge_vol = _series([1e6] * 195 + [3e6] * 5)       # 3x the trailing average
+    s_flat = screen_metrics(close, flat_vol)
+    s_surge = screen_metrics(close, surge_vol)
+    assert s_surge["vol_surge"] > 2.5
+    assert s_flat["vol_surge"] == pytest.approx(1.0, rel=0.05)
+    assert s_surge["score"] > s_flat["score"]
+
+
+def test_screen_no_volume_is_neutral_not_crash():
+    close = _series(np.linspace(100, 130, 200))
+    s_none = screen_metrics(close, None)
+    s_flat = screen_metrics(close, _series([1e6] * 200))
+    # missing volume (e.g. a fallback data source) scores like flat volume, ±rounding
+    assert abs(s_none["score"] - s_flat["score"]) < 2.0
+    assert math.isnan(s_none["vol_surge"])

@@ -145,6 +145,72 @@ CN_DEEP_TICKERS = [
 # Region -> deep universe. Europe intentionally omitted (per request).
 DEEP_UNIVERSES = {"USA": DEEP_US_TICKERS, "Japan": JP_DEEP_TICKERS, "China": CN_DEEP_TICKERS}
 
+# ---------------------------------------------------------------------------
+# LIVE deep-universe refresh via Yahoo's screener (yfinance yf.screen)
+# ---------------------------------------------------------------------------
+# Per market: which Yahoo region codes to query, how many top-market-cap names to
+# pull, how many top movers (biggest daily gainers above the cap floor) to overlay
+# for discovery/churn, and the minimum market cap (USD-ish; Yahoo compares in the
+# listing currency for suffixed markets, so JP/CN floors are set in local terms).
+# Screener names MERGE with (never replace) the curated lists above — curation is
+# the quality floor, the screener is the churn. Fully fail-safe: if the screener
+# is blocked (common on cloud IPs — it's unofficial), the curated list stands.
+DYNAMIC_UNIVERSE_SPEC = {
+    "USA":   {"regions": ["us"],       "top_cap": 100, "movers": 25, "min_cap": 2_000_000_000},
+    "Japan": {"regions": ["jp"],       "top_cap": 60,  "movers": 15, "min_cap": 300_000_000_000},
+    "China": {"regions": ["hk", "cn"], "top_cap": 60,  "movers": 15, "min_cap": 20_000_000_000},
+}
+# Symbol suffixes accepted per market ("" = unsuffixed US listing). Anything else
+# the screener returns (warrants, odd venues) is dropped.
+DYNAMIC_ALLOWED_SUFFIXES = {
+    "USA": {""},
+    "Japan": {".T"},
+    "China": {".HK", ".SS", ".SZ"},
+}
+
+# ---------------------------------------------------------------------------
+# Industry/sector -> THEME classification (Deep Scan <-> Themes bridge)
+# ---------------------------------------------------------------------------
+# Ordered, first match wins — specific industries before catch-alls (a semiconductor
+# name must land in Semiconductors, not the broad-tech AI bucket). Keys MUST match
+# THEMES keys exactly. Matched against the lowercase "sector industry" string that
+# yfinance/FMP return during stage-2 scoring, so this costs zero extra API calls.
+# "China Internet" is special-cased in code (China region + internet keywords).
+THEME_INDUSTRY_KEYWORDS = [
+    ("Semiconductors",      ["semiconductor"]),
+    ("Defense & Aerospace", ["aerospace", "defense"]),
+    ("Clean Energy",        ["solar", "renewable"]),
+    ("Energy (Oil & Gas)",  ["oil", "gas", "coal", "uranium"]),
+    ("EV & Mobility",       ["auto", "vehicle", "tire"]),
+    ("Financials",          ["bank", "insurance", "capital markets", "financial",
+                             "credit services", "asset management", "exchange"]),
+    ("Healthcare",          ["drug", "biotech", "medical", "health", "pharma", "diagnostics"]),
+    ("Consumer & Luxury",   ["luxury", "apparel", "footwear", "retail", "restaurant",
+                             "beverage", "household", "packaged food", "travel",
+                             "lodging", "department store", "leisure"]),
+    ("Artificial Intelligence", ["software", "information technology", "internet content",
+                                 "internet retail", "electronic", "communication equipment",
+                                 "computer hardware", "consumer electronics", "telecom"]),
+]
+
+# ---------------------------------------------------------------------------
+# Deep-scan promotions into the MAIN scan universe
+# ---------------------------------------------------------------------------
+# How many deep-scan winners per market may ride along with the standard
+# TICKER_UNIVERSE on every main scan (US 5 / Japan 3 / China 2 = +10 max).
+PROMOTION_QUOTA = {"USA": 5, "Japan": 3, "China": 2}
+
+# The PERSISTENT layer of promoted tickers. The Deep Scan tab's "Promote" button
+# writes promotions into the local SQLite DB, which Streamlit Cloud wipes on every
+# restart/redeploy — so the app also shows a ready-to-paste snippet for this block.
+# Paste it here in local VS Code and push to make the current promotions permanent.
+# Names already in TICKER_UNIVERSE are ignored automatically (no double scanning).
+PROMOTED_TICKERS = {
+    "USA": [],
+    "Japan": [],
+    "China": [],
+}
+
 # Benchmark index per home market for the walk-forward evaluator. A pick is judged
 # against the index of the exchange it actually trades on (keyed by ticker suffix),
 # so a Tokyo-listed name is measured against the Nikkei rather than the S&P 500.
@@ -354,9 +420,28 @@ TRANSLATIONS = {
         "deep_scan_scoring": "Stage 2: full scoring on the finalists…",
         "deep_scan_hint": "Press Run deep scan to screen the large-cap list and score the top finalists. Takes a little longer than a normal scan.",
         "deep_scan_done": "Screened {screened} of {total} names on price; full-scored the top {finalists}. Ranked by composite below.",
-        "deep_scan_note": "Hype is skipped on the deep scan (price + fundamentals only). A finalist that Yahoo throttled is dropped rather than shown with bad data. 'Screen %' is the blended 1M/3M/6M momentum that earned its finalist slot.",
+        "deep_scan_note": "Hype is skipped on the deep scan (price + fundamentals only). A finalist that Yahoo throttled is dropped rather than shown with bad data. 'Screen score' is the stage-1 rank: 1M/3M/6M momentum (50%) + volume surge vs its 60-day average (20%) + proximity to the 52-week high (30%), with a falling-knife cap at 40 when the last month dropped more than 15%.",
         "deep_col_screen": "Screen %",
-        "us_header": "🇺🇸 Top US Conviction Picks (SEC Fundamentals)",
+        "deep_col_score": "Screen score",
+        "deep_col_dhigh": "vs 52w high",
+        "deep_col_vsurge": "Vol surge",
+        "deep_col_theme": "Theme",
+        "dyn_refresh_btn": "🔄 Refresh universe (Yahoo screener)",
+        "dyn_refresh_done": "Screener returned {n} names for this market — merged with the curated list for the next deep scan.",
+        "dyn_refresh_fail": "The Yahoo screener returned nothing (it's unofficial and often blocked on cloud/shared IPs). The curated list still works as-is.",
+        "dyn_universe_status": "Deep universe: {curated} curated + {dynamic} live from the screener (top market cap + biggest movers){ago}",
+        "themes_deep_echo": "🔭 Deep-scan echo — finalists matching these themes",
+        "themes_deep_echo_note": "The latest deep-scan finalists (any market), classified into these theme baskets by their Yahoo sector/industry — top 3 per theme by composite. Names outside the curated baskets can surface here, which is the point: theme heat confirmed (or contradicted) by the wider market.",
+        "themes_deep_echo_none": "No deep-scan finalist matched a theme basket.",
+        "themes_deep_echo_hint": "Tip: run a Deep Scan and its finalists will be cross-referenced against these themes here.",
+        "promote_btn": "⭐ Promote top {n} into the main scan",
+        "promote_done": "Promoted {added} name(s) into the main scan universe. {skipped} of the top finalists were already in it.",
+        "promote_none": "No new names to promote — the top finalists are already in the main universe.",
+        "promoted_current": "⭐ Riding along with every main scan: {items}",
+        "promote_clear": "Clear promotions",
+        "promote_clear_note": "Cleared the promotions saved in the app database. Any names hard-coded in config.py's PROMOTED_TICKERS stay until you edit the file.",
+        "promote_snippet_hint": "Streamlit Cloud wipes the app's database on every restart/redeploy, so promotions made here are temporary. To make them permanent, paste this block over PROMOTED_TICKERS in config.py (local VS Code) and push:",
+        "promoted_sidebar": "incl. {n} promoted deep-scan name(s)",
         "us_spinner": "Pulling audited SEC EDGAR fundamentals…",
         "us_module_missing": "The sec_research.py companion module isn't available — place it beside app.py.",
         "us_conviction_suffix": "conviction",
@@ -602,9 +687,28 @@ TRANSLATIONS = {
         "deep_scan_scoring": "ステージ2：ファイナリストの完全評価…",
         "deep_scan_hint": "「ディープスキャン実行」を押すと大型株リストをスクリーニングし上位銘柄を評価します。通常スキャンより少し時間がかかります。",
         "deep_scan_done": "{total}銘柄中{screened}銘柄を価格でスクリーニングし、上位{finalists}銘柄を完全評価しました。以下は総合スコア順です。",
-        "deep_scan_note": "ディープスキャンではハイプを除外します（価格＋ファンダメンタルのみ）。Yahooのレート制限を受けたファイナリストは誤データを表示せず除外します。「スクリーン%」はファイナリスト入りの根拠となった1か月/3か月/6か月の複合モメンタムです。",
+        "deep_scan_note": "ディープスキャンではハイプを除外します（価格＋ファンダメンタルのみ）。Yahooのレート制限を受けたファイナリストは誤データを表示せず除外します。「スクリーンスコア」は第1段階のランク: 1か月/3か月/6か月モメンタム（50%）＋60日平均比の出来高急増（20%）＋52週高値への近さ（30%）。直近1か月で15%超下落した銘柄は40点で頭打ち（落ちるナイフ対策）。",
         "deep_col_screen": "スクリーン%",
-        "us_header": "🇺🇸 米国 確信度トップ銘柄（SEC財務）",
+        "deep_col_score": "スクリーンスコア",
+        "deep_col_dhigh": "52週高値比",
+        "deep_col_vsurge": "出来高急増",
+        "deep_col_theme": "テーマ",
+        "dyn_refresh_btn": "🔄 ユニバースを更新（Yahooスクリーナー）",
+        "dyn_refresh_done": "スクリーナーがこの市場で{n}銘柄を返しました — 次回のディープスキャンでキュレーション済みリストと統合されます。",
+        "dyn_refresh_fail": "Yahooスクリーナーが応答しませんでした（非公式APIのため、クラウド/共有IPではブロックされがちです）。キュレーション済みリストはそのまま使えます。",
+        "dyn_universe_status": "ディープユニバース: キュレーション{curated}銘柄＋スクリーナー{dynamic}銘柄（時価総額上位＋値上がり上位）{ago}",
+        "themes_deep_echo": "🔭 ディープスキャン・エコー — テーマに合致したファイナリスト",
+        "themes_deep_echo_note": "最新のディープスキャンのファイナリスト（全市場）を、Yahooのセクター/業種でテーマバスケットに分類 — テーマごとに総合スコア上位3銘柄。キュレーション外の銘柄もここに現れます。それが狙いです: テーマの過熱を市場全体で裏付け（または反証）します。",
+        "themes_deep_echo_none": "テーマバスケットに合致するディープスキャンのファイナリストはありませんでした。",
+        "themes_deep_echo_hint": "ヒント: ディープスキャンを実行すると、そのファイナリストがここでテーマと照合されます。",
+        "promote_btn": "⭐ 上位{n}銘柄をメインスキャンに昇格",
+        "promote_done": "{added}銘柄をメインスキャンのユニバースに昇格しました。上位ファイナリストのうち{skipped}銘柄は既に含まれていました。",
+        "promote_none": "昇格できる新規銘柄はありません — 上位ファイナリストは既にメインユニバースに含まれています。",
+        "promoted_current": "⭐ 毎回のメインスキャンに同乗中: {items}",
+        "promote_clear": "昇格をクリア",
+        "promote_clear_note": "アプリのデータベースに保存された昇格をクリアしました。config.py の PROMOTED_TICKERS にハードコードされた銘柄はファイルを編集するまで残ります。",
+        "promote_snippet_hint": "Streamlit Cloud は再起動・再デプロイのたびにアプリのデータベースを消去するため、ここでの昇格は一時的です。恒久化するには、このブロックをローカルの VS Code で config.py の PROMOTED_TICKERS に貼り付けてプッシュしてください:",
+        "promoted_sidebar": "うち{n}銘柄はディープスキャンからの昇格",
         "us_spinner": "SECの監査済み財務データ（EDGAR）を取得中…",
         "us_module_missing": "コンパニオンモジュール sec_research.py がありません。app.py と同じフォルダに置いてください。",
         "us_conviction_suffix": "確信度",
