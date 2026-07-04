@@ -15,8 +15,8 @@ TICKER_UNIVERSE = {
     "USA": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "TSLA", "JPM", "LMT", "XOM", "JNJ",
             "META", "V", "WMT", "PG", "KO", "DIS", "NFLX", "AMD", "BAC", "PFE",
             "CSCO", "MRK", "HD", "RTX", "NOC", "GD", "BA", "CVX", "COP", "SLB",
-            "NEE", "ENPH", "FSLR", "LLY", "UNH"],
-    "Japan": ["7203.T", "6758.T", "9984.T", "6501.T", "7751.T",
+            "NEE", "ENPH", "FSLR", "LLY", "UNH", "PANW", "CRWD", "ZS"],
+    "Japan": ["7203.T", "6758.T", "9984.T", "6501.T", "7751.T", "4385.T",
               "8306.T", "9432.T", "6902.T", "4063.T", "8035.T",
               "7267.T", "6098.T", "9433.T", "6954.T", "8058.T"],
     "Europe": ["ASML", "MC.PA", "VOW3.DE", "SAP", "OR.PA",
@@ -41,8 +41,9 @@ COMPANY_NAMES = {
     "GD": "General Dynamics", "BA": "Boeing", "CVX": "Chevron",
     "COP": "ConocoPhillips", "SLB": "SLB Schlumberger", "NEE": "NextEra Energy",
     "ENPH": "Enphase Energy", "FSLR": "First Solar", "LLY": "Eli Lilly",
+    "PANW": "Palo Alto Networks", "CRWD": "CrowdStrike", "ZS": "Zscaler",
     "UNH": "UnitedHealth",
-    "7203.T": "Toyota", "6758.T": "Sony", "9984.T": "SoftBank", "6501.T": "Hitachi",
+    "7203.T": "Toyota", "6758.T": "Sony", "9984.T": "SoftBank", "6501.T": "Hitachi", "4385.T": "Mercari",
     "7751.T": "Canon", "8306.T": "Mitsubishi UFJ", "9432.T": "NTT", "6902.T": "Denso",
     "4063.T": "Shin-Etsu Chemical", "8035.T": "Tokyo Electron", "7267.T": "Honda",
     "6098.T": "Recruit Holdings", "9433.T": "KDDI", "6954.T": "Fanuc", "8058.T": "Mitsubishi Corp",
@@ -63,6 +64,7 @@ THEMES = {
     "Artificial Intelligence": ["NVDA", "MSFT", "GOOGL", "META", "AMD", "AMZN", "ASML",
                                  "8035.T", "9984.T", "BIDU"],
     "Semiconductors": ["NVDA", "AMD", "ASML", "8035.T", "4063.T"],
+    "Cybersecurity": ["PANW", "CRWD", "ZS"],
     "Defense & Aerospace": ["LMT", "RTX", "NOC", "GD", "BA", "AIR.PA"],
     "Energy (Oil & Gas)": ["XOM", "CVX", "COP", "SLB"],
     "Clean Energy": ["NEE", "ENPH", "FSLR", "TSLA"],
@@ -71,6 +73,10 @@ THEMES = {
     "Consumer & Luxury": ["AMZN", "WMT", "KO", "PG", "HD", "MC.PA", "OR.PA", "RMS.PA",
                           "NFLX", "DIS"],
     "China Internet": ["0700.HK", "9988.HK", "JD", "BIDU", "3690.HK", "PDD", "1810.HK"],
+    # Cross-region e-commerce/marketplaces. Overlaps China Internet deliberately —
+    # Alibaba is both; a Chinese finalist still routes to China Internet first (the
+    # region special-case in match_theme), non-China e-commerce lands here.
+    "E-Commerce & Marketplaces": ["AMZN", "JD", "PDD", "9988.HK", "3690.HK", "4385.T"],
     "Healthcare": ["JNJ", "PFE", "MRK", "LLY", "UNH"],
 }
 
@@ -178,6 +184,12 @@ DYNAMIC_ALLOWED_SUFFIXES = {
 # "China Internet" is special-cased in code (China region + internet keywords).
 THEME_INDUSTRY_KEYWORDS = [
     ("Semiconductors",      ["semiconductor"]),
+    # NOTE: Yahoo lumps most cybersecurity names into the generic industry
+    # "Software - Infrastructure", so keyword classification can only catch the
+    # rare explicit strings; the curated basket above is what really powers this
+    # theme. PANW/CRWD/ZS deep-scan finalists will classify as AI (software) —
+    # a known limit of Yahoo's taxonomy, not a map bug.
+    ("Cybersecurity",       ["cyber", "security software"]),
     ("Defense & Aerospace", ["aerospace", "defense"]),
     ("Clean Energy",        ["solar", "renewable"]),
     ("Energy (Oil & Gas)",  ["oil", "gas", "coal", "uranium"]),
@@ -185,11 +197,18 @@ THEME_INDUSTRY_KEYWORDS = [
     ("Financials",          ["bank", "insurance", "capital markets", "financial",
                              "credit services", "asset management", "exchange"]),
     ("Healthcare",          ["drug", "biotech", "medical", "health", "pharma", "diagnostics"]),
+    # MUST precede Consumer & Luxury: Yahoo's industry for Mercari/Amazon/Alibaba is
+    # "Internet Retail", and the generic "retail" substring below would swallow it.
+    # Multi-word/specific keywords always go in an earlier entry than their generic
+    # substring — that's the whole ordering contract of this map.
+    ("E-Commerce & Marketplaces", ["internet retail", "e-commerce", "marketplace",
+                                   "online retail", "auction"]),
     ("Consumer & Luxury",   ["luxury", "apparel", "footwear", "retail", "restaurant",
+                             "gaming", "entertainment",
                              "beverage", "household", "packaged food", "travel",
                              "lodging", "department store", "leisure"]),
     ("Artificial Intelligence", ["software", "information technology", "internet content",
-                                 "internet retail", "electronic", "communication equipment",
+                                 "electronic components", "communication equipment",
                                  "computer hardware", "consumer electronics", "telecom"]),
 ]
 
@@ -408,6 +427,10 @@ TRANSLATIONS = {
         "col_theme_ret1m": "Avg 1M %",
         "col_theme_buys": "BUYs",
         "col_theme_coverage": "Coverage",
+        "col_theme_breadth": ">SMA50 %",
+        "col_theme_buyspct": "BUY %",
+        "col_theme_delta": "Δ Mom",
+        "themes_delta_note": "Δ Mom compares average momentum with the previous recorded full scan (quick scans aren't recorded, so deltas compare like with like). History lives in the local SQLite DB — on Streamlit Cloud it resets at every redeploy, so trends accumulate meaningfully when run locally.",
         "tab_deep_scan": "🔬 Deep Scan",
         "deep_scan_intro": "Screens a curated large-cap list for the chosen market on price momentum (one bulk download), then runs full fundamental scoring on the top 25 only — so Yahoo isn't hammered. Curated large-caps, not a verified exchange ranking; not financial advice.",
         "deep_region_label": "Market",
@@ -675,6 +698,10 @@ TRANSLATIONS = {
         "col_theme_ret1m": "平均1か月%",
         "col_theme_buys": "BUY数",
         "col_theme_coverage": "カバレッジ",
+        "col_theme_breadth": ">SMA50 %",
+        "col_theme_buyspct": "BUY %",
+        "col_theme_delta": "Δモメンタム",
+        "themes_delta_note": "Δモメンタムは前回記録されたフルスキャンとの平均モメンタム比較です（クイックスキャンは記録されないため、同条件同士の比較になります）。履歴はローカルのSQLite DBに保存され、Streamlit Cloudでは再デプロイごとにリセットされます。ローカル実行でこそトレンドが蓄積されます。",
         "tab_deep_scan": "🔬 ディープスキャン",
         "deep_scan_intro": "選択した市場の厳選大型株リストを価格モメンタムでスクリーニングし（一括ダウンロード）、上位25銘柄のみ完全なファンダメンタル評価を行います。Yahooへの負荷を抑えるためです。検証済みの取引所ランキングではなく厳選した大型株です。投資助言ではありません。",
         "deep_region_label": "市場",

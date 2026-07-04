@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import math
@@ -652,6 +653,16 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 region TEXT NOT NULL, ticker TEXT NOT NULL,
                 rank INTEGER, fetched_at TEXT NOT NULL
+            )""")
+        # Per-theme aggregates recorded once per FULL scan (quick scans skipped) so
+        # the Themes tab can show momentum deltas vs the previous scan. Local-only
+        # persistence: on Streamlit Cloud this resets at every redeploy.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS theme_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot TEXT NOT NULL, theme TEXT NOT NULL,
+                momentum REAL, hype REAL, composite REAL,
+                n INTEGER, cover INTEGER, created_at TEXT NOT NULL
             )""")
         # --- Safe migration for pre-existing stock_engine.db files ---
         # Databases created before the "quality" factor existed are missing the
@@ -2186,6 +2197,52 @@ def render_deep_scan() -> None:
             st.info(tr("promote_none"))
 
 
+def record_theme_snapshot(rows: list[dict]) -> None:
+    """Persist per-theme aggregates for one FULL scan. Quick scans are skipped by the
+    caller (comparing quick vs full would be noise, not signal). A content signature
+    dedupes Streamlit's reruns: the same scan rendering ten times inserts once."""
+    sig = hashlib.md5(json.dumps(
+        [(r["theme"], round(safe_float(r.get("momentum"), 0.0), 2), r["n"]) for r in rows],
+        sort_keys=True).encode()).hexdigest()
+    try:
+        with get_conn() as conn:
+            last = conn.execute(
+                "SELECT snapshot FROM theme_history ORDER BY id DESC LIMIT 1").fetchone()
+            if last and last[0] == sig:
+                return
+            now = datetime.now().isoformat(timespec="seconds")
+            conn.executemany(
+                "INSERT INTO theme_history (snapshot, theme, momentum, hype, composite, n, cover, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                [(sig, r["theme"], safe_float(r.get("momentum")), safe_float(r.get("hype")),
+                  safe_float(r.get("composite")), int(r["n"]), int(r["cover"]), now)
+                 for r in rows])
+    except Exception as e:
+        logger.warning("theme history write skipped: %s", e)
+
+
+def theme_momentum_deltas() -> dict[str, float]:
+    """Momentum change per theme vs the PREVIOUS recorded snapshot (latest minus
+    prior). Empty dict when fewer than two snapshots exist — the Δ column shows '—'
+    until a second full scan is recorded."""
+    try:
+        with get_conn() as conn:
+            snaps = [r[0] for r in conn.execute(
+                "SELECT DISTINCT snapshot FROM theme_history ORDER BY id DESC LIMIT 2")]
+            if len(snaps) < 2:
+                return {}
+            cur = dict(conn.execute(
+                "SELECT theme, momentum FROM theme_history WHERE snapshot = ?", (snaps[0],)))
+            prev = dict(conn.execute(
+                "SELECT theme, momentum FROM theme_history WHERE snapshot = ?", (snaps[1],)))
+    except Exception as e:
+        logger.warning("theme history read skipped: %s", e)
+        return {}
+    return {t: float(cur[t]) - float(prev[t])
+            for t in cur if t in prev
+            and cur[t] is not None and prev[t] is not None}
+
+
 def render_themes(results: list[dict]) -> None:
     if not results:
         st.info(tr("need_run_engine"))
@@ -2215,17 +2272,30 @@ def render_themes(results: list[dict]) -> None:
         if not present:
             continue   # nothing from this theme was scanned -> omit (coverage note explains)
         smart = float(sum(int(sci.get(t, 0) or 0) for t in ticks)) if smart_ok else float("nan")
+        # Breadth: does the whole basket participate, or is one megacap carrying the
+        # average? (>SMA50 % and BUY %). This is the honest fix for megacap skew —
+        # not cap-weighting, which would amplify it.
+        above = sum(1 for x in present
+                    if safe_float(x.get("price"), float("nan")) > safe_float(x.get("sma50"), float("inf")))
+        buys = sum(1 for x in present if str(x.get("recommendation")) == "BUY")
         rows.append({"theme": theme,
                      "momentum": _avg(present, "momentum"),
                      "hype": _avg(present, "hype_score"),
                      "smart": smart,
                      "composite": _avg(present, "composite"),
                      "ret1m": _avg(present, "ret_1m"),
+                     "breadth": above / len(present) * 100.0,
+                     "buyspct": buys / len(present) * 100.0,
                      "n": len(present), "cover": len(ticks)})
     if not rows:
         st.warning(tr("themes_no_coverage"))
         return
+    # Rotation memory: record full scans only, then diff vs the previous snapshot.
+    if not st.session_state.get("scan_is_quick", True):
+        record_theme_snapshot(rows)
+    deltas = theme_momentum_deltas()
     df = pd.DataFrame(rows)
+    df["delta"] = df["theme"].map(lambda t: deltas.get(t, float("nan")))
 
     st.caption(tr("themes_caption"))
 
@@ -2270,17 +2340,25 @@ def render_themes(results: list[dict]) -> None:
              .properties(height=max(180, 28 * len(df)), width="container"))
     st.altair_chart(chart)
 
-    table = df.assign(coverage=lambda d: d["n"].astype(str) + "/" + d["cover"].astype(str))[
-        ["theme", "momentum", "hype", "smart", "composite", "ret1m", "coverage"]].rename(columns={
+    table = df.assign(
+        coverage=lambda d: d["n"].astype(str) + "/" + d["cover"].astype(str),
+        delta_disp=lambda d: d["delta"].map(
+            lambda v: "—" if math.isnan(v) else f"{'▲' if v >= 0 else '▼'} {v:+.1f}"))[
+        ["theme", "momentum", "delta_disp", "breadth", "buyspct", "hype", "smart",
+         "composite", "ret1m", "coverage"]].rename(columns={
         "theme": tr("col_theme"), "momentum": tr("col_theme_momentum"),
+        "delta_disp": tr("col_theme_delta"),
+        "breadth": tr("col_theme_breadth"), "buyspct": tr("col_theme_buyspct"),
         "hype": tr("col_theme_hype"), "smart": tr("col_theme_smart"),
         "composite": tr("col_theme_strength"), "ret1m": tr("col_theme_ret1m"),
         "coverage": tr("col_theme_coverage")})
     st.dataframe(table.style.format({tr("col_theme_momentum"): "{:.0f}", tr("col_theme_hype"): "{:.0f}",
+                 tr("col_theme_breadth"): "{:.0f}%", tr("col_theme_buyspct"): "{:.0f}%",
                  tr("col_theme_smart"): "{:.0f}", tr("col_theme_strength"): "{:.0f}",
                  tr("col_theme_ret1m"): "{:+.1f}%"}, na_rep="—"),
                  width="stretch", hide_index=True)
     st.caption(tr("themes_coverage_note"))
+    st.caption(tr("themes_delta_note"))
 
     if not smart_ok:
         st.caption(tr("themes_smart_unavailable"))
@@ -2791,6 +2869,7 @@ def main() -> None:
                 res, fail = run_engine(limit_per_region=limit, regions=selected_regions,
                                        sources=selected_sources)
                 st.session_state["results"], st.session_state["failed"] = res, fail
+                st.session_state["scan_is_quick"] = bool(quick_scan)
             if res:
                 st.success(tr("scan_success"))
             elif fail:
