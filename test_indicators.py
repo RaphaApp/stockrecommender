@@ -10,7 +10,8 @@ import pandas as pd
 import pytest
 
 from indicators import (compute_rsi, compute_macd, compute_bollinger, compute_hype,
-                        clamp, screen_metrics)
+                        clamp, screen_metrics, forum_sentiment_score,
+                        forum_euphoria_sell_score)
 
 
 # --------------------------------------------------------------------------- clamp
@@ -169,3 +170,60 @@ def test_screen_no_volume_is_neutral_not_crash():
     # missing volume (e.g. a fallback data source) scores like flat volume, ±rounding
     assert abs(s_none["score"] - s_flat["score"]) < 2.0
     assert math.isnan(s_none["vol_surge"])
+
+
+# ------------------------------------------------------------ forum sentiment (JP)
+def test_forum_bullish_poll():
+    # the Rakuten screenshot case: 64% buy / 14% sell -> net +50 -> 85
+    assert forum_sentiment_score(64, 14) == pytest.approx(85.0)
+
+
+def test_forum_bearish_poll():
+    assert forum_sentiment_score(20, 60) == pytest.approx(50 + (20 - 60) * 0.7)  # 22
+
+
+def test_forum_balanced_poll_is_neutral():
+    assert forum_sentiment_score(40, 40) == pytest.approx(50.0)
+
+
+def test_forum_extremes_clamp():
+    assert forum_sentiment_score(100, 0) == 100.0
+    assert forum_sentiment_score(0, 100) == 0.0
+
+
+def test_forum_invalid_inputs_none():
+    assert forum_sentiment_score(float("nan"), 10) is None
+    assert forum_sentiment_score(-5, 10) is None
+    assert forum_sentiment_score(70, 40) is None     # sums past 100 -> malformed parse
+    assert forum_sentiment_score(0, 0) is None       # no votes -> no signal
+
+
+# --------------------------------------------------- forum euphoria (sell side)
+def test_euphoria_bearish_board_is_neutral():
+    # crowd bearishness must NOT push toward selling (contrarian) -> neutral 50
+    assert forum_euphoria_sell_score(20, 60) == 50.0
+    assert forum_euphoria_sell_score(40, 40) == 50.0
+
+
+def test_euphoria_normal_optimism_is_neutral():
+    # ordinary retail bullishness (net <= 35) is background noise, not a sell signal
+    assert forum_euphoria_sell_score(60, 30) == 50.0   # net +30
+    assert forum_euphoria_sell_score(64, 30) == 50.0   # net +34, just under threshold
+
+
+def test_euphoria_extreme_raises_sell_pressure():
+    # lopsided euphoria beyond +35 net starts adding sell pressure
+    assert forum_euphoria_sell_score(64, 14) == pytest.approx(65.0)   # net +50 -> 50+15
+    assert forum_euphoria_sell_score(90, 5) == pytest.approx(100.0)   # net +85 -> capped
+    assert forum_euphoria_sell_score(80, 10) > forum_euphoria_sell_score(64, 14)
+
+
+def test_euphoria_never_below_neutral():
+    for b, s in [(0, 100), (10, 80), (50, 50), (55, 40)]:
+        assert forum_euphoria_sell_score(b, s) >= 50.0
+
+
+def test_euphoria_invalid_none():
+    assert forum_euphoria_sell_score(float("nan"), 10) is None
+    assert forum_euphoria_sell_score(70, 40) is None   # sums > 100
+    assert forum_euphoria_sell_score(0, 0) is None

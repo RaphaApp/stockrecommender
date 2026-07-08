@@ -105,3 +105,58 @@ def screen_metrics(close: pd.Series, volume: pd.Series | None = None) -> dict | 
     return {"score": float(score), "blend_pct": float(blend_pct),
             "ret_1m_pct": float(ret_1m_pct), "vol_surge": float(vol_surge),
             "dist_high_pct": float(dist_high_pct)}
+
+
+def forum_sentiment_score(bull_pct: float, bear_pct: float) -> float | None:
+    """Map a Yahoo! Japan 掲示板 みんなの評価 poll (買いたい% / 売りたい%) onto the
+    app's 0-100 hype scale via NET bullishness, not raw buy%:
+
+        score = clamp(50 + (bull - bear) * 0.7)
+
+    Rationale: retail boards skew structurally bullish (buy% of 55-65 is normal, not
+    a signal), so raw buy% would overstate everything; the buy-minus-sell spread is
+    the informative part. 0.7 damping means a very strong poll (e.g. 64/14 -> +50 net)
+    lands at 85, and only an extreme ~+71 net saturates at 100. Returns None when the
+    inputs aren't a usable poll (NaN, out of [0,100], or 0/0 = no votes recorded).
+    Pure function; the page fetching/parsing lives in the app layer.
+    """
+    b, s = float(bull_pct), float(bear_pct)
+    if np.isnan(b) or np.isnan(s):
+        return None
+    if not (0.0 <= b <= 100.0 and 0.0 <= s <= 100.0) or b + s > 100.0:
+        return None
+    if b == 0.0 and s == 0.0:
+        return None   # no votes -> no signal (distinct from a genuinely neutral poll)
+    return clamp(50.0 + (b - s) * 0.7)
+
+
+def forum_euphoria_sell_score(bull_pct: float, bear_pct: float) -> float | None:
+    """ASYMMETRIC sell-side reading of the Yahoo!掲示板 poll — deliberately NOT the
+    mirror of forum_sentiment_score.
+
+    Rationale: crowd *bearishness* is a weak/contrarian sell signal (retail capitulation
+    often marks bottoms), so it should NOT push toward selling. What genuinely precedes
+    drops is retail *euphoria* — an unusually lopsided bullish board on a name the crowd
+    is already crowded into. So only net bullishness ABOVE a normal-optimism threshold
+    contributes, scaled into sell pressure:
+
+        net = bull - bear
+        net <= 35  -> 50   (neutral: normal retail optimism is not a sell signal)
+        net  = 70  -> ~85  (extreme euphoria: elevated sell pressure)
+        capped at 100
+
+    A balanced or bearish board returns exactly 50 (neutral), never < 50 — bearishness
+    is never scored as a reason to sell. Returns None on unusable input (same validity
+    rules as forum_sentiment_score) so the caller can SKIP the KPI, not zero it.
+    """
+    b, s = float(bull_pct), float(bear_pct)
+    if np.isnan(b) or np.isnan(s):
+        return None
+    if not (0.0 <= b <= 100.0 and 0.0 <= s <= 100.0) or b + s > 100.0:
+        return None
+    if b == 0.0 and s == 0.0:
+        return None
+    net = b - s
+    if net <= 35.0:
+        return 50.0                       # normal or bearish -> neutral, never a sell push
+    return clamp(50.0 + (net - 35.0) * 1.0)   # only euphoria beyond +35 adds sell pressure

@@ -437,6 +437,7 @@ except ImportError:
     DYNAMIC_UNIVERSE_SPEC, DYNAMIC_ALLOWED_SUFFIXES, THEME_INDUSTRY_KEYWORDS = {}, {}, []
 from indicators import (
     compute_rsi, compute_macd, compute_bollinger, compute_hype, clamp, screen_metrics,
+    forum_sentiment_score, forum_euphoria_sell_score,
 )
 ALL_TICKERS = [ticker for region in TICKER_UNIVERSE.values() for ticker in region]
 
@@ -586,9 +587,87 @@ def fmt_big(v: float) -> str:
     return f"${v:,.0f}"
 
 # ----------------------------------------------------------------------------
-# Database layer
+# Database layer — dual backend.
+#
+# Default: local SQLite (zero config, exactly as before). If a DATABASE_URL
+# secret/env var is set (e.g. a Supabase Postgres connection string) AND
+# psycopg2 is installed, everything persists to Postgres instead — which is
+# what survives Streamlit Cloud redeploys (walk-forward weights, mock
+# portfolio, promotions, theme history). All call sites are unchanged: the
+# adapter speaks the sqlite3 dialect the app already uses ('?' placeholders,
+# conn.execute(), rows addressable by name AND position, `with` = commit).
 # ----------------------------------------------------------------------------
-def get_conn() -> sqlite3.Connection:
+try:
+    import psycopg2                     # optional; only needed for Postgres mode
+    import psycopg2.extras
+except Exception:
+    psycopg2 = None
+
+
+def _db_url() -> str | None:
+    return _get_secret("DATABASE_URL")
+
+
+def db_backend() -> str:
+    return "postgres" if (psycopg2 is not None and _db_url()) else "sqlite"
+
+
+def _pg_sql(sql: str) -> str:
+    """Translate the app's sqlite dialect to Postgres: '?' params -> '%s'."""
+    return sql.replace("?", "%s")
+
+
+class _PgConn:
+    """psycopg2 adapter with the sqlite3-ish surface the app uses.
+
+    - conn.execute()/executemany() directly (no explicit cursor at call sites)
+    - '?' placeholders
+    - DictCursor rows: addressable by column name AND position, like sqlite3.Row
+      (RealDictCursor would break the app's positional access — r[0] etc.)
+    - context manager commits on success, rolls back on error, and CLOSES the
+      connection (per-call connections; no long-lived idle sockets to go stale)
+    """
+    def __init__(self, raw):
+        self._raw = raw
+
+    def execute(self, sql: str, params=()):
+        cur = self._raw.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute(_pg_sql(sql), tuple(params))
+        return cur
+
+    def executemany(self, sql: str, seq):
+        cur = self._raw.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.executemany(_pg_sql(sql), [tuple(p) for p in seq])
+        return cur
+
+    def cursor(self, *args, **kwargs):
+        # pandas.read_sql_query drives the raw DBAPI cursor protocol directly.
+        return self._raw.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+    def commit(self):
+        self._raw.commit()
+
+    def close(self):
+        self._raw.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self._raw.commit()
+            else:
+                self._raw.rollback()
+        finally:
+            self._raw.close()
+        return False
+
+
+def get_conn():
+    if db_backend() == "postgres":
+        return _PgConn(psycopg2.connect(_db_url()))
+    # SQLite path — unchanged semantics.
     # check_same_thread=False because Streamlit serves reruns on a pool of threads;
     # timeout gives writers up to 10s to wait out a lock instead of erroring out;
     # WAL journaling lets reads and a writer proceed concurrently, which together
@@ -602,68 +681,82 @@ def get_conn() -> sqlite3.Connection:
         pass   # some network filesystems reject WAL; fall back to default journaling
     return conn
 
-def _ensure_column(conn: sqlite3.Connection, table: str, column: str,
+def _ensure_column(conn, table: str, column: str,
                    decl: str = "REAL DEFAULT 0.0") -> None:
     """Add `column` to `table` if it isn't already present (safe schema migration)."""
+    if db_backend() == "postgres":
+        # Postgres types: REAL is only 4 bytes there; store doubles like sqlite does.
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} "
+                     f"{decl.replace('REAL', 'DOUBLE PRECISION')}")
+        return
     existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
+
+def _ddl(sql: str) -> str:
+    """Translate CREATE TABLE statements for the active backend. The app's DDL is
+    written in sqlite dialect; for Postgres swap the auto-id and widen floats."""
+    if db_backend() == "postgres":
+        return (sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+                   .replace(" REAL", " DOUBLE PRECISION"))
+    return sql
+
 def init_db() -> None:
     with get_conn() as conn:
-        conn.execute("""
+        conn.execute(_ddl("""
             CREATE TABLE IF NOT EXISTS recommendations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticker TEXT NOT NULL, rec_date TEXT NOT NULL, recommendation TEXT NOT NULL,
                 composite REAL NOT NULL, price_at_rec REAL, momentum REAL, value REAL, 
                 technical REAL, hype REAL, quality REAL, price_after REAL, outcome INTEGER, eval_date TEXT
-            )""")
-        conn.execute("""
+            )"""))
+        conn.execute(_ddl("""
             CREATE TABLE IF NOT EXISTS kpi_weights (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, update_date TEXT NOT NULL,
                 momentum REAL, value REAL, technical REAL, hype REAL, quality REAL, note TEXT
-            )""")
+            )"""))
         # Walk-forward optimisation tables (new). CREATE ... IF NOT EXISTS is
         # inherently non-destructive, so existing data is never touched.
-        conn.execute("""
+        conn.execute(_ddl("""
             CREATE TABLE IF NOT EXISTS mock_portfolio (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL, ticker TEXT NOT NULL,
                 recommendation_price REAL, reason TEXT, kpi_snapshot TEXT,
                 evaluated INTEGER DEFAULT 0
-            )""")
-        conn.execute("""
+            )"""))
+        conn.execute(_ddl("""
             CREATE TABLE IF NOT EXISTS system_weights (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL, factor_name TEXT NOT NULL, current_weight REAL
-            )""")
+            )"""))
         # Deep-scan winners promoted into the main scan universe. NOTE: on Streamlit
         # Cloud this file-backed table is wiped on restart/redeploy — the persistent
         # layer is PROMOTED_TICKERS in config.py (the app offers a paste-able snippet).
-        conn.execute("""
+        conn.execute(_ddl("""
             CREATE TABLE IF NOT EXISTS promoted_tickers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 region TEXT NOT NULL, ticker TEXT NOT NULL, name TEXT,
                 composite REAL, promoted_at TEXT NOT NULL
-            )""")
+            )"""))
         # Live screener names merged into each market's deep-scan universe (rotates
         # on every "Refresh universe" click; curated lists remain the quality floor).
-        conn.execute("""
+        conn.execute(_ddl("""
             CREATE TABLE IF NOT EXISTS dynamic_universe (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 region TEXT NOT NULL, ticker TEXT NOT NULL,
                 rank INTEGER, fetched_at TEXT NOT NULL
-            )""")
+            )"""))
         # Per-theme aggregates recorded once per FULL scan (quick scans skipped) so
         # the Themes tab can show momentum deltas vs the previous scan. Local-only
         # persistence: on Streamlit Cloud this resets at every redeploy.
-        conn.execute("""
+        conn.execute(_ddl("""
             CREATE TABLE IF NOT EXISTS theme_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 snapshot TEXT NOT NULL, theme TEXT NOT NULL,
                 momentum REAL, hype REAL, composite REAL,
                 n INTEGER, cover INTEGER, created_at TEXT NOT NULL
-            )""")
+            )"""))
         # --- Safe migration for pre-existing stock_engine.db files ---
         # Databases created before the "quality" factor existed are missing the
         # column. Add it (defaulting old rows to 0.0) only when absent, so this is
@@ -1107,7 +1200,65 @@ def resolve_div_yield(info: dict) -> float:
     return dy
 
 
-def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0) -> dict | None:
+def _parse_jp_forum(html: str) -> tuple[float, float] | None:
+    """Extract (買いたい%, 売りたい%) from a Yahoo! Japan Finance forum page. The
+    markup is unofficial and can change, so this is deliberately tolerant — but
+    binding a percentage to a label is ambiguity-prone (in `買いたい：72% 売りたい：9%`
+    the naive percent-before-label pattern lets 売りたい steal the 72). So: pass 1
+    binds label→following-% (unambiguous), claiming those percents; pass 2 binds any
+    still-unresolved label to the nearest UNCLAIMED preceding % (the screenshot's
+    `64% 買いたい` layout). Returns None rather than guessing."""
+    if not html:
+        return None
+    labels = ("買いたい", "売りたい")
+    got: dict[str, float] = {}
+    claimed: set[int] = set()
+    # pass 1: label ... NN%   (claim the percent's position)
+    for lab in labels:
+        m = re.search(rf"{lab}[^0-9%]{{0,20}}(\d{{1,3}})\s*%", html)
+        if m and 0.0 <= float(m.group(1)) <= 100.0:
+            got[lab] = float(m.group(1))
+            claimed.add(m.start(1))
+    # pass 2: NN% ... label   (only percents nobody claimed, window free of labels)
+    for lab in labels:
+        if lab in got:
+            continue
+        for m in re.finditer(rf"(\d{{1,3}})\s*%([^0-9%]{{0,20}}){lab}", html):
+            gap = m.group(2)
+            if m.start(1) not in claimed and not any(l in gap for l in labels) \
+                    and 0.0 <= float(m.group(1)) <= 100.0:
+                got[lab] = float(m.group(1))
+                claimed.add(m.start(1))
+                break
+    if len(got) < 2:
+        mb = re.search(r'"(?:buy|bullish)(?:Ratio|Percent)"\s*:\s*(\d{1,3})', html)
+        ms = re.search(r'"(?:sell|bearish)(?:Ratio|Percent)"\s*:\s*(\d{1,3})', html)
+        if mb and ms:
+            return (float(mb.group(1)), float(ms.group(1)))
+        return None
+    return (got["買いたい"], got["売りたい"])
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_jp_forum_rating(ticker: str) -> tuple[float, float] | None:
+    """みんなの評価 poll for one Japanese ticker (####.T) from the Yahoo! Japan
+    Finance forum page. Unofficial HTML endpoint: cached 30 min, courtesy-throttled,
+    fail-safe (None on any error/blocked/markup change — hype falls back to the
+    volume signal alone). Personal-use scraping; Yahoo! JP could block or change it."""
+    if not ticker.endswith(".T"):
+        return None
+    try:
+        html = _reddit_get(f"https://finance.yahoo.co.jp/quote/{ticker}/forum",
+                           {"User-Agent": "Mozilla/5.0", "Accept-Language": "ja"})
+        time.sleep(0.25)   # only on cache miss; be polite to the page
+        return _parse_jp_forum(html)
+    except Exception as e:
+        logger.warning("JP forum fetch failed for %s: %s", ticker, e)
+        return None
+
+
+def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
+                   jp_forum: tuple | None = None) -> dict | None:
     hist = fetch_history(ticker)
     if hist is None or len(hist) < 60: return None
     close, volume = hist["Close"], hist.get("Volume", pd.Series(dtype=float))
@@ -1150,6 +1301,15 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0) -> dict
     if hype_mentions > 0:
         hype["score"] = clamp(hype["score"] + min(35, hype_mentions * 10))
 
+    # Japan-native sentiment: Yahoo!掲示板 みんなの評価 poll, blended 50/50 into the
+    # hype score when available. This gives Japanese names a real sentiment signal
+    # (Reddit/GDELT are English-centric); the transform (net bullishness, damped)
+    # is forum_sentiment_score in indicators.py. Fail-safe: no poll -> volume-only.
+    if jp_forum is not None:
+        fs = forum_sentiment_score(jp_forum[0], jp_forum[1])
+        if fs is not None:
+            hype["score"] = clamp(0.5 * hype["score"] + 0.5 * fs)
+
     # Short-squeeze modifier — a heavily-shorted name (>10% of float) that is also
     # printing sustained volume breakouts can squeeze violently, so we boost its
     # hype score by +30 (capped at 100). The boost flows into hype_score below.
@@ -1165,7 +1325,9 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0) -> dict
         "sector": funds.get("sector", ""), "industry": funds.get("industry", ""),
         "hype": hype, "momentum": momentum_score, "value": value_score,
         "technical": technical_score, "quality": quality_score,
-        "hype_score": hype["score"], "hype_mentions": hype_mentions, "history": hist
+        "hype_score": hype["score"], "hype_mentions": hype_mentions,
+        "jp_bull": (jp_forum[0] if jp_forum else float("nan")),
+        "jp_bear": (jp_forum[1] if jp_forum else float("nan")), "history": hist
     }
 
 def score_with_weights(analysis: dict, weights: dict[str, float]) -> dict:
@@ -1192,6 +1354,7 @@ SELL_KPI_WEIGHTS = {
     "technical": 0.15,    # trend breakdown (moving averages, MACD)
     "momentum": 0.10,     # recent price momentum
     "short": 0.05,        # short interest as bearish positioning
+    "forum": 0.05,        # Yahoo!掛示板 euphoria (JP only; asymmetric, skipped elsewhere)
 }
 _SELL_GRADES = ("sell", "underperform", "reduce", "underweight", "negative", "strong sell")
 
@@ -1405,6 +1568,23 @@ def analyze_sell_signals(ticker: str, hist: pd.DataFrame | None = None) -> dict 
     else:
         signals.append(("short", None,
                         f"{sp * 100:.1f}% short ignored — 1M momentum not negative (possible squeeze)"))
+
+    # 8) Yahoo!掛示板 euphoria (Japan only). ASYMMETRIC and contrarian-aware:
+    # only lopsided retail *bullishness* on a .T name adds sell pressure (the retail-top
+    # pattern); a bearish or balanced board is neutral, never a sell push. Skipped
+    # (None) for non-Japanese names and whenever no usable poll is available, so it
+    # never dilutes a US/EU/CN composite.
+    if ticker.endswith(".T"):
+        poll = fetch_jp_forum_rating(ticker)
+        es = forum_euphoria_sell_score(poll[0], poll[1]) if poll else None
+        if es is None:
+            signals.append(("forum", None, "No Yahoo!掛示板 poll available"))
+        else:
+            signals.append(("forum", es,
+                f"Yahoo!掛示板 買いたい {poll[0]:.0f}% / 売りたい {poll[1]:.0f}% "
+                + ("(euphoric — possible retail top)" if es > 50 else "(not euphoric — neutral)")))
+    else:
+        signals.append(("forum", None, "Yahoo!掛示板 poll — Japan only"))
 
     # Composite over only the KPIs that returned a score
     num = sum(SELL_KPI_WEIGHTS[k] * s for k, s, _ in signals if s is not None)
@@ -1769,7 +1949,8 @@ def seed_demo_history() -> None:
 
 def run_engine(limit_per_region: int | None = None,
                regions: list | None = None,
-               sources: list | None = None) -> tuple[list[dict], list[str]]:
+               sources: list | None = None,
+               use_jp_forum: bool = True) -> tuple[list[dict], list[str]]:
     weights = get_latest_weights()
     results, failed = [], []
 
@@ -1803,7 +1984,10 @@ def run_engine(limit_per_region: int | None = None,
     for region, tickers in universe.items():
         for t in tickers:
             try:
-                analysis = analyze_ticker(t, region, hype_counts.get(t, 0))
+                jp_rating = (fetch_jp_forum_rating(t)
+                             if (use_jp_forum and region == "Japan") else None)
+                analysis = analyze_ticker(t, region, hype_counts.get(t, 0),
+                                          jp_forum=jp_rating)
                 if analysis is None:
                     failed.append(f"{t} (no data)")
                 else:
@@ -2032,7 +2216,8 @@ def _evidence_rows(r: dict) -> list:
     pe, div, rsi, bbp = _f(r.get("pe")), _f(r.get("div_yield")), _f(r.get("rsi")), _f(r.get("bb_pct"))
     roe, shortp = _f(r.get("roe")), _f(r.get("short_pct"))
     ret1m = _f(r.get("ret_1m"))
-    return [
+    jp_bull, jp_bear = _f(r.get("jp_bull")), _f(r.get("jp_bear"))
+    rows = [
         (fm, tr("evi_ret_1m"),  "—" if math.isnan(ret1m) else f"{ret1m:+.1f}%"),
         (fm, tr("evi_vs_sma50"), vs50),
         (fm, tr("evi_macd"),     macd_s),
@@ -2044,6 +2229,13 @@ def _evidence_rows(r: dict) -> list:
         (fh, tr("evi_mentions"), f"{safe_float(r.get('hype_mentions'), 0):g}"),
         (fh, tr("evi_short"),    "—" if math.isnan(shortp) else f"{shortp * 100:.1f}%"),  # fraction of float
     ]
+    # Yahoo!掲示板 みんなの評価 — shown only for names where a poll was actually
+    # fetched (Japanese tickers with the toggle on), so the row's presence is itself
+    # the "is the forum signal live?" confirmation Gemini wanted for the live test.
+    if not (math.isnan(jp_bull) or math.isnan(jp_bear)):
+        rows.append((fh, tr("evi_jp_forum"), tr("evi_jp_forum_val").format(
+            bull=f"{jp_bull:.0f}", bear=f"{jp_bear:.0f}")))
+    return rows
 
 
 def _screen_rank(histories: dict, n: int) -> list:
@@ -2228,7 +2420,11 @@ def theme_momentum_deltas() -> dict[str, float]:
     try:
         with get_conn() as conn:
             snaps = [r[0] for r in conn.execute(
-                "SELECT DISTINCT snapshot FROM theme_history ORDER BY id DESC LIMIT 2")]
+                # GROUP BY + MAX(id) instead of DISTINCT + ORDER BY id: Postgres
+                # rejects ordering a DISTINCT by a column outside the select list
+                # (sqlite tolerates it); this form is valid and identical on both.
+                "SELECT snapshot FROM theme_history GROUP BY snapshot "
+                "ORDER BY MAX(id) DESC LIMIT 2")]
             if len(snaps) < 2:
                 return {}
             cur = dict(conn.execute(
@@ -2854,6 +3050,7 @@ def main() -> None:
     if _n_promoted:
         st.sidebar.caption(tr("promoted_sidebar", n=_n_promoted))
     quick_scan = st.sidebar.toggle(tr("scan_quick_toggle"), value=True, help=tr("scan_quick_help"))
+    jp_forum_on = st.sidebar.toggle(tr("jp_forum_toggle"), value=True, help=tr("jp_forum_help"))
     update_prices = st.sidebar.checkbox(tr("update_hist_prices"), value=True)
     source_keys = list(SENTIMENT_SOURCES.keys())
     selected_sources = st.sidebar.multiselect(
@@ -2867,7 +3064,7 @@ def main() -> None:
             with st.spinner(tr("scan_spinner")):
                 limit = 10 if quick_scan else None
                 res, fail = run_engine(limit_per_region=limit, regions=selected_regions,
-                                       sources=selected_sources)
+                                       sources=selected_sources, use_jp_forum=jp_forum_on)
                 st.session_state["results"], st.session_state["failed"] = res, fail
                 st.session_state["scan_is_quick"] = bool(quick_scan)
             if res:
