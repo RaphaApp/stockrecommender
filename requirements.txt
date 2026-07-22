@@ -3,3 +3,9 @@ yfinance
 pandas
 numpy
 altair
+# Radar chart on the Deep-Dive page. Optional (guarded import) but install it
+# so the chart renders on Streamlit Cloud.
+plotly
+# Optional: enables persistent Postgres storage (e.g. Supabase) when a
+# DATABASE_URL secret is set. Without it the app runs on local SQLite.
+psycopg2-binary

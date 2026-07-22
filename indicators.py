@@ -107,6 +107,33 @@ def screen_metrics(close: pd.Series, volume: pd.Series | None = None) -> dict | 
             "dist_high_pct": float(dist_high_pct)}
 
 
+def theme_strength_score(peer_momenta) -> float:
+    """Cross-sectional THEME (industry-rotation) KPI: how strong is the rest of the
+    ticker's theme basket in the current scan?
+
+    Input: the momentum scores (0-100) of the OTHER scanned members of the ticker's
+    theme — the ticker itself is excluded by the caller, so this measures *peer*
+    strength and doesn't double-count the name's own momentum (which already has its
+    own factor). The mapping is a damped average deviation from neutral:
+
+        score = clamp(50 + (mean(peers) - 50) * 0.8)
+
+    0.8 damping keeps industry beta from dominating stock-level signals: a red-hot
+    basket (peers averaging 90) scores 82, not 90. Neutral 50 when the name has no
+    theme, no scanned peers, or only NaN peers — a themeless stock is neither
+    rewarded nor punished. Pure function: list in, float out; the theme membership
+    lookup lives in the app layer (match_theme)."""
+    if not peer_momenta:
+        return 50.0
+    # pd.notna, not np.isnan: np.isnan(None) raises TypeError, and a defensive
+    # caller may hand us None for a missing peer. pd.notna rejects None and NaN
+    # alike without raising.
+    vals = [float(v) for v in peer_momenta if pd.notna(v)]
+    if not vals:
+        return 50.0
+    return clamp(50.0 + (sum(vals) / len(vals) - 50.0) * 0.8)
+
+
 def forum_sentiment_score(bull_pct: float, bear_pct: float) -> float | None:
     """Map a Yahoo! Japan 掲示板 みんなの評価 poll (買いたい% / 売りたい%) onto the
     app's 0-100 hype scale via NET bullishness, not raw buy%:

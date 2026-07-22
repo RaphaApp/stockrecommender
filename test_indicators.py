@@ -11,7 +11,7 @@ import pytest
 
 from indicators import (compute_rsi, compute_macd, compute_bollinger, compute_hype,
                         clamp, screen_metrics, forum_sentiment_score,
-                        forum_euphoria_sell_score)
+                        forum_euphoria_sell_score, theme_strength_score)
 
 
 # --------------------------------------------------------------------------- clamp
@@ -227,3 +227,42 @@ def test_euphoria_invalid_none():
     assert forum_euphoria_sell_score(float("nan"), 10) is None
     assert forum_euphoria_sell_score(70, 40) is None   # sums > 100
     assert forum_euphoria_sell_score(0, 0) is None
+
+
+# ------------------------------------------------------- theme (industry) KPI
+def test_theme_no_peers_is_neutral():
+    # themeless names and single-member baskets carry no rotation signal
+    assert theme_strength_score(None) == 50.0
+    assert theme_strength_score([]) == 50.0
+    assert theme_strength_score([float("nan")]) == 50.0
+
+
+def test_theme_hot_basket_beats_cold():
+    hot = theme_strength_score([80.0, 90.0, 85.0])
+    cold = theme_strength_score([20.0, 30.0, 25.0])
+    assert hot > 50.0 > cold
+    assert hot > cold
+
+
+def test_theme_damping_factor():
+    # peers averaging 90 -> 50 + 40*0.8 = 82, NOT 90: industry beta is damped
+    assert theme_strength_score([90.0, 90.0]) == pytest.approx(82.0)
+    assert theme_strength_score([10.0, 10.0]) == pytest.approx(18.0)
+
+
+def test_theme_nan_peers_dropped():
+    assert theme_strength_score([80.0, float("nan"), 80.0]) == \
+        pytest.approx(theme_strength_score([80.0, 80.0]))
+
+
+def test_theme_bounded_0_100():
+    for peers in ([100.0] * 5, [0.0] * 5, [50.0], [0.0, 100.0]):
+        assert 0.0 <= theme_strength_score(peers) <= 100.0
+
+
+def test_theme_none_peers_tolerated():
+    # None must behave exactly like NaN (dropped, no TypeError) — a defensive
+    # caller may pass None for a missing peer score.
+    assert theme_strength_score([None]) == 50.0
+    assert theme_strength_score([80.0, None, 80.0]) == \
+        pytest.approx(theme_strength_score([80.0, 80.0]))

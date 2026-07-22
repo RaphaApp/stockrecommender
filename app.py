@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import ssl
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -24,6 +25,14 @@ try:
     import yfinance as yf
 except Exception:
     yf = None
+
+# Optional: powers the six-factor radar in the Deep-Dive tab. Guarded like yfinance
+# so the app runs without it (the radar section is simply skipped). Add `plotly`
+# to requirements.txt to enable it.
+try:
+    import plotly.graph_objects as go
+except Exception:
+    go = None
 
 # Optional companion module (sec_research.py). Powers the US-only Conviction tab from
 # SEC EDGAR fundamentals. Guarded so the app still runs if it's absent.
@@ -403,14 +412,19 @@ def fetch_hype_signals(universe: dict, enabled_sources: list | None = None) -> d
 # Configuration & Global Market Universes
 # ----------------------------------------------------------------------------
 DB_PATH = "stock_engine.db"
-FACTORS = ["momentum", "value", "technical", "hype", "quality"]
+FACTORS = ["momentum", "value", "technical", "hype", "quality", "theme"]
 
 DEFAULT_WEIGHTS = {
     "momentum": 0.20,
-    "value": 0.20,
-    "technical": 0.20,
-    "hype": 0.20,
-    "quality": 0.20,
+    "value": 0.18,
+    "technical": 0.18,
+    "hype": 0.16,
+    "quality": 0.16,
+    # Theme (industry-rotation) starts as the smallest factor: it's the newest and
+    # the most correlated with momentum, so it must earn a bigger weight through the
+    # walk-forward loop rather than being granted one. Old kpi_weights rows lack the
+    # column; get_latest_weights substitutes this default and renormalises.
+    "theme": 0.12,
 }
 
 LEARNING_RATE = 0.04
@@ -437,7 +451,7 @@ except ImportError:
     DYNAMIC_UNIVERSE_SPEC, DYNAMIC_ALLOWED_SUFFIXES, THEME_INDUSTRY_KEYWORDS = {}, {}, []
 from indicators import (
     compute_rsi, compute_macd, compute_bollinger, compute_hype, clamp, screen_metrics,
-    forum_sentiment_score, forum_euphoria_sell_score,
+    forum_sentiment_score, forum_euphoria_sell_score, theme_strength_score,
 )
 ALL_TICKERS = [ticker for region in TICKER_UNIVERSE.values() for ticker in region]
 
@@ -485,9 +499,11 @@ st.set_page_config(
     page_title="Alpha Quant Engine",
     page_icon="📈",
     layout="wide",
-    # Collapsed by default: on a phone an expanded sidebar covers the whole
-    # screen. Users tap the ☰ menu to open the console.
-    initial_sidebar_state="collapsed",
+    # "auto": expanded on desktop, collapsed on phones. The page NAVIGATION now
+    # lives in the sidebar (st.navigation), so hiding it by default on desktop
+    # would hide the app's entire structure; on mobile "auto" still collapses it
+    # and the first-run hero CTA covers the cold start.
+    initial_sidebar_state="auto",
 )
 
 # ----------------------------------------------------------------------------
@@ -529,6 +545,12 @@ def inject_css(accent: str = "#3b82f6", card_bg: str = "rgba(255,255,255,0.03)")
         .qc-sell {{ background: rgba(220,38,38,0.15);  color: var(--neg); }}
         .qc-ticker {{ font-size: 1.25rem; font-weight: 800; }}
         .qc-sub {{ font-size: 0.82rem; color: var(--muted); }}
+        .qc-chip {{
+            display: inline-block; padding: 3px 12px; border-radius: 999px;
+            font-size: 0.78rem; font-weight: 600; color: var(--muted);
+            background: var(--card-bg); border: 1px solid rgba(148,163,184,0.25);
+            margin-bottom: 8px;
+        }}
         @media (max-width: 640px) {{
             .qc-value {{ font-size: 1.3rem; }}
             .qc-ticker {{ font-size: 1.1rem; }}
@@ -600,6 +622,7 @@ def fmt_big(v: float) -> str:
 try:
     import psycopg2                     # optional; only needed for Postgres mode
     import psycopg2.extras
+    import psycopg2.pool
 except Exception:
     psycopg2 = None
 
@@ -624,11 +647,13 @@ class _PgConn:
     - '?' placeholders
     - DictCursor rows: addressable by column name AND position, like sqlite3.Row
       (RealDictCursor would break the app's positional access — r[0] etc.)
-    - context manager commits on success, rolls back on error, and CLOSES the
-      connection (per-call connections; no long-lived idle sockets to go stale)
+    - context manager commits on success, rolls back on error, and RELEASES the
+      connection back to the shared pool (or closes it, for a non-pooled fallback
+      connection) — see _pg_checkout below.
     """
-    def __init__(self, raw):
+    def __init__(self, raw, pool=None):
         self._raw = raw
+        self._pool = pool   # None -> direct connection; close() really closes
 
     def execute(self, sql: str, params=()):
         cur = self._raw.cursor(cursor_factory=psycopg2.extras.DictCursor)
@@ -648,7 +673,15 @@ class _PgConn:
         self._raw.commit()
 
     def close(self):
-        self._raw.close()
+        """Return the connection to the pool (pooled) or close it (fallback)."""
+        if self._pool is not None:
+            try:
+                self._pool.putconn(self._raw)
+            except Exception:
+                try: self._raw.close()
+                except Exception: pass
+        else:
+            self._raw.close()
 
     def __enter__(self):
         return self
@@ -660,13 +693,63 @@ class _PgConn:
             else:
                 self._raw.rollback()
         finally:
-            self._raw.close()
+            self.close()
         return False
+
+
+# --- Postgres connection pool -----------------------------------------------
+# Every get_conn() used to open a brand-new TCP+TLS connection to the hosted
+# database (100-300ms each to e.g. Supabase) — multiplied by the scan loop's
+# per-ticker writes and by concurrent Streamlit sessions. A module-level
+# ThreadedConnectionPool amortises that to near-zero, and the SELECT 1 pre-ping
+# on checkout transparently replaces connections the server dropped while idle
+# (hosted Postgres commonly reaps idle sockets), so callers never see a stale
+# one. Every call site is unchanged: _PgConn.close()/__exit__ now *release*
+# instead of closing.
+_PG_POOL = None
+_PG_POOL_LOCK = threading.Lock()
+
+
+def _pg_pool():
+    global _PG_POOL
+    if _PG_POOL is None:
+        with _PG_POOL_LOCK:
+            if _PG_POOL is None:
+                _PG_POOL = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=1, maxconn=6, dsn=_db_url())
+    return _PG_POOL
+
+
+def _pg_checkout() -> "_PgConn":
+    """Checkout with pre-ping: a pooled connection that fails SELECT 1 (dropped by
+    the server while idle) is discarded and replaced. If the pool itself is broken
+    or exhausted, fall back to one direct connection so the request still succeeds —
+    _PgConn knows to really close that one instead of returning it to the pool."""
+    try:
+        pool = _pg_pool()
+    except Exception:
+        return _PgConn(psycopg2.connect(_db_url()), pool=None)
+    for _ in range(2):
+        try:
+            raw = pool.getconn()
+        except Exception:
+            break
+        try:
+            with raw.cursor() as cur:
+                cur.execute("SELECT 1")
+            raw.rollback()            # clear the ping's implicit transaction
+            return _PgConn(raw, pool=pool)
+        except Exception:
+            try:
+                pool.putconn(raw, close=True)   # stale/dead -> drop from the pool
+            except Exception:
+                pass
+    return _PgConn(psycopg2.connect(_db_url()), pool=None)
 
 
 def get_conn():
     if db_backend() == "postgres":
-        return _PgConn(psycopg2.connect(_db_url()))
+        return _pg_checkout()
     # SQLite path — unchanged semantics.
     # check_same_thread=False because Streamlit serves reruns on a pool of threads;
     # timeout gives writers up to 10s to wait out a lock instead of erroring out;
@@ -757,23 +840,41 @@ def init_db() -> None:
                 momentum REAL, hype REAL, composite REAL,
                 n INTEGER, cover INTEGER, created_at TEXT NOT NULL
             )"""))
+        # Full scan-result snapshots (JSON payload, history frames stripped) so the
+        # last scan survives a page refresh / new session instead of living only in
+        # st.session_state. Pruned to the newest few rows on every save.
+        conn.execute(_ddl("""
+            CREATE TABLE IF NOT EXISTS scan_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL, is_quick INTEGER DEFAULT 1,
+                n_results INTEGER, payload TEXT
+            )"""))
         # --- Safe migration for pre-existing stock_engine.db files ---
         # Databases created before the "quality" factor existed are missing the
         # column. Add it (defaulting old rows to 0.0) only when absent, so this is
         # a no-op on fresh installs and never errors on an upgrade.
         _ensure_column(conn, "recommendations", "quality")
         _ensure_column(conn, "kpi_weights", "quality")
+        # Theme (industry-rotation) factor — sixth KPI, added the same safe way.
+        _ensure_column(conn, "recommendations", "theme")
+        _ensure_column(conn, "kpi_weights", "theme")
         # Bookkeeping flag so each logged pick feeds the walk-forward loop once.
         _ensure_column(conn, "mock_portfolio", "evaluated", "INTEGER DEFAULT 0")
         # Company name stored alongside the ticker for a friendlier audit table.
         _ensure_column(conn, "mock_portfolio", "name", "TEXT")
+        # Indexes for the hot queries: per-day replace in save_recommendation,
+        # the pending-outcome sweep, and the walk-forward's evaluated=0 select.
+        # CREATE INDEX IF NOT EXISTS is valid on both sqlite and Postgres.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_reco_ticker_date ON recommendations(ticker, rec_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_reco_date_outcome ON recommendations(rec_date, outcome)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mock_evaluated ON mock_portfolio(evaluated)")
         conn.commit()
     if get_weight_history().empty:
         save_weights(DEFAULT_WEIGHTS, note="initial defaults")
 
 def get_latest_weights() -> dict[str, float]:
     with get_conn() as conn:
-        row = conn.execute("SELECT momentum, value, technical, hype, quality FROM kpi_weights ORDER BY id DESC LIMIT 1").fetchone()
+        row = conn.execute("SELECT momentum, value, technical, hype, quality, theme FROM kpi_weights ORDER BY id DESC LIMIT 1").fetchone()
     if row is None: return dict(DEFAULT_WEIGHTS)
     raw = {f: safe_float(row[f], DEFAULT_WEIGHTS[f]) for f in FACTORS}
     # A pre-migration weight row carries quality=0.0 (the ALTER TABLE default). The
@@ -788,8 +889,8 @@ def save_weights(weights: dict[str, float], note: str = "") -> None:
     ts = datetime.now().isoformat(timespec="seconds")
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO kpi_weights (update_date, momentum, value, technical, hype, quality, note) VALUES (?,?,?,?,?,?,?)",
-            (ts, weights["momentum"], weights["value"], weights["technical"], weights["hype"], weights["quality"], note),
+            "INSERT INTO kpi_weights (update_date, momentum, value, technical, hype, quality, theme, note) VALUES (?,?,?,?,?,?,?,?)",
+            (ts, weights["momentum"], weights["value"], weights["technical"], weights["hype"], weights["quality"], weights["theme"], note),
         )
         # Mirror each factor into the long-format system_weights ledger (one row per
         # factor per change) so the walk-forward audit can track them individually.
@@ -801,7 +902,7 @@ def save_weights(weights: dict[str, float], note: str = "") -> None:
 
 def get_weight_history() -> pd.DataFrame:
     with get_conn() as conn:
-        df = pd.read_sql_query("SELECT update_date, momentum, value, technical, hype, quality, note FROM kpi_weights ORDER BY id ASC", conn)
+        df = pd.read_sql_query("SELECT update_date, momentum, value, technical, hype, quality, theme, note FROM kpi_weights ORDER BY id ASC", conn)
     if not df.empty: df["update_date"] = pd.to_datetime(df["update_date"], errors="coerce")
     return df
 
@@ -834,10 +935,11 @@ def save_recommendation(rec: dict) -> None:
             (rec["ticker"], today),
         )
         conn.execute(
-            "INSERT INTO recommendations (ticker, rec_date, recommendation, composite, price_at_rec, momentum, value, technical, hype, quality) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO recommendations (ticker, rec_date, recommendation, composite, price_at_rec, momentum, value, technical, hype, quality, theme) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (rec["ticker"], today, rec["recommendation"], float(rec["composite"]),
              price_val, safe_float(rec["momentum"]), safe_float(rec["value"]),
-             safe_float(rec["technical"]), hype_val, quality_val),
+             safe_float(rec["technical"]), hype_val, quality_val,
+             safe_float(rec.get("theme"), 50.0)),
         )
         conn.commit()
 
@@ -1066,10 +1168,13 @@ def fetch_history_stooq(ticker: str, period: str = "8mo") -> "pd.DataFrame | Non
     return df if not df.empty else None
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_history(ticker: str, period: str = "8mo") -> pd.DataFrame:
     """Fetch OHLCV with retry/backoff so a throttled burst doesn't wipe a scan.
 
-    RAISES RuntimeError when nothing comes back after the retries. @st.cache_data
+    Cached 30 min per (ticker, period): repeat scans, the Deep-Dive lazy refetch,
+    and fallback paths reuse the frame instead of re-hitting Yahoo. RAISES
+    RuntimeError when nothing comes back after the retries. @st.cache_data
     never caches an exception, so a transient throttle is retried next call instead
     of being frozen as a permanent None for the whole TTL. Callers that loop over
     many tickers wrap this in try/except and skip the offending name.
@@ -1138,6 +1243,7 @@ def _fmp_fundamentals(ticker: str) -> dict:
     return out if got else {}
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_fundamentals(ticker: str) -> dict:
     out = {"pe": float("nan"), "div_yield": float("nan"), "market_cap": float("nan"),
            "roe": float("nan"), "short_pct": float("nan"), "name": ticker,
@@ -1148,6 +1254,7 @@ def fetch_fundamentals(ticker: str) -> dict:
     # caches an exception, so the broken state isn't frozen for the whole TTL and the
     # next scan retries. Field-level gaps stay as NaN and cache normally.
     try:
+        time.sleep(0.15)   # pace the un-bulkable .info endpoint; cache misses only
         info = _ticker(ticker).info
     except Exception as e:
         fb = _fmp_fundamentals(ticker)   # secondary source kicks in only on failure
@@ -1258,8 +1365,13 @@ def fetch_jp_forum_rating(ticker: str) -> tuple[float, float] | None:
 
 
 def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
-                   jp_forum: tuple | None = None) -> dict | None:
-    hist = fetch_history(ticker)
+                   jp_forum: tuple | None = None,
+                   hist: pd.DataFrame | None = None) -> dict | None:
+    # `hist` lets bulk callers (run_engine / run_deep_scan) hand in the frame from
+    # ONE yf.download for the whole universe instead of paying a per-ticker request;
+    # names the bulk call missed fall back to the per-ticker fetch (retry + Stooq).
+    if hist is None:
+        hist = fetch_history(ticker)
     if hist is None or len(hist) < 60: return None
     close, volume = hist["Close"], hist.get("Volume", pd.Series(dtype=float))
     funds = fetch_fundamentals(ticker)
@@ -1325,9 +1437,20 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
         "sector": funds.get("sector", ""), "industry": funds.get("industry", ""),
         "hype": hype, "momentum": momentum_score, "value": value_score,
         "technical": technical_score, "quality": quality_score,
+        # Theme (industry-rotation) KPI: neutral until the caller's cross-sectional
+        # second pass fills it in (run_engine / run_deep_scan) — the score depends on
+        # the OTHER scanned members of the basket, which a per-ticker function can't
+        # see. Neutral 50 contributes weight*50 to the composite, i.e. no tilt.
+        "theme": 50.0, "theme_match": None,
         "hype_score": hype["score"], "hype_mentions": hype_mentions,
         "jp_bull": (jp_forum[0] if jp_forum else float("nan")),
-        "jp_bear": (jp_forum[1] if jp_forum else float("nan")), "history": hist
+        # Keep ONLY the Close column of the history frame in the result dict: the
+        # sole post-scan consumer is the Deep-Dive price chart (Close + SMAs derived
+        # from Close). Storing the full 7-column OHLCV frame per ticker kept ~85%
+        # dead weight alive in st.session_state for the whole session — multiplied
+        # by the universe size and by every concurrent user, a real contributor to
+        # Streamlit Cloud's memory limit (which kills the app until a reboot).
+        "jp_bear": (jp_forum[1] if jp_forum else float("nan")), "history": hist[["Close"]]
     }
 
 def score_with_weights(analysis: dict, weights: dict[str, float]) -> dict:
@@ -1370,6 +1493,7 @@ def fetch_analyst_signals(ticker: str) -> dict:
     # whole TTL (see fetch_fundamentals). A reachable name with no analyst coverage
     # returns a populated info dict but NaN fields — that's legitimate and caches.
     try:
+        time.sleep(0.2)    # pace the per-ticker endpoint; runs on cache misses only
         info = tk.info
     except Exception as e:
         raise RuntimeError(f"analyst fetch failed for {ticker} (likely rate-limited)") from e
@@ -1415,6 +1539,7 @@ def fetch_insider_activity(ticker: str) -> dict:
     # isn't cached. A successful call that returns an EMPTY frame is a legitimate
     # 'no insider transactions' result for this name and is cached as such.
     try:
+        time.sleep(0.2)    # pace the per-ticker endpoint; runs on cache misses only
         it = _ticker(ticker).insider_transactions
     except Exception as e:
         raise RuntimeError(f"insider fetch failed for {ticker} (likely rate-limited)") from e
@@ -1465,16 +1590,13 @@ def analyze_sell_signals(ticker: str, hist: pd.DataFrame | None = None) -> dict 
     if not ticker:
         return None
     if hist is None:
-        hist = fetch_history(ticker, period="1y")   # 1y so SMA200 is available
-        time.sleep(0.2)                              # pace only when we hit the network
+        hist = fetch_history(ticker, period="1y")   # 1y so SMA200 is available (cached)
     if hist is None or len(hist) < 60:
         return None
 
-    # Pace the remaining (un-bulkable) per-ticker endpoints to avoid IP-level rate limits.
+    # Per-ticker endpoints below are cached; each paces itself on cache misses only.
     funds = fetch_fundamentals(ticker)
-    time.sleep(0.2)
     analyst = fetch_analyst_signals(ticker)
-    time.sleep(0.2)
     insider = fetch_insider_activity(ticker)
 
     close = hist["Close"]
@@ -1646,7 +1768,13 @@ def evaluate_outcomes_only() -> int:
     if pending.empty:
         return 0
 
-    bench_cache: dict[str, pd.DataFrame | None] = {}
+    # Batch the price fetches, same pattern as walk_forward_update: one bulk
+    # download for the pending tickers and their benchmarks, per-ticker fallback.
+    pend_syms = list(dict.fromkeys(pending["ticker"].tolist()))
+    bench_syms = sorted({benchmark_for(t) for t in pend_syms})
+    bulk = get_histories(pend_syms + bench_syms, period="1y")
+
+    bench_cache: dict[str, pd.DataFrame | None] = {s: bulk[s] for s in bench_syms if s in bulk}
     def bench_hist(sym: str) -> pd.DataFrame | None:
         if sym not in bench_cache:
             try:
@@ -1658,10 +1786,12 @@ def evaluate_outcomes_only() -> int:
     evaluated = 0
     with get_conn() as conn:
         for _, row in pending.iterrows():
-            try:
-                hist = fetch_history(row["ticker"], period="1y")
-            except Exception:
-                continue   # transient fetch failure -> skip this name, keep the batch alive
+            hist = bulk.get(row["ticker"])
+            if hist is None:
+                try:
+                    hist = fetch_history(row["ticker"], period="1y")
+                except Exception:
+                    continue   # transient fetch failure -> skip this name, keep the batch alive
             rec_dt = row["rec_date"]
             target = rec_dt + timedelta(days=EVAL_HORIZON_DAYS)
             price_then = _close_on_or_after(hist, rec_dt)
@@ -1722,6 +1852,7 @@ def save_mock_portfolio(results: list[dict]) -> None:
                 "technical": round(_val(r, "technical", 0.0), 2),
                 "hype": round(_val(r, "hype_score", 0.0), 2),
                 "quality": round(_val(r, "quality", 0.0), 2),
+                "theme": round(_val(r, "theme", 50.0), 2),
                 "composite": round(_val(r, "composite", 0.0), 2),
             })
             conn.execute(
@@ -1739,6 +1870,69 @@ def get_mock_portfolio() -> pd.DataFrame:
         return pd.read_sql_query(
             "SELECT timestamp, ticker, name, recommendation_price, reason FROM mock_portfolio ORDER BY id DESC", conn
         )
+
+# ----------------------------------------------------------------------------
+# Scan snapshots — persist the last scan so a refresh / new session restores it
+# instead of greeting a returning user with the empty state. The price history
+# frames are STRIPPED before serialising (they're the bulk of the memory and
+# aren't JSON-serialisable); the Deep-Dive page lazily refetches the one frame
+# it needs. Everything else in an analysis dict round-trips through json.
+# ----------------------------------------------------------------------------
+_SCAN_SNAPSHOT_KEEP = 5   # newest rows retained; older ones pruned on save
+
+
+def _json_safe(o):
+    """json.dumps default hook: numpy scalars sneak into analysis dicts (np.mean,
+    Series.iloc) and json refuses them — coerce to plain Python."""
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.bool_):
+        return bool(o)
+    return str(o)
+
+
+def save_scan_snapshot(results: list[dict], is_quick: bool) -> None:
+    """Persist one scan's results (sans history frames). Never raises — snapshot
+    persistence must not be able to sink an otherwise-successful scan."""
+    try:
+        payload = json.dumps(
+            [{k: v for k, v in r.items() if k != "history"} for r in results],
+            default=_json_safe)
+        ts = datetime.now().isoformat(timespec="seconds")
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO scan_snapshots (created_at, is_quick, n_results, payload) VALUES (?,?,?,?)",
+                (ts, 1 if is_quick else 0, len(results), payload))
+            # Prune: keep only the newest N snapshots (valid on sqlite AND Postgres).
+            conn.execute(
+                "DELETE FROM scan_snapshots WHERE id NOT IN "
+                "(SELECT id FROM scan_snapshots ORDER BY id DESC LIMIT ?)",
+                (_SCAN_SNAPSHOT_KEEP,))
+            conn.commit()
+    except Exception as e:
+        logger.warning("scan snapshot save failed: %s", e)
+
+
+def load_latest_scan_snapshot() -> tuple[list[dict], str, bool] | None:
+    """(results, created_at_iso, is_quick) of the newest snapshot, or None.
+    Restored dicts have no 'history' key — consumers must treat it as optional."""
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT created_at, is_quick, payload FROM scan_snapshots ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        results = json.loads(row["payload"] or "[]")
+        if not isinstance(results, list) or not results:
+            return None
+        return results, str(row["created_at"]), bool(row["is_quick"])
+    except Exception as e:
+        logger.warning("scan snapshot load failed: %s", e)
+        return None
+
 
 def _bulk_history(tickers: list, period: str = "1y") -> dict:
     """Fetch history for many tickers in ONE yf.download, returned as
@@ -1782,8 +1976,57 @@ def _bulk_history(tickers: list, period: str = "1y") -> dict:
         return out
     return out
 
-def _bulk_latest_close(tickers: list) -> dict:
+_HIST_CACHE_TTL = 1800   # seconds a per-ticker frame stays fresh in the session cache
+
+def get_histories(tickers: list, period: str = "1y") -> dict:
+    """Session-level history cache in front of _bulk_history.
+
+    Every bulk consumer (quick scan, deep scan, sell scanner, walk-forward and
+    maturity updates) goes through here, so a ticker's frame is downloaded ONCE
+    per session per TTL and shared across features — previously each feature paid
+    its own full bulk download even for overlapping names (benchmarks, promoted
+    tickers, portfolio names that were just scanned). Only the tickers that are
+    missing or stale are fetched, in a single yf.download. Returns
+    {ticker: DataFrame} like _bulk_history; missing names are simply absent so
+    callers' per-ticker fallbacks keep working unchanged.
+    """
+    cache = st.session_state.setdefault("_hist_cache", {})   # {(t, period): (df, ts)}
+    now = time.time()
+    # Prune expired entries first: without this, frames for tickers that are never
+    # requested again (rotated screener names, one-off portfolio symbols) would sit
+    # in session memory for the lifetime of the session.
+    for k in [k for k, (_, ts) in cache.items() if now - ts > _HIST_CACHE_TTL]:
+        del cache[k]
+    missing = [t for t in dict.fromkeys(t for t in tickers if t)
+               if (t, period) not in cache or now - cache[(t, period)][1] > _HIST_CACHE_TTL]
+    if missing:
+        for t, df in _bulk_history(missing, period).items():
+            cache[(t, period)] = (df, now)
+    return {t: cache[(t, period)][0] for t in tickers if (t, period) in cache}
+
+def clear_market_data_caches() -> None:
+    """Escape hatch for the 30-min data TTLs: wipe the session history cache and
+    the per-ticker market-data fetchers so the NEXT scan re-hits Yahoo and picks
+    up sudden intraday price action instead of serving cached frames.
+
+    Deliberately surgical — sentiment caches (Reddit/GDELT hype, JP forum) are
+    left alone: they aren't price data, and re-hitting those courtesy-throttled
+    endpoints early would be both slow and impolite."""
+    st.session_state.pop("_hist_cache", None)          # shared bulk-history frames
+    for fn in (fetch_history, fetch_fundamentals, fetch_analyst_signals,
+               fetch_insider_activity, _bulk_latest_close):
+        try:
+            fn.clear()                                 # per-function st.cache_data wipe
+        except Exception:
+            pass   # decorator absent (e.g. hot-reload edge) -> nothing cached anyway
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _bulk_latest_close(tickers: tuple) -> dict:
     """Most-recent close for many tickers in ONE bulk yf.download request.
+
+    Cached 5 min per ticker tuple: on the audit tab any widget interaction reruns
+    the whole script, and while "update prices" is ticked that used to refire the
+    full bulk download every rerun. Callers pass a TUPLE (hashable cache key).
 
     Fetching prices one ticker at a time hammered Yahoo and tripped its IP rate
     limiter (crashing the app on Streamlit Cloud). A single `yf.download(...)` for
@@ -1861,7 +2104,19 @@ def walk_forward_update() -> int:
         return 0
 
     cutoff = date.today() - timedelta(days=EVAL_HORIZON_DAYS)
-    bench_cache: dict[str, pd.DataFrame | None] = {}
+
+    # Batch the price fetches: ONE bulk download covering every matured ticker plus
+    # its benchmark, instead of a per-ticker fetch (with 3-retry backoff) inside the
+    # loop. Bulk misses fall back to the per-ticker path below.
+    matured_syms: list[str] = []
+    for row in rows:
+        _dt = pd.to_datetime(row["timestamp"], errors="coerce")
+        if not pd.isna(_dt) and _dt.date() <= cutoff:
+            matured_syms.append(row["ticker"])
+    bench_syms = sorted({benchmark_for(t) for t in matured_syms})
+    bulk = get_histories(list(dict.fromkeys(matured_syms)) + bench_syms, period="1y")
+
+    bench_cache: dict[str, pd.DataFrame | None] = {s: bulk[s] for s in bench_syms if s in bulk}
     def bench_hist(sym: str) -> pd.DataFrame | None:
         if sym not in bench_cache:
             try:
@@ -1880,10 +2135,12 @@ def walk_forward_update() -> int:
             snap = json.loads(row["kpi_snapshot"] or "{}")
         except Exception:
             snap = {}
-        try:
-            hist = fetch_history(row["ticker"], period="1y")
-        except Exception:
-            continue   # transient fetch failure -> skip this name, keep the batch alive
+        hist = bulk.get(row["ticker"])
+        if hist is None:
+            try:
+                hist = fetch_history(row["ticker"], period="1y")
+            except Exception:
+                continue   # transient fetch failure -> skip this name, keep the batch alive
         target = rec_dt + timedelta(days=EVAL_HORIZON_DAYS)
         # Fix 5 — derive BOTH endpoints from the SAME freshly-fetched, dividend-
         # adjusted series (fetch_history uses auto_adjust=True, which folds dividends
@@ -1936,8 +2193,8 @@ def seed_demo_history() -> None:
             win = int(rng.random() < 0.62)
             price = float(rng.uniform(100, 300))
             conn.execute(
-                "INSERT INTO recommendations (ticker, rec_date, recommendation, composite, price_at_rec, momentum, value, technical, hype, quality, price_after, outcome, eval_date) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (t, d, "BUY" if comp > 60 else "HOLD", comp, price, scores["momentum"], scores["value"], scores["technical"], scores["hype"], scores["quality"], price * (1.06 if win else 0.94), win, d)
+                "INSERT INTO recommendations (ticker, rec_date, recommendation, composite, price_at_rec, momentum, value, technical, hype, quality, theme, price_after, outcome, eval_date) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (t, d, "BUY" if comp > 60 else "HOLD", comp, price, scores["momentum"], scores["value"], scores["technical"], scores["hype"], scores["quality"], scores["theme"], price * (1.06 if win else 0.94), win, d)
             )
         conn.commit()
     w = dict(DEFAULT_WEIGHTS)
@@ -1976,18 +2233,31 @@ def run_engine(limit_per_region: int | None = None,
     # contributes zeros, so the scan proceeds with hype unaffected.
     hype_counts = fetch_hype_signals(universe, sources)
 
+    # ONE bulk price download for the whole scan (the deep scan already worked this
+    # way; the main scan previously paid a per-ticker fetch with retry/backoff plus
+    # a fixed 0.4s sleep per name — most of a quick scan's wall clock). Anything the
+    # bulk request misses (delisted, exchange quirk) transparently falls back to the
+    # per-ticker path inside analyze_ticker. Fundamentals (.info) remain per-ticker —
+    # Yahoo has no bulk endpoint for those — pacing lives inside the cached fetchers.
+    # period="1y" (was 8mo) deliberately matches the deep scan / sell scanner /
+    # walk-forward period, so get_histories serves ALL of them from one download;
+    # analyze_ticker only reads tail slices, so the longer frame changes nothing.
+    all_symbols = [t for ticks in universe.values() for t in ticks]
+    bulk = get_histories(all_symbols, period="1y")
+
     progress = st.progress(0.0, text=tr("scanning"))
 
     total_symbols = sum(len(ticks) for ticks in universe.values())
     current_index = 0
 
+    analyses: list[dict] = []
     for region, tickers in universe.items():
         for t in tickers:
             try:
                 jp_rating = (fetch_jp_forum_rating(t)
                              if (use_jp_forum and region == "Japan") else None)
                 analysis = analyze_ticker(t, region, hype_counts.get(t, 0),
-                                          jp_forum=jp_rating)
+                                          jp_forum=jp_rating, hist=bulk.get(t))
                 if analysis is None:
                     failed.append(f"{t} (no data)")
                 else:
@@ -1996,23 +2266,47 @@ def run_engine(limit_per_region: int | None = None,
                         # Star the display name so promoted ride-alongs are
                         # recognisable in every tab without new columns.
                         analysis["name"] = f"⭐ {analysis.get('name') or t}"
-                    analysis.update(score_with_weights(analysis, weights))
-                    save_recommendation(analysis)
-                    results.append(analysis)
+                    analyses.append(analysis)
             except Exception as e:
                 # Surface the real reason instead of silently swallowing it.
                 failed.append(f"{t} ({type(e).__name__})")
             current_index += 1
-            time.sleep(0.4)   # gentle pacing so Yahoo doesn't throttle the burst
+            # Pacing now lives INSIDE the cached fetchers (fetch_fundamentals /
+            # fetch_history), so it only fires on actual network calls — a repeat
+            # scan within the TTL runs at full speed instead of sleeping per name.
             progress.progress(current_index / total_symbols, text=tr("processing", ticker=t, region=region_name(region)))
     progress.empty()
+
+    # ---- Theme (industry-rotation) KPI: cross-sectional second pass ----
+    # A ticker's theme score is the damped average MOMENTUM of the *other* scanned
+    # members of its basket (theme_strength_score in indicators.py), so it must be
+    # computed after every name has been analysed. Uses the sector/industry strings
+    # stage-2 fundamentals fetched anyway — zero extra API calls. Themeless names
+    # keep the neutral 50 set by analyze_ticker.
+    theme_members: dict[str, list[dict]] = {}
+    for a in analyses:
+        a["theme_match"] = match_theme(a["region"], a.get("sector"), a.get("industry"))
+        if a["theme_match"]:
+            theme_members.setdefault(a["theme_match"], []).append(a)
+    for a in analyses:
+        peers = [p["momentum"] for p in theme_members.get(a.get("theme_match"), []) if p is not a]
+        a["theme"] = theme_strength_score(peers)
+        a.update(score_with_weights(a, weights))
+        save_recommendation(a)
+        results.append(a)
+
     results.sort(key=lambda r: r["composite"], reverse=True)
     # Log today's curated Top-3 Growth / Top-3 Dividend picks for the walk-forward
-    # loop. Wrapped so a logging hiccup can never sink an otherwise-successful scan.
+    # loop, persist the scan snapshot (survives refresh/new session), and stamp the
+    # scan time for the freshness chip. All wrapped/fail-safe so bookkeeping can
+    # never sink an otherwise-successful scan.
     try:
         save_mock_portfolio(results)
     except Exception:
         pass
+    save_scan_snapshot(results, is_quick=limit_per_region is not None)
+    st.session_state["scan_ts"] = time.time()
+    st.session_state["restored_scan"] = False
     return results, failed
 
 # ----------------------------------------------------------------------------
@@ -2174,22 +2468,85 @@ def render_global_sectors(results: list[dict]) -> None:
     target_region = st.selectbox(tr("select_region"), region_keys, format_func=region_name)
     regional_filtered = [r for r in results if r["region"] == target_region]
 
-    for r in regional_filtered:
-        cols = st.columns([2, 1, 1, 1])
-        cols[0].markdown(f'<div class="qc-card"><span class="qc-ticker">{r["ticker"]}</span> {rec_pill(r["recommendation"])}<br><span class="qc-sub">{r["name"]}</span></div>', unsafe_allow_html=True)
-        cols[1].markdown(metric_card(tr("card_system_rating"), f"{r['composite']:.1f}"), unsafe_allow_html=True)
-        cols[2].markdown(metric_card(tr("card_trading_close"), fmt_money(r["price"])), unsafe_allow_html=True)
-        cols[3].markdown(metric_card(tr("card_sustained_hype"), f"{r['hype_score']:.0f}", tr("breakout") if r['hype']['sustained'] else tr("flat"), positive=r['hype']['sustained']), unsafe_allow_html=True)
+    # One sortable, selectable table instead of a card row per ticker (38 US names
+    # made a very long scroll with no sorting). ProgressColumn gives an instant
+    # visual ranking; clicking a row opens a detail card below AND preselects the
+    # name in the Deep-Dive tab (row order == regional_filtered order, so the
+    # selection index maps straight back to the analysis dict).
+    df = pd.DataFrame([{
+        "ticker": r["ticker"],
+        "name": str(r.get("name", r["ticker"])),
+        "call": tr(f"rec_{r['recommendation']}") if r.get("recommendation") in ("BUY", "HOLD", "SELL")
+                else str(r.get("recommendation", "—")),
+        "composite": safe_float(r.get("composite")),
+        "price": safe_float(r.get("price")),
+        "hype": safe_float(r.get("hype_score")),
+        "ret1m": safe_float(r.get("ret_1m")),
+    } for r in regional_filtered])
+    event = st.dataframe(
+        df,
+        column_config={
+            "ticker": st.column_config.TextColumn(tr("col_ticker"), width="small"),
+            "name": st.column_config.TextColumn(tr("col_company")),
+            "call": st.column_config.TextColumn(tr("why_call"), width="small"),
+            "composite": st.column_config.ProgressColumn(
+                tr("card_system_rating"), min_value=0, max_value=100, format="%.1f"),
+            "price": st.column_config.NumberColumn(tr("card_trading_close"), format="%.2f"),
+            "hype": st.column_config.ProgressColumn(
+                tr("card_sustained_hype"), min_value=0, max_value=100, format="%.0f"),
+            "ret1m": st.column_config.NumberColumn(tr("evi_ret_1m"), format="%+.1f%%"),
+        },
+        hide_index=True, width="stretch",
+        on_select="rerun", selection_mode="single-row",
+        key=f"regional_table_{target_region}",
+    )
+    sel_rows = []
+    try:
+        sel_rows = list(event.selection.rows)   # DataframeState from on_select
+    except Exception:
+        sel_rows = []
+    if not sel_rows:
+        st.caption(tr("row_select_prompt"))
+        return
+
+    r = regional_filtered[sel_rows[0]]
+    # Hand the pick to the Deep-Dive tab: its selectbox is keyed "deep_dive_pick",
+    # and this tab renders BEFORE it in the same rerun, so the state lands in time.
+    st.session_state["deep_dive_pick"] = r["ticker"]
+
+    cols = st.columns([2, 1, 1, 1])
+    cols[0].markdown(
+        f'<div class="qc-card"><span class="qc-ticker">{r["ticker"]}</span> '
+        f'{rec_pill(r["recommendation"])}<br><span class="qc-sub">{r["name"]}</span></div>',
+        unsafe_allow_html=True)
+    cols[1].markdown(metric_card(tr("card_system_rating"), f"{r['composite']:.1f}"), unsafe_allow_html=True)
+    cols[2].markdown(metric_card(tr("card_trading_close"), fmt_money(r["price"])), unsafe_allow_html=True)
+    cols[3].markdown(metric_card(tr("card_sustained_hype"), f"{r['hype_score']:.0f}",
+                     tr("breakout") if r["hype"]["sustained"] else tr("flat"),
+                     positive=r["hype"]["sustained"]), unsafe_allow_html=True)
+    # Real navigation, not just preselection: the Deep-Dive page is registered in
+    # _PAGES by _build_navigation (runs before any page renders). The pick was
+    # already stored under the Deep-Dive selectbox's key above, so the landing
+    # page opens straight on this name. Fallback caption if navigation isn't up
+    # (e.g. bare-mode tests).
+    if st.button(tr("open_deep_dive_btn", ticker=r["ticker"]), type="primary",
+                 key=f"open_dd_{target_region}"):
+        page = _PAGES.get("deep_dive")
+        if page is not None:
+            st.switch_page(page)
+    st.caption(tr("row_selected_hint", ticker=r["ticker"]))
 
 def _ago(epoch: float) -> str:
-    """Compact 'time since' label, e.g. '<1m', '12m', '2h 5m'. Unit suffixes only, so
-    the surrounding 'updated … ago' phrasing handles localization."""
+    """Compact 'time since' label, e.g. '<1m', '12m', '2h 5m', '3d 4h'. Unit suffixes
+    only, so the surrounding 'updated … ago' phrasing handles localization."""
     mins = max(0, int(time.time() - epoch)) // 60
     if mins < 1:
         return "<1m"
     if mins < 60:
         return f"{mins}m"
-    return f"{mins // 60}h {mins % 60}m"
+    if mins < 60 * 48:
+        return f"{mins // 60}h {mins % 60}m"
+    return f"{mins // 1440}d {(mins % 1440) // 60}h"   # restored snapshots can be days old
 
 
 def _pick_breakdown(r: dict, weights: dict) -> pd.DataFrame:
@@ -2208,6 +2565,7 @@ def _evidence_rows(r: dict) -> list:
     """The actual KPI numbers behind each factor, as (factor, metric, value) rows."""
     fm, fv, ft, fh, fq = (tr("factor_momentum"), tr("factor_value"), tr("factor_technical"),
                           tr("factor_hype"), tr("factor_quality"))
+    fth = tr("factor_theme")
     def _f(x): return safe_float(x, float("nan"))
     price, sma50 = _f(r.get("price")), _f(r.get("sma50"))
     vs50 = "—" if (math.isnan(price) or math.isnan(sma50) or sma50 == 0) else f"{(price / sma50 - 1) * 100:+.1f}%"
@@ -2228,6 +2586,8 @@ def _evidence_rows(r: dict) -> list:
         (fq, tr("evi_roe"),      "—" if math.isnan(roe) else f"{roe * 100:.1f}%"),  # roe is a fraction
         (fh, tr("evi_mentions"), f"{safe_float(r.get('hype_mentions'), 0):g}"),
         (fh, tr("evi_short"),    "—" if math.isnan(shortp) else f"{shortp * 100:.1f}%"),  # fraction of float
+        (fth, tr("evi_theme_basket"), str(r.get("theme_match") or "—")),
+        (fth, tr("evi_theme_peers"),  fmt_num(safe_float(r.get("theme"), float("nan")), 0)),
     ]
     # Yahoo!掲示板 みんなの評価 — shown only for names where a poll was actually
     # fetched (Japanese tickers with the toggle on), so the row's presence is itself
@@ -2261,27 +2621,44 @@ def run_deep_scan(region: str) -> tuple[list, int]:
     DEEP_FINALISTS per-ticker calls. Finalists also get a theme classification
     from the sector/industry that stage 2 fetches anyway."""
     tickers, _n_live = deep_universe_for(region)
-    histories = _bulk_history(tickers, period="8mo")
+    # 1y (~252 trading days), not 8mo: screen_metrics' 52-week-high proximity reads
+    # closes.iloc[-252:], so an 8-month frame silently turned it into an 8-month
+    # high — flattering names that peaked 9-12 months ago and bled since, the exact
+    # profile the falling-knife cap exists to exclude. One bulk download either way.
+    histories = get_histories(tickers, period="1y")
     n_screened = len(histories)
     finalists = _screen_rank(histories, DEEP_FINALISTS)
     weights = get_latest_weights()
-    results = []
+    scored: list[tuple[dict, dict]] = []
     prog = st.progress(0.0, text=tr("deep_scan_scoring"))
     for i, (t, m) in enumerate(finalists, start=1):
         try:
-            a = analyze_ticker(t, region, 0.0)   # hype skipped on the deep scan (price+fundamentals)
+            # Reuse the stage-1 bulk frame — stage 2 previously re-fetched each
+            # finalist's history per ticker even though it was already in memory.
+            a = analyze_ticker(t, region, 0.0, hist=histories.get(t))
             if a:
-                a.update(score_with_weights(a, weights))
                 a["screen_score"] = m["score"]
                 a["screen_blend"] = m["blend_pct"]
                 a["screen_dhigh"] = m["dist_high_pct"]
                 a["screen_vsurge"] = m["vol_surge"]
                 a["theme_match"] = match_theme(region, a.get("sector"), a.get("industry"))
-                results.append(a)
+                scored.append((a, m))
         except Exception:
             pass   # a throttled finalist is dropped, not fatal
         prog.progress(i / max(1, len(finalists)), text=tr("deep_scan_scoring"))
     prog.empty()
+    # Theme KPI across the finalist cohort (same cross-sectional logic as the main
+    # scan): a finalist in a basket whose scanned peers are also strong gets a tilt.
+    theme_members: dict[str, list[dict]] = {}
+    for a, _m in scored:
+        if a.get("theme_match"):
+            theme_members.setdefault(a["theme_match"], []).append(a)
+    results = []
+    for a, _m in scored:
+        peers = [p["momentum"] for p in theme_members.get(a.get("theme_match"), []) if p is not a]
+        a["theme"] = theme_strength_score(peers)
+        a.update(score_with_weights(a, weights))
+        results.append(a)
     results.sort(key=lambda x: safe_float(x.get("composite"), float("-inf")), reverse=True)
     return results, n_screened
 
@@ -2622,8 +2999,15 @@ def render_deep_dive(results: list[dict]) -> None:
         sorted(results, key=lambda x: safe_float(x.get("composite"), float("-inf")), reverse=True))}
 
     names = {r["ticker"]: r.get("name", r["ticker"]) for r in results}
-    pick = st.selectbox(tr("select_profile"), [r["ticker"] for r in results],
-                        format_func=lambda t: f"{t} — {names.get(t, t)}")
+    opts = [r["ticker"] for r in results]
+    # "deep_dive_pick" may have been set by a row click in the Regional tab (which
+    # renders earlier in the same rerun). Sanitize: a stale pick from a previous
+    # scan that's no longer in the results must not crash the keyed selectbox.
+    if st.session_state.get("deep_dive_pick") not in opts:
+        st.session_state.pop("deep_dive_pick", None)
+    pick = st.selectbox(tr("select_profile"), opts,
+                        format_func=lambda t: f"{t} — {names.get(t, t)}",
+                        key="deep_dive_pick")
     r = next(x for x in results if x["ticker"] == pick)
     weights = get_latest_weights()
     st.markdown(f"### {r['ticker']} — {r.get('name', r['ticker'])}")
@@ -2638,11 +3022,43 @@ def render_deep_dive(results: list[dict]) -> None:
     hc[2].markdown(metric_card(tr("why_rank"), f"#{rank_of.get(pick, '—')} / {len(results)}"),
                    unsafe_allow_html=True)
 
+    # --- factor profile: six-axis radar, this pick vs the scan average ---
+    # The contribution bars below answer "why this composite"; the radar answers
+    # "what KIND of stock is this" (momentum monster vs. value dog) at a glance.
+    # plotly is optional (guarded import) — without it the section is skipped.
+    if go is not None:
+        def _fval(x: dict, f: str) -> float:
+            return safe_float(x.get("hype_score" if f == "hype" else f), 50.0)
+        cats = [tr(f"factor_{f}") for f in FACTORS]
+        vals = [_fval(r, f) for f in FACTORS]
+        avgs = [float(np.mean([_fval(x, f) for x in results])) for f in FACTORS]
+        fig = go.Figure()
+        fig.add_trace(go.Scatterpolar(
+            r=avgs + avgs[:1], theta=cats + cats[:1], name=tr("radar_scan_avg"),
+            line=dict(color="#94a3b8", dash="dot"), opacity=0.65))
+        fig.add_trace(go.Scatterpolar(
+            r=vals + vals[:1], theta=cats + cats[:1], name=r["ticker"],
+            fill="toself", line=dict(color="#3b82f6"),
+            fillcolor="rgba(59,130,246,0.25)"))
+        fig.update_layout(
+            polar=dict(bgcolor="rgba(0,0,0,0)",
+                       radialaxis=dict(range=[0, 100], showticklabels=True,
+                                       tickfont=dict(size=10), gridcolor="rgba(148,163,184,0.25)"),
+                       angularaxis=dict(gridcolor="rgba(148,163,184,0.25)")),
+            paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#94a3b8"),
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=-0.15, x=0.5, xanchor="center"),
+            height=360, margin=dict(l=50, r=50, t=30, b=30))
+        st.markdown(f"#### {tr('radar_header')}")
+        st.plotly_chart(fig, width="stretch", key=f"radar_{pick}")
+    else:
+        st.caption(tr("radar_plotly_hint"))
+
     # --- why this pick: exact weighted-contribution decomposition ---
     st.markdown(f"#### {tr('why_header')}")
     name_map = {"momentum": tr("factor_momentum"), "value": tr("factor_value"),
                 "technical": tr("factor_technical"), "hype": tr("factor_hype"),
-                "quality": tr("factor_quality")}
+                "quality": tr("factor_quality"), "theme": tr("factor_theme")}
     bd = _pick_breakdown(r, weights)
     bd["label"] = bd["factor"].map(name_map)
     total = float(bd["contribution"].sum())
@@ -2685,11 +3101,24 @@ def render_deep_dive(results: list[dict]) -> None:
     st.dataframe(ev, width="stretch", hide_index=True)
 
     # --- price context ---
-    st.markdown(f"#### {tr('price_trend')}")
-    chart_df = pd.DataFrame({"Close": r["history"]["Close"],
-                             "SMA20": r["history"]["Close"].rolling(20).mean(),
-                             "SMA50": r["history"]["Close"].rolling(50).mean()})
-    st.line_chart(chart_df.dropna())
+    # Restored snapshot results carry no history frame (stripped before
+    # serialising) — lazily refetch just the picked ticker's series, cache it
+    # back onto the dict, and degrade to a caption if the fetch fails.
+    hist = r.get("history")
+    if hist is None:
+        try:
+            hist = fetch_history(r["ticker"])
+            r["history"] = hist
+        except Exception:
+            hist = None
+    if hist is not None and "Close" in getattr(hist, "columns", []):
+        st.markdown(f"#### {tr('price_trend')}")
+        chart_df = pd.DataFrame({"Close": hist["Close"],
+                                 "SMA20": hist["Close"].rolling(20).mean(),
+                                 "SMA50": hist["Close"].rolling(50).mean()})
+        st.line_chart(chart_df.dropna())
+    else:
+        st.caption(tr("price_chart_unavailable"))
 
     mentions = safe_float(r.get("hype_mentions", 0), 0.0)
     st.markdown(metric_card(tr("hype_buzz_label"), f"{mentions:g}", positive=mentions > 0),
@@ -2765,8 +3194,9 @@ def render_engine_audit(update_prices: bool = True) -> None:
     uniq = list(view["ticker"].unique())
     if update_prices:
         # SINGLE bulk request for every unique ticker — replaces the per-ticker fetch
-        # storm that was tripping Yahoo's rate limiter and crashing the app.
-        prices = _bulk_latest_close(uniq)
+        # storm that was tripping Yahoo's rate limiter and crashing the app. Tuple:
+        # the function is cached (5 min), so the argument must be hashable.
+        prices = _bulk_latest_close(tuple(uniq))
     else:
         prices = {t: float("nan") for t in uniq}   # checkbox off -> leave prices blank
     view["current"] = view["ticker"].map(prices)
@@ -2956,7 +3386,7 @@ def render_sell_signals() -> None:
         # OPTIMISATION: one bulk yf.download for every name's history up front, so
         # the per-ticker loop reuses it instead of making a history request each.
         with st.spinner(tr("sell_bulk_fetch", total=len(portfolio))):
-            histories = _bulk_history(portfolio, period="1y")
+            histories = get_histories(portfolio, period="1y")
         prog = st.progress(0.0, text=tr("sell_scan_progress", done=0, total=len(portfolio)))
         for i, tk in enumerate(portfolio, start=1):
             try:
@@ -3017,8 +3447,185 @@ def render_sell_signals() -> None:
             _render_sell_detail(detail)
 
 # ----------------------------------------------------------------------------
-# Main Application Controller Setup
+# Help / About tab — in-app documentation, bilingual (follows the language menu).
+# Content lives here (not in TRANSLATIONS) because it's long-form prose per
+# language, not templated UI strings.
 # ----------------------------------------------------------------------------
+_HELP_SECTIONS = {
+    "en": [
+        ("🚀 What is this app?",
+         """The **Alpha Quant Engine** scans a global stock universe (US, Japan, Europe, China), scores
+every name on **six KPI factors**, and turns the weighted composite into a BUY / HOLD / SELL call.
+It is a *screening and research* tool: it surfaces candidates and shows its work — it is **not
+financial advice**, and its signals are based on free, sometimes-delayed data sources."""),
+        ("🧭 Quick start",
+         """1. In the sidebar, pick the **regions** to scan and leave **Quick scan** on (first 10 names
+per region — fast, and gentle on the data sources).
+2. Press **Run scan**. Results populate the Top Selections, Regional, Category, Themes and Deep-Dive tabs.
+3. Open **Deep-Dive Analysis** on any name to see *exactly* why it scored what it did — an exact
+weighted-contribution breakdown, plus the raw evidence behind every factor.
+4. Use the **Deep Scan** tab to hunt outside the curated universe, and **promote** winners so they
+ride along with your daily scans.
+5. The engine logs its picks and, two weeks later, grades itself and **re-tunes its own factor
+weights** (see "How the engine learns" below)."""),
+        ("📊 The six KPI factors",
+         """Every stock gets a 0–100 score per factor; the composite is the weighted average.
+- **Momentum** — price vs. its 50-day average, MACD direction, and the 1-month return.
+- **Value** — trailing P/E mapped to a score (cheaper = higher), plus a dividend-yield bonus.
+- **Technical** — RSI positioning and Bollinger %B; rewards healthy, mid-band setups over
+overbought/oversold extremes.
+- **Hype** — volume-breakout detection vs. a 30-day baseline, boosted by live retail/news buzz
+(Reddit, GDELT), the Yahoo! Japan forum poll for Japanese names, and a short-squeeze modifier.
+- **Quality** — return on equity (profitability). Missing data scores neutral, never penalised.
+- **Theme** *(new)* — industry-rotation strength: the average momentum of the *other* scanned members
+of the stock's theme basket (AI, Semis, Defense, Clean Energy…), damped so a hot industry helps a
+name without drowning out its own signals. Stocks without a theme score a neutral 50.
+
+**Calls:** composite ≥ 65 → BUY · < 45 → SELL · otherwise HOLD."""),
+        ("🔁 How the engine learns (walk-forward loop)",
+         """Each full scan logs the day's Top-3 Growth and Top-3 Dividend picks with a snapshot of their
+factor scores. Once a pick is **14 days** old, the engine checks whether it beat its home-market
+benchmark (S&P 500 for US names, Nikkei for Japan, etc.). Factors that scored highly on *winners*
+get nudged **up**; factors that scored highly on *losers* get nudged **down** — with a floor so no
+factor ever dies completely. The **Systems Audit** tab charts the weight evolution and win rate.
+The new Theme factor starts small (12%) and must earn a bigger weight through this loop."""),
+        ("🔬 Deep Scan & promotions",
+         """The Deep Scan is a two-stage funnel per market. **Stage 1** downloads prices for a few hundred
+names in one bulk request and ranks them on a pure price screen (momentum blend, volume surge,
+52-week-high proximity, with a falling-knife cap). **Stage 2** runs full fundamental scoring on the
+top finalists only. The best finalists can be **promoted** (US 5 / JP 3 / CN 2) into your main daily
+scan; promotions rotate each time you re-run and promote. On cloud deployments the promotion table
+resets on redeploy — paste the offered `PROMOTED_TICKERS` snippet into `config.py` to make it stick."""),
+        ("📡 Data sources & limitations",
+         """Prices and fundamentals come from **Yahoo Finance** (with a free Stooq fallback for US names and
+an optional FMP key for fundamentals). Sentiment comes from **Reddit**, **GDELT news**, and the
+**Yahoo! Japan forum poll** for Japanese tickers. All sources are free/unofficial: they can be
+delayed, throttled, or blocked, and every fetch is wrapped so a dead source degrades a signal to
+neutral instead of crashing a scan. If a whole scan fails, it is almost always a temporary Yahoo
+rate limit — wait a few minutes and use Quick scan."""),
+        ("⚠️ Disclaimer",
+         """This app is an educational screening tool. Scores are mechanical transformations of public,
+sometimes-delayed data; they can be wrong, stale, or based on incomplete inputs. Nothing here is a
+recommendation to buy or sell any security. Always do your own research and consider consulting a
+licensed financial advisor before trading."""),
+    ],
+    "ja": [
+        ("🚀 このアプリについて",
+         """**Alpha Quant Engine** は、グローバル株式ユニバース（米国・日本・欧州・中国）をスキャンし、
+各銘柄を **6つのKPIファクター** で採点、加重平均のコンポジットスコアから BUY / HOLD / SELL を
+判定します。これは*スクリーニング・リサーチ*ツールであり、**投資助言ではありません**。
+シグナルは無料（遅延あり）のデータソースに基づきます。"""),
+        ("🧭 クイックスタート",
+         """1. サイドバーでスキャンする**地域**を選び、**クイックスキャン**はONのまま（各地域の先頭10銘柄のみ・高速）。
+2. **スキャン実行**を押すと、トップ銘柄・地域別・カテゴリ・テーマ・詳細分析の各タブに結果が反映されます。
+3. **詳細分析**タブで銘柄を選ぶと、スコアの根拠（ファクター別の正確な寄与分解と裏付けデータ）を確認できます。
+4. **ディープスキャン**タブで通常ユニバース外を探索し、勝者を**プロモート**すると日次スキャンに同乗します。
+5. エンジンは自らのピックを記録し、2週間後に成績を判定して**ファクターの重みを自動調整**します（下記参照）。"""),
+        ("📊 6つのKPIファクター",
+         """各銘柄はファクターごとに0–100点、コンポジットはその加重平均です。
+- **モメンタム** — 50日移動平均との乖離、MACDの向き、1ヶ月リターン。
+- **バリュー** — 実績PER（割安ほど高得点）＋配当利回りボーナス。
+- **テクニカル** — RSIの位置とボリンジャー%B。過熱・売られすぎより健全な中間帯を評価。
+- **ハイプ** — 30日ベースライン比の出来高ブレイクアウトに、Reddit・GDELTニュース・
+Yahoo!掲示板「みんなの評価」（日本株）・踏み上げ（ショートスクイーズ）補正を加味。
+- **クオリティ** — ROE（収益性）。データ欠損は中立扱いで減点しません。
+- **テーマ**（新設）— 業種ローテーションの強さ。同じテーマバスケット（AI・半導体・防衛・
+クリーンエネルギー等）の*他の*スキャン銘柄の平均モメンタムを減衰付きで反映します。
+テーマなしの銘柄は中立の50点です。
+
+**判定:** コンポジット 65以上 → BUY ・ 45未満 → SELL ・ それ以外 → HOLD"""),
+        ("🔁 エンジンの学習（ウォークフォワード）",
+         """フルスキャンごとに、その日のトップ3グロース／トップ3配当ピックをファクタースコア付きで記録します。
+**14日**経過後、各ピックが自国市場ベンチマーク（米国株はS&P 500、日本株は日経平均など）に勝ったかを
+判定し、勝者で高得点だったファクターの重みを**引き上げ**、敗者で高得点だったファクターを**引き下げ**
+ます（下限付き）。**システム監査**タブで重みの推移と勝率を確認できます。新設のテーマファクターは
+12%の小さな重みから始まり、このループで実力に応じて調整されます。"""),
+        ("🔬 ディープスキャンとプロモート",
+         """市場ごとの2段階ファネルです。**ステージ1**は数百銘柄の株価を一括取得し、価格スクリーン
+（モメンタムブレンド・出来高サージ・52週高値近接度・急落キャップ）でランク付け。**ステージ2**は
+上位ファイナリストのみファンダメンタルズを含むフル採点を行います。最上位は（米5・日3・中2の枠で）
+メインスキャンに**プロモート**でき、再実行のたびに入れ替わります。クラウド環境では再デプロイで
+プロモートが消えるため、表示される `PROMOTED_TICKERS` スニペットを `config.py` に貼り付けると永続化できます。"""),
+        ("📡 データソースと制限",
+         """株価・ファンダメンタルズは **Yahoo Finance**（米国株はStooqフォールバック、任意でFMP APIキー）、
+センチメントは **Reddit**・**GDELTニュース**・日本株は **Yahoo!掲示板「みんなの評価」** を利用します。
+いずれも無料・非公式のソースで、遅延・制限・ブロックの可能性があります。全取得処理はフェイルセーフで、
+ソース停止時はシグナルが中立に劣化するだけでスキャンは継続します。スキャン全体が失敗する場合は
+ほぼYahooの一時的なレート制限です。数分待ってクイックスキャンをお試しください。"""),
+        ("⚠️ 免責事項",
+         """本アプリは教育目的のスクリーニングツールです。スコアは公開データ（遅延あり）の機械的な変換であり、
+誤り・陳腐化・入力不足の可能性があります。特定の証券の売買を推奨するものではありません。
+投資判断はご自身の調査に基づき、必要に応じて有資格のファイナンシャルアドバイザーにご相談ください。"""),
+    ],
+}
+
+
+def render_help() -> None:
+    """In-app documentation. First section open by default; the rest collapsed."""
+    sections = _HELP_SECTIONS.get(get_lang(), _HELP_SECTIONS["en"])
+    for i, (title, body) in enumerate(sections):
+        with st.expander(title, expanded=(i == 0)):
+            st.markdown(body)
+
+
+# ----------------------------------------------------------------------------
+# Main Application Controller Setup — st.navigation page structure.
+#
+# The old single-script st.tabs(10) bar had two costs: every widget click
+# re-rendered ALL ten tabs (Audit queries, Sell scanner, everything), and the
+# bar itself scrolled horizontally, worse in Japanese. st.navigation renders
+# only the selected page per rerun and groups the app into four sections in the
+# sidebar. Page url_paths are language-independent, so switching 言語 keeps you
+# on the same page; _PAGES lets other modules jump programmatically
+# (st.switch_page) — e.g. the Regional table's "Open full analysis" button.
+# Requires Streamlit >= 1.36 (the app already uses >= 1.35 APIs elsewhere).
+# ----------------------------------------------------------------------------
+_PAGES: dict[str, "st.Page"] = {}
+
+
+def _session_results() -> list[dict]:
+    return st.session_state.get("results", [])
+
+
+# Page wrappers: st.Page callables take no arguments, so each page pulls the
+# shared scan results (and the audit toggle) from session state itself.
+def page_top() -> None: render_daily_top_3(_session_results())
+def page_regional() -> None: render_global_sectors(_session_results())
+def page_category() -> None: render_category_views(_session_results())
+def page_themes() -> None: render_themes(_session_results())
+def page_deep_dive() -> None: render_deep_dive(_session_results())
+def page_deep_scan() -> None: render_deep_scan()
+def page_us() -> None: render_us_conviction(_session_results())
+def page_audit() -> None: render_engine_audit(st.session_state.get("_update_prices", True))
+def page_sell() -> None: render_sell_signals()
+def page_help() -> None: render_help()
+
+
+def _build_navigation() -> "st.navigation":
+    """Grouped page tree. Titles are translated per rerun (tr follows the language
+    menu, which is read before this runs); url_paths stay fixed so bookmarks and
+    the current selection survive a language switch."""
+    global _PAGES
+    _PAGES = {
+        "top": st.Page(page_top, title=tr("tab_top"), url_path="top", default=True),
+        "regional": st.Page(page_regional, title=tr("tab_regional"), url_path="regional"),
+        "category": st.Page(page_category, title=tr("tab_category"), url_path="category"),
+        "themes": st.Page(page_themes, title=tr("tab_themes"), url_path="themes"),
+        "deep_dive": st.Page(page_deep_dive, title=tr("tab_deep"), url_path="deep-dive"),
+        "deep_scan": st.Page(page_deep_scan, title=tr("tab_deep_scan"), url_path="deep-scan"),
+        "us": st.Page(page_us, title=tr("tab_us"), url_path="us-conviction"),
+        "audit": st.Page(page_audit, title=tr("tab_audit"), url_path="audit"),
+        "sell": st.Page(page_sell, title=tr("tab_sell"), url_path="sell"),
+        "help": st.Page(page_help, title=tr("tab_help"), url_path="help"),
+    }
+    return st.navigation({
+        tr("nav_scan"): [_PAGES["top"], _PAGES["regional"], _PAGES["category"], _PAGES["themes"]],
+        tr("nav_research"): [_PAGES["deep_dive"], _PAGES["deep_scan"], _PAGES["us"]],
+        tr("nav_audit"): [_PAGES["audit"], _PAGES["sell"]],
+        tr("nav_info"): [_PAGES["help"]],
+    })
+
+
 def main() -> None:
     init_db()
     inject_css()
@@ -3037,10 +3644,15 @@ def main() -> None:
         except Exception: pass
         st.session_state["_maintenance_done"] = True
 
-    # Sidebar Interface Controller Layout 
-    # Language menu first, so changing it re-renders the whole UI in the chosen language.
+    # Sidebar Interface Controller Layout
+    # Language menu first: tr() must reflect the chosen language BEFORE the page
+    # tree is built, so section headers and page titles localize on this rerun.
+    # (st.navigation pins the nav to the top of the sidebar; these controls
+    # render below it regardless of call order.)
     lang_choice = st.sidebar.selectbox("🌐 Language / 言語", list(LANGUAGES.keys()), key="lang_select")
     st.session_state["lang"] = LANGUAGES[lang_choice]
+
+    pg = _build_navigation()
 
     st.sidebar.title(tr("console_title"))
     region_keys = list(TICKER_UNIVERSE.keys())
@@ -3052,6 +3664,8 @@ def main() -> None:
     quick_scan = st.sidebar.toggle(tr("scan_quick_toggle"), value=True, help=tr("scan_quick_help"))
     jp_forum_on = st.sidebar.toggle(tr("jp_forum_toggle"), value=True, help=tr("jp_forum_help"))
     update_prices = st.sidebar.checkbox(tr("update_hist_prices"), value=True)
+    # The Audit page reads this from session state (page callables take no args).
+    st.session_state["_update_prices"] = bool(update_prices)
     source_keys = list(SENTIMENT_SOURCES.keys())
     selected_sources = st.sidebar.multiselect(
         tr("sentiment_sources"), source_keys, default=source_keys,
@@ -3079,31 +3693,81 @@ def main() -> None:
         st.sidebar.success(tr("seed_success"))
         st.rerun()
 
-    # Read existing session metrics safely
+    # Escape hatch for the 30-min data caches: without this, a sudden intraday
+    # move is invisible until the TTL lapses because every scan is served from
+    # cached frames. Clears price/fundamentals caches only (sentiment keeps its
+    # own TTL); the user then re-runs the scan to pull fresh data.
+    if st.sidebar.button(tr("refresh_btn"), width="stretch", help=tr("refresh_help")):
+        clear_market_data_caches()
+        st.sidebar.success(tr("refresh_success"))
+
+    # Read existing session metrics safely. A brand-new session (refresh, new
+    # browser tab, cloud session timeout) restores the last persisted scan
+    # snapshot so returning users land on their results, not the empty state.
+    if "results" not in st.session_state:
+        snap = load_latest_scan_snapshot()
+        if snap:
+            res, created_at, was_quick = snap
+            st.session_state["results"] = res
+            st.session_state["failed"] = []
+            st.session_state["scan_is_quick"] = was_quick
+            st.session_state["restored_scan"] = True
+            try:
+                st.session_state["scan_ts"] = pd.Timestamp(created_at).timestamp()
+            except Exception:
+                st.session_state["scan_ts"] = None
     results = st.session_state.get("results", [])
     failed = st.session_state.get("failed", [])
 
     if failed:
         st.sidebar.warning(tr("skipped", items=", ".join(failed)))
 
+    # Freshness chip: when, how many, quick or full — visible on every page.
+    if results:
+        scan_ts = st.session_state.get("scan_ts")
+        ago_txt = _ago(scan_ts) if scan_ts else "—"
+        mode = tr("scan_mode_quick") if st.session_state.get("scan_is_quick") else tr("scan_mode_full")
+        st.markdown(
+            f'<span class="qc-chip">🕒 {tr("scan_chip", ago=ago_txt, n=len(results), mode=mode)}</span>',
+            unsafe_allow_html=True)
+        if st.session_state.get("restored_scan"):
+            st.caption(tr("scan_restored_note"))
+
+    # --- First-run empty state ---------------------------------------------
+    # A new user — especially on mobile, where the sidebar starts collapsed —
+    # would otherwise land on "please run a scan" pages with the actual Run
+    # button hidden. Give them a hero card with a primary CTA right on the main
+    # page; it disappears once results exist, and is skipped on the Help page
+    # (reading the docs shouldn't compete with a call to action).
+    if not results and pg.url_path != "help":
+        st.markdown(
+            f'<div class="qc-card" style="padding:26px 24px;">'
+            f'<div class="qc-ticker">{tr("hero_title")}</div>'
+            f'<div class="qc-sub" style="margin-top:6px; max-width:60ch;">{tr("hero_sub")}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button(tr("hero_btn"), type="primary", key="hero_scan_btn"):
+            with st.spinner(tr("scan_spinner")):
+                res, fail = run_engine(limit_per_region=10,
+                                       regions=list(TICKER_UNIVERSE.keys()),
+                                       sources=None, use_jp_forum=True)
+                st.session_state["results"], st.session_state["failed"] = res, fail
+                st.session_state["scan_is_quick"] = True
+            if not res and fail:
+                st.error(tr("all_failed"))
+            else:
+                st.rerun()
+        st.caption(tr("hero_hint"))
+
     # Global sentiment telemetry: surface the buzz sources + freshness once a scan has
-    # run, so it's visible app-wide rather than only inside the Deep-Dive tab.
+    # run, so it's visible app-wide rather than only inside the Deep-Dive page.
     if _LAST_HYPE_FETCHED_AT:
         _msg = tr("hype_updated", ago=_ago(_LAST_HYPE_FETCHED_AT))
         st.caption(f"{_LAST_HYPE_STATUS} · {_msg}" if _LAST_HYPE_STATUS else _msg)
 
-    # Main Segment View tabs routing setup
-    t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs([tr("tab_top"), tr("tab_regional"), tr("tab_category"), tr("tab_deep"), tr("tab_audit"), tr("tab_sell"), tr("tab_us"), tr("tab_themes"), tr("tab_deep_scan")])
-
-    with t1: render_daily_top_3(results)
-    with t2: render_global_sectors(results)
-    with t3: render_category_views(results)
-    with t4: render_deep_dive(results)
-    with t5: render_engine_audit(update_prices)
-    with t6: render_sell_signals()
-    with t7: render_us_conviction(results)
-    with t8: render_themes(results)
-    with t9: render_deep_scan()
+    # Render ONLY the selected page (lazy — the whole point of st.navigation).
+    pg.run()
 
 if __name__ == "__main__":
     main()
