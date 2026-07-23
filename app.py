@@ -452,6 +452,7 @@ except ImportError:
 from indicators import (
     compute_rsi, compute_macd, compute_bollinger, compute_hype, clamp, screen_metrics,
     forum_sentiment_score, forum_euphoria_sell_score, theme_strength_score,
+    payout_penalty, compute_atr, trade_levels,
 )
 ALL_TICKERS = [ticker for region in TICKER_UNIVERSE.values() for ticker in region]
 
@@ -857,6 +858,10 @@ def init_db() -> None:
         _ensure_column(conn, "kpi_weights", "quality")
         # Theme (industry-rotation) factor — sixth KPI, added the same safe way.
         _ensure_column(conn, "recommendations", "theme")
+        # Trade reference levels recorded AT recommendation time, so the audit can
+        # later judge them (did price reach target before stop?). REAL, NaN-tolerant.
+        for col in ("entry_lo", "entry_hi", "target_level", "stop_level"):
+            _ensure_column(conn, "recommendations", col)
         _ensure_column(conn, "kpi_weights", "theme")
         # Bookkeeping flag so each logged pick feeds the walk-forward loop once.
         _ensure_column(conn, "mock_portfolio", "evaluated", "INTEGER DEFAULT 0")
@@ -935,11 +940,13 @@ def save_recommendation(rec: dict) -> None:
             (rec["ticker"], today),
         )
         conn.execute(
-            "INSERT INTO recommendations (ticker, rec_date, recommendation, composite, price_at_rec, momentum, value, technical, hype, quality, theme) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO recommendations (ticker, rec_date, recommendation, composite, price_at_rec, momentum, value, technical, hype, quality, theme, entry_lo, entry_hi, target_level, stop_level) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (rec["ticker"], today, rec["recommendation"], float(rec["composite"]),
              price_val, safe_float(rec["momentum"]), safe_float(rec["value"]),
              safe_float(rec["technical"]), hype_val, quality_val,
-             safe_float(rec.get("theme"), 50.0)),
+             safe_float(rec.get("theme"), 50.0),
+             safe_float(rec.get("entry_lo")), safe_float(rec.get("entry_hi")),
+             safe_float(rec.get("target_level")), safe_float(rec.get("stop_level"))),
         )
         conn.commit()
 
@@ -1234,6 +1241,7 @@ def _fmp_fundamentals(ticker: str) -> dict:
             if pe is not None and math.isnan(out["pe"]):
                 out["pe"] = safe_float(pe)
             out["roe"] = safe_float(r.get("returnOnEquityTTM", r.get("roeTTM")))   # fraction
+            out["payout"] = safe_float(r.get("payoutRatioTTM"))
             dy = r.get("dividendYieldTTM")
             if dy is not None:
                 out["div_yield"] = safe_float(dy) * 100.0   # FMP fraction -> app percent
@@ -1246,8 +1254,8 @@ def _fmp_fundamentals(ticker: str) -> dict:
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_fundamentals(ticker: str) -> dict:
     out = {"pe": float("nan"), "div_yield": float("nan"), "market_cap": float("nan"),
-           "roe": float("nan"), "short_pct": float("nan"), "name": ticker,
-           "sector": "", "industry": ""}
+           "roe": float("nan"), "short_pct": float("nan"), "payout": float("nan"),
+           "name": ticker, "sector": "", "industry": ""}
     if yf is None: return out
     # Distinguish a transient failure (rate-limit / network) from a reachable ticker
     # that simply lacks some fields. On the former we RAISE — @st.cache_data never
@@ -1276,6 +1284,9 @@ def fetch_fundamentals(ticker: str) -> dict:
     # keeps these as NaN when yfinance omits them, so downstream scoring never breaks.
     out["roe"] = safe_float(info.get("returnOnEquity"))
     out["short_pct"] = safe_float(info.get("shortPercentOfFloat"))
+    # Dividend coverage (dividends/earnings, fraction). Flaky field: NaN when absent,
+    # and payout_penalty treats NaN/<=0 as "no signal" so it can never punish a gap.
+    out["payout"] = safe_float(info.get("payoutRatio"))
     # Sector/industry ride along for free from the same .info call — they feed the
     # Deep Scan <-> Themes bridge (match_theme) at zero extra API cost.
     out["sector"] = str(info.get("sector") or "")
@@ -1379,6 +1390,12 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
     price = safe_float(close.iloc[-1])
     sma20 = safe_float(close.rolling(20).mean().iloc[-1])
     sma50 = safe_float(close.rolling(50).mean().iloc[-1])
+    # Trade reference levels (entry/target/stop). ATR needs High/Low; some fallback
+    # frames may lack them -> NaN ATR -> trade_levels returns None -> panel hidden.
+    atr = (compute_atr(hist["High"], hist["Low"], close)
+           if "High" in hist.columns and "Low" in hist.columns else float("nan"))
+    high_52w = safe_float(close.iloc[-252:].max())
+    levels = trade_levels(safe_float(close.iloc[-1]), sma20, sma50, atr, high_52w)
     rsi = safe_float(compute_rsi(close).iloc[-1])
     macd_line, signal_line, hist_macd = compute_macd(close)
     _, bb_up, bb_lo, bb_pct = compute_bollinger(close)
@@ -1395,6 +1412,10 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
     pe = funds["pe"]
     value_score = 50.0 if math.isnan(pe) or pe <= 0 else clamp(100 - (pe - 10) * 2.0)
     if not math.isnan(funds["div_yield"]): value_score = clamp(value_score + min(funds["div_yield"] * 3, 10))
+    # Dividend-coverage guard: an uncovered payout is the yield-trap profile the two
+    # lines above otherwise REWARD (falling price -> higher yield, lower P/E). The
+    # penalty (0-20 pts, indicators.payout_penalty) only fires above 80% payout.
+    value_score = clamp(value_score - payout_penalty(funds["payout"]))
 
     rsi_safe = rsi if not math.isnan(rsi) else 50.0
     tech = 50.0 - abs(rsi_safe - 50) * 0.6 + (15 if 45 <= rsi_safe <= 65 else 0)
@@ -1433,6 +1454,11 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
         "ticker": ticker, "region": region, "name": funds["name"], "price": price,
         "sma20": sma20, "sma50": sma50, "rsi": rsi, "macd_hist": safe_float(hist_macd.iloc[-1]),
         "bb_pct": pct_b, "ret_1m": ret_1m, "pe": pe, "div_yield": funds["div_yield"],
+        "payout": funds["payout"], "atr": atr,
+        "entry_lo": (levels["entry_lo"] if levels else float("nan")),
+        "entry_hi": (levels["entry_hi"] if levels else float("nan")),
+        "target_level": (levels["target"] if levels else float("nan")),
+        "stop_level": (levels["stop"] if levels else float("nan")),
         "market_cap": funds["market_cap"], "roe": roe, "short_pct": short_pct,
         "sector": funds.get("sector", ""), "industry": funds.get("industry", ""),
         "hype": hype, "momentum": momentum_score, "value": value_score,
@@ -2456,7 +2482,13 @@ def render_category_views(results: list[dict]) -> None:
         div_df = df[df["div_yield"] >= 1.5].sort_values(by="composite", ascending=False).head(5).copy()
         if not div_df.empty:
             div_df["region"] = div_df["region"].map(region_name)
-            st.dataframe(div_df[["ticker", "name", "region", "price", "div_yield", "composite"]].rename(columns={"ticker": tr("col_ticker"), "name": tr("col_company"), "region": tr("col_region"), "price": tr("col_price"), "div_yield": tr("col_dividend_return"), "composite": tr("col_overall_score")}), width="stretch", hide_index=True)
+            # Coverage column: yield alone can't distinguish a healthy payer from a
+            # yield trap (payout > earnings), so show what fraction of earnings the
+            # dividend consumes, flagged above 100%. NaN -> "—" (field is flaky).
+            div_df["payout_disp"] = (div_df["payout"].map(_payout_disp)
+                                     if "payout" in div_df.columns else "—")
+            st.dataframe(div_df[["ticker", "name", "region", "price", "div_yield", "payout_disp", "composite"]].rename(columns={"ticker": tr("col_ticker"), "name": tr("col_company"), "region": tr("col_region"), "price": tr("col_price"), "div_yield": tr("col_dividend_return"), "payout_disp": tr("col_payout"), "composite": tr("col_overall_score")}), width="stretch", hide_index=True)
+            st.caption(tr("payout_note"))
         else:
             st.info(tr("no_dividend_match"))
 
@@ -2561,6 +2593,13 @@ def _pick_breakdown(r: dict, weights: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _payout_disp(p: float) -> str:
+    """Payout ratio display: '65%', '112% ⚠' above 100%, '—' when unknown."""
+    if math.isnan(p) or p <= 0:
+        return "—"
+    return f"{p * 100:.0f}%" + (" ⚠" if p > 1.0 else "")
+
+
 def _evidence_rows(r: dict) -> list:
     """The actual KPI numbers behind each factor, as (factor, metric, value) rows."""
     fm, fv, ft, fh, fq = (tr("factor_momentum"), tr("factor_value"), tr("factor_technical"),
@@ -2581,6 +2620,7 @@ def _evidence_rows(r: dict) -> list:
         (fm, tr("evi_macd"),     macd_s),
         (fv, tr("evi_pe"),       "—" if (math.isnan(pe) or pe <= 0) else f"{pe:,.1f}"),
         (fv, tr("evi_div"),      "—" if math.isnan(div) else f"{div:.2f}%"),       # div_yield already in %
+        (fv, tr("evi_payout"),   _payout_disp(_f(r.get("payout")))),
         (ft, tr("evi_rsi"),      "—" if math.isnan(rsi) else f"{rsi:.0f}"),
         (ft, tr("evi_bbpct"),    "—" if math.isnan(bbp) else f"{bbp:.2f}"),
         (fq, tr("evi_roe"),      "—" if math.isnan(roe) else f"{roe * 100:.1f}%"),  # roe is a fraction
@@ -2991,6 +3031,37 @@ def render_themes(results: list[dict]) -> None:
             st.caption(tr("themes_deep_echo_note"))
 
 
+def refresh_levels_for(r: dict) -> bool:
+    """Refetch ONE ticker's history fresh (bypassing the session cache) and recompute
+    its price + entry/target/stop in place. Mutates the session result dict so every
+    panel reflects the new levels immediately. Deliberately does NOT touch the audit
+    rows — those stay frozen at recommendation time as the record of what the engine
+    said. Returns False (dict untouched) on any fetch/compute failure."""
+    try:
+        fresh = _bulk_history([r["ticker"]], period="1y").get(r["ticker"])
+        if fresh is None or fresh.empty or "Close" not in fresh.columns:
+            return False
+        close = fresh["Close"].dropna()
+        if len(close) < 30:
+            return False
+        px = safe_float(close.iloc[-1])
+        s20 = safe_float(close.rolling(20).mean().iloc[-1])
+        s50 = safe_float(close.rolling(50).mean().iloc[-1])
+        atr = (compute_atr(fresh["High"], fresh["Low"], close)
+               if "High" in fresh.columns and "Low" in fresh.columns else float("nan"))
+        lvls = trade_levels(px, s20, s50, atr, safe_float(close.iloc[-252:].max()))
+        if lvls is None:
+            return False
+        r.update(price=px, atr=atr, sma20=s20, sma50=s50,
+                 entry_lo=lvls["entry_lo"], entry_hi=lvls["entry_hi"],
+                 target_level=lvls["target"], stop_level=lvls["stop"],
+                 levels_refreshed_at=time.time())
+        return True
+    except Exception as e:
+        logger.warning("level refresh failed for %s: %s", r.get("ticker"), e)
+        return False
+
+
 def render_deep_dive(results: list[dict]) -> None:
     if not results:
         st.info(tr("need_run_history"))
@@ -3021,6 +3092,31 @@ def render_deep_dive(results: list[dict]) -> None:
     hc[1].markdown(metric_card(tr("why_call"), rec, positive=(rec == "BUY")), unsafe_allow_html=True)
     hc[2].markdown(metric_card(tr("why_rank"), f"#{rank_of.get(pick, '—')} / {len(results)}"),
                    unsafe_allow_html=True)
+
+    # --- Trade reference levels (entry / target / stop) -----------------------
+    # Structure+volatility-derived LEVELS, not forecasts (see indicators.trade_levels).
+    # Hidden entirely when ATR wasn't computable — made-up levels are worse than none.
+    # The refresh button refetches THIS ticker fresh and recomputes in place — one
+    # bulk call for one name, so it's cheap and can also FILL levels a throttled
+    # scan left blank. Audit rows are never rewritten (frozen at rec time).
+    bc, cc = st.columns([1, 3])
+    if bc.button(tr("levels_refresh_btn"), key=f"lvl_refresh_{pick}"):
+        if not refresh_levels_for(r):
+            st.warning(tr("levels_refresh_failed"))
+    if r.get("levels_refreshed_at"):
+        cc.caption(tr("levels_refreshed", ago=_ago(r["levels_refreshed_at"])))
+    e_lo, e_hi = safe_float(r.get("entry_lo")), safe_float(r.get("entry_hi"))
+    tgt, stp = safe_float(r.get("target_level")), safe_float(r.get("stop_level"))
+    px = safe_float(r.get("price"))
+    if not any(math.isnan(v) for v in (e_lo, e_hi, tgt, stp, px)) and px > 0:
+        lv = st.columns(3)
+        lv[0].markdown(metric_card(tr("level_entry"), f"{e_lo:,.2f} – {e_hi:,.2f}"),
+                       unsafe_allow_html=True)
+        lv[1].markdown(metric_card(tr("level_target"), f"{tgt:,.2f}",
+                       f"{(tgt / px - 1) * 100:+.1f}%", positive=True), unsafe_allow_html=True)
+        lv[2].markdown(metric_card(tr("level_stop"), f"{stp:,.2f}",
+                       f"{(stp / px - 1) * 100:+.1f}%", positive=False), unsafe_allow_html=True)
+        st.caption(tr("levels_note"))
 
     # --- factor profile: six-axis radar, this pick vs the scan average ---
     # The contribution bars below answer "why this composite"; the radar answers
@@ -3206,21 +3302,48 @@ def render_engine_audit(update_prices: bool = True) -> None:
     reason_map = {"Top Growth": tr("reason_growth"), "Top Dividend": tr("reason_dividend")}
     view["reason"] = view["reason"].map(lambda x: reason_map.get(x, x))
 
+    # Merge the trade levels recorded at recommendation time (recommendations table)
+    # onto the portfolio rows (ticker + calendar day), so the audit shows what the
+    # engine SAID at the time — the raw material for judging the levels later.
+    try:
+        recs = get_recommendations()
+        if not recs.empty and "target_level" in recs.columns:
+            recs = recs.assign(date_key=recs["rec_date"].dt.date)[
+                ["ticker", "date_key", "entry_lo", "entry_hi", "target_level", "stop_level"]
+            ].drop_duplicates(subset=["ticker", "date_key"], keep="first")
+            view = view.assign(date_key=view["date"].dt.date).merge(
+                recs, on=["ticker", "date_key"], how="left")
+    except Exception as e:
+        logger.warning("audit level merge skipped: %s", e)
+    for c in ("entry_lo", "entry_hi", "target_level", "stop_level"):
+        if c not in view.columns:
+            view[c] = float("nan")
+    view["entry_disp"] = [
+        "—" if (math.isnan(safe_float(lo)) or math.isnan(safe_float(hi)))
+        else f"{safe_float(lo):,.2f}–{safe_float(hi):,.2f}"
+        for lo, hi in zip(view["entry_lo"], view["entry_hi"])]
+
     ret_col = tr("col_return_pct")
     rec_col, cur_col = tr("col_rec_price"), tr("col_current_price")
     if one_per:
         view = view.sort_values("return_pct", ascending=False, na_position="last")
         disp = view[["date_str", "ticker", "name", "reason", "times",
-                     "recommendation_price", "current", "return_pct"]].rename(columns={
+                     "recommendation_price", "current", "return_pct",
+                     "entry_disp", "target_level", "stop_level"]].rename(columns={
             "date_str": tr("col_first_rec"), "ticker": tr("col_ticker"), "name": tr("col_company"),
             "reason": tr("col_reason"), "times": tr("col_times"),
-            "recommendation_price": rec_col, "current": cur_col, "return_pct": ret_col})
+            "recommendation_price": rec_col, "current": cur_col, "return_pct": ret_col,
+            "entry_disp": tr("col_entry"), "target_level": tr("col_target"),
+            "stop_level": tr("col_stop")})
     else:
         disp = view[["date_str", "ticker", "name", "reason",
-                     "recommendation_price", "current", "return_pct"]].rename(columns={
+                     "recommendation_price", "current", "return_pct",
+                     "entry_disp", "target_level", "stop_level"]].rename(columns={
             "date_str": tr("col_date"), "ticker": tr("col_ticker"), "name": tr("col_company"),
             "reason": tr("col_reason"),
-            "recommendation_price": rec_col, "current": cur_col, "return_pct": ret_col})
+            "recommendation_price": rec_col, "current": cur_col, "return_pct": ret_col,
+            "entry_disp": tr("col_entry"), "target_level": tr("col_target"),
+            "stop_level": tr("col_stop")})
 
     def _style_returns(series):
         styles = []
@@ -3232,7 +3355,8 @@ def render_engine_audit(update_prices: bool = True) -> None:
 
     styled = (disp.style
               .apply(_style_returns, subset=[ret_col])
-              .format({rec_col: "{:,.2f}", cur_col: "{:,.2f}", ret_col: "{:+.2f}%"}, na_rep="—"))
+              .format({rec_col: "{:,.2f}", cur_col: "{:,.2f}", ret_col: "{:+.2f}%",
+                       tr("col_target"): "{:,.2f}", tr("col_stop"): "{:,.2f}"}, na_rep="—"))
     st.dataframe(styled, width="stretch", hide_index=True)
     st.caption(tr("audit_one_per_note") if one_per else tr("historical_perf_note"))
     if update_prices:
