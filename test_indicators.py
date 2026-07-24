@@ -11,7 +11,8 @@ import pytest
 
 from indicators import (compute_rsi, compute_macd, compute_bollinger, compute_hype,
                         clamp, screen_metrics, forum_sentiment_score,
-                        forum_euphoria_sell_score, theme_strength_score)
+                        forum_euphoria_sell_score, theme_strength_score, payout_penalty,
+                        compute_atr, trade_levels)
 
 
 # --------------------------------------------------------------------------- clamp
@@ -266,3 +267,75 @@ def test_theme_none_peers_tolerated():
     assert theme_strength_score([None]) == 50.0
     assert theme_strength_score([80.0, None, 80.0]) == \
         pytest.approx(theme_strength_score([80.0, 80.0]))
+
+
+# ------------------------------------------------------ payout coverage penalty
+def test_payout_missing_or_zero_is_no_penalty():
+    # skip-don't-punish: flaky/absent payoutRatio must never penalise
+    assert payout_penalty(float("nan")) == 0.0
+    assert payout_penalty(0.0) == 0.0
+    assert payout_penalty(-0.3) == 0.0
+
+
+def test_payout_healthy_coverage_no_penalty():
+    assert payout_penalty(0.4) == 0.0
+    assert payout_penalty(0.8) == 0.0    # boundary: exactly 80% is still fine
+
+
+def test_payout_thin_coverage_ramps():
+    assert payout_penalty(0.9) == pytest.approx(4.0)
+    assert payout_penalty(1.0) == pytest.approx(8.0)
+    assert 0.0 < payout_penalty(0.85) < payout_penalty(0.95)
+
+
+def test_payout_over_earnings_and_cap():
+    assert payout_penalty(1.2) == pytest.approx(12.0)   # 8 + 0.2*20
+    assert payout_penalty(1.6) == pytest.approx(20.0)   # hits the cap
+    assert payout_penalty(3.0) == 20.0                  # absurd/broken data still capped
+
+
+# ----------------------------------------------------------- ATR + trade levels
+def _ohlc(n=60, base=100.0, step=0.5, rng_amp=1.0):
+    close = pd.Series(base + np.arange(n) * step)
+    high = close + rng_amp
+    low = close - rng_amp
+    return high, low, close
+
+
+def test_atr_reflects_range():
+    h1, l1, c1 = _ohlc(rng_amp=1.0)
+    h2, l2, c2 = _ohlc(rng_amp=3.0)
+    a1, a2 = compute_atr(h1, l1, c1), compute_atr(h2, l2, c2)
+    assert a2 > a1 > 0            # wider daily ranges -> larger ATR
+
+
+def test_atr_too_short_nan():
+    h, l, c = _ohlc(n=10)
+    assert math.isnan(compute_atr(h, l, c))
+
+
+def test_levels_uptrend_basing_below_high():
+    # price 100, MAs below (94/97), 52w high 120 well above -> reclaim target
+    lv = trade_levels(price=100, sma20=97, sma50=94, atr=2.0, high_52w=120)
+    assert lv["entry_lo"] == 94 and lv["entry_hi"] == 97
+    assert lv["target"] == 120
+    assert lv["stop"] < lv["entry_lo"]        # stop strictly below the entry zone
+
+
+def test_levels_at_the_high_extension_target():
+    # already at its 52w high -> volatility extension, not the (equal) high
+    lv = trade_levels(price=120, sma20=116, sma50=112, atr=2.0, high_52w=120)
+    assert lv["target"] == pytest.approx(124.0)   # price + 2 ATR
+
+
+def test_levels_downtrend_band_falls_back():
+    # MAs overhead (price below both) -> entry zone anchors to price - ATR
+    lv = trade_levels(price=80, sma20=88, sma50=90, atr=2.0, high_52w=100)
+    assert lv["entry_hi"] == 80 and lv["entry_lo"] == pytest.approx(78.0)
+    assert lv["stop"] < lv["entry_lo"]
+
+
+def test_levels_unusable_inputs_none():
+    assert trade_levels(float("nan"), 97, 94, 2.0, 120) is None
+    assert trade_levels(100, 97, 94, float("nan"), 120) is None
+    assert trade_levels(100, 97, 94, 0.0, 120) is None
