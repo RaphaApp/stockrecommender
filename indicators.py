@@ -187,3 +187,85 @@ def forum_euphoria_sell_score(bull_pct: float, bear_pct: float) -> float | None:
     if net <= 35.0:
         return 50.0                       # normal or bearish -> neutral, never a sell push
     return clamp(50.0 + (net - 35.0) * 1.0)   # only euphoria beyond +35 adds sell pressure
+
+
+def payout_penalty(payout_ratio: float) -> float:
+    """Dividend-coverage penalty (points to subtract from the VALUE factor score).
+
+    `payout_ratio` is dividends / earnings as a FRACTION (yfinance `payoutRatio`).
+    A dividend comfortably covered by earnings is fine; one consuming most or more
+    than all of earnings is the classic yield-trap profile (a cut waiting to happen),
+    which the raw value score otherwise *rewards* — a falling price inflates yield
+    and deflates P/E simultaneously.
+
+        payout <= 0.8        -> 0            (healthy coverage: no penalty)
+        0.8 < payout <= 1.0  -> 0..8 ramp    (thin coverage)
+        payout > 1.0         -> 8 + 20*(p-1) (paying out more than it earns)
+        capped at 20 points total
+
+    NaN / missing / non-positive payout -> 0.0: skip-don't-punish, consistent with
+    every other optional fundamental (yfinance's payoutRatio is a flaky field, and
+    REITs / irregular Japanese payout conventions can distort it — a missing value
+    must never penalise). Pure function: float in, float out.
+    """
+    p = float(payout_ratio)
+    if np.isnan(p) or p <= 0.0:
+        return 0.0
+    if p <= 0.8:
+        return 0.0
+    if p <= 1.0:
+        return (p - 0.8) / 0.2 * 8.0
+    return min(8.0 + (p - 1.0) * 20.0, 20.0)
+
+
+def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> float:
+    """Average True Range (Wilder): the stock's typical daily movement, used to scale
+    trade levels to each name's own volatility. Returns NaN when the OHLC inputs are
+    unusable (e.g. a fallback data source without High/Low)."""
+    try:
+        h, l, c = high.astype(float), low.astype(float), close.astype(float)
+    except Exception:
+        return float("nan")
+    if len(c) < period + 1:
+        return float("nan")
+    prev_c = c.shift(1)
+    tr = pd.concat([(h - l), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / period, min_periods=period).mean().iloc[-1]
+    return float(atr) if pd.notna(atr) and atr > 0 else float("nan")
+
+
+def trade_levels(price: float, sma20: float, sma50: float, atr: float,
+                 high_52w: float) -> dict | None:
+    """Entry / target / stop REFERENCE LEVELS (not forecasts) derived purely from
+    structure and volatility:
+
+      * entry zone  — the SMA20..SMA50 band (a pullback buy in an uptrend); when
+                      price already trades below that band, the zone falls back to
+                      [price - ATR, price] (you don't 'pull back' up to a level).
+      * target      — the 52-week high when price is basing >2% below it (structure
+                      to reclaim); otherwise price + 2 ATR (volatility-scaled
+                      extension for a name already at highs).
+      * stop        — thesis-invalidation: half an ATR below the lower of SMA50 and
+                      price - 2 ATR, guaranteeing it sits below the entry zone.
+
+    Volatile names automatically get wider zones/stops than stable ones via ATR.
+    Returns None when price or ATR is unusable — a panel with made-up levels is
+    worse than no panel. Pure function; honest 'levels, not predictions' framing
+    is the caller's job in the UI."""
+    p, a = float(price), float(atr)
+    if not (p > 0) or not (a > 0) or np.isnan(p) or np.isnan(a):
+        return None
+    band = [v for v in (float(sma20), float(sma50)) if not np.isnan(v) and v > 0]
+    if band:
+        entry_lo, entry_hi = min(band), max(band)
+        if p < entry_lo:                      # downtrend: MAs overhead, band is meaningless
+            entry_lo, entry_hi = p - a, p
+    else:
+        entry_lo, entry_hi = p - a, p
+    hi52 = float(high_52w)
+    target = hi52 if (not np.isnan(hi52) and hi52 > p * 1.02) else p + 2.0 * a
+    stop_cands = [v for v in (float(sma50), p - 2.0 * a) if not np.isnan(v)]
+    stop = min(stop_cands) - 0.5 * a
+    stop = min(stop, entry_lo - 0.25 * a)     # always strictly below the entry zone
+    return {"entry_lo": float(entry_lo), "entry_hi": float(entry_hi),
+            "target": float(target), "stop": float(stop)}
