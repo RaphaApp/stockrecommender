@@ -315,11 +315,24 @@ def test_atr_too_short_nan():
 
 
 def test_levels_uptrend_basing_below_high():
-    # price 100, MAs below (94/97), 52w high 120 well above -> reclaim target
+    # price 100, MAs below (94/97), 52w high 120 well above -> reclaim target.
+    # Entry is FLOORED at price - 1 ATR (=98): a healthy name rarely retraces all
+    # the way to a lagging SMA50, so the zone caps the pullback depth.
     lv = trade_levels(price=100, sma20=97, sma50=94, atr=2.0, high_52w=120)
-    assert lv["entry_lo"] == 94 and lv["entry_hi"] == 97
+    assert lv["entry_lo"] >= 98.0 - 1e-9          # floored at price - 1 ATR, not 94
+    assert lv["entry_hi"] <= 100.0                # never above current price
+    assert lv["entry_hi"] > lv["entry_lo"]        # real width, not a point
     assert lv["target"] == 120
-    assert lv["stop"] < lv["entry_lo"]        # stop strictly below the entry zone
+    assert lv["stop"] < lv["entry_lo"]            # stop strictly below the entry zone
+
+
+def test_levels_entry_never_far_below_price():
+    # the reported bug: a fast mover whose SMA50 lags ~20% below price must NOT
+    # produce a -15/-20% entry zone. Floor keeps it within ~1 ATR of price.
+    lv = trade_levels(price=150, sma20=140, sma50=125, atr=3.0, high_52w=150)
+    assert lv["entry_lo"] >= 150 - 3.0 - 1e-9     # within 1 ATR of price
+    assert lv["entry_hi"] > lv["entry_lo"]
+    assert (lv["entry_lo"] / 150 - 1) * 100 > -3.0   # not a 15%+ pullback anymore
 
 
 def test_levels_at_the_high_extension_target():

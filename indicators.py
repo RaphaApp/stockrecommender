@@ -239,9 +239,11 @@ def trade_levels(price: float, sma20: float, sma50: float, atr: float,
     """Entry / target / stop REFERENCE LEVELS (not forecasts) derived purely from
     structure and volatility:
 
-      * entry zone  — the SMA20..SMA50 band (a pullback buy in an uptrend); when
-                      price already trades below that band, the zone falls back to
-                      [price - ATR, price] (you don't 'pull back' up to a level).
+      * entry zone  — a pullback buy: the SMA20..SMA50 band, but FLOORED at
+                      price - 1 ATR so a fast/parabolic mover (whose SMA50 lags far
+                      below) doesn't produce an entry 15-20% under price that may
+                      never fill. When price already trades below the band (downtrend,
+                      MAs overhead) the zone is [price - ATR, price] instead.
       * target      — the 52-week high when price is basing >2% below it (structure
                       to reclaim); otherwise price + 2 ATR (volatility-scaled
                       extension for a name already at highs).
@@ -260,6 +262,17 @@ def trade_levels(price: float, sma20: float, sma50: float, atr: float,
         entry_lo, entry_hi = min(band), max(band)
         if p < entry_lo:                      # downtrend: MAs overhead, band is meaningless
             entry_lo, entry_hi = p - a, p
+        else:
+            # Cap how deep the pullback can be: a healthy uptrend rarely retraces to a
+            # far-lagging SMA50, so floor the zone at price - 1 ATR (a realistic dip)
+            # and cap the top at price (never suggest buying above current price).
+            floor = p - a
+            entry_lo = max(entry_lo, floor)
+            entry_hi = min(max(entry_hi, entry_lo), p)
+            if entry_hi - entry_lo < 0.5 * a:     # keep a usable band (>= half an ATR)
+                entry_hi = min(entry_lo + 0.5 * a, p)   # widen upward toward price first
+                if entry_hi - entry_lo < 0.5 * a:       # only if capped at price, drop lo
+                    entry_lo = entry_hi - 0.5 * a
     else:
         entry_lo, entry_hi = p - a, p
     hi52 = float(high_52w)
