@@ -41,6 +41,14 @@ try:
 except Exception:
     sec_research = None
 
+# Rakuten trade-history parsing (portfolio.py). Guarded like sec_research so an
+# out-of-sync file set degrades to "page unavailable" instead of failing the import
+# and taking the whole app down.
+try:
+    import portfolio as pf
+except Exception:
+    pf = None
+
 logger = logging.getLogger("alpha_quant")
 
 # ----------------------------------------------------------------------------
@@ -2719,12 +2727,14 @@ def render_deep_scan() -> None:
             st.info(tr("promote_clear_note"))
             st.rerun()
     region_labels = {tr("deep_region_us"): "USA", tr("deep_region_jp"): "Japan",
-                     tr("deep_region_cn"): "China"}
+                     tr("deep_region_cn"): "China", tr("deep_region_eu"): "Europe"}
     choice = st.radio(tr("deep_region_label"), list(region_labels.keys()),
                       horizontal=True, key="deep_region")
     region = region_labels[choice]
     if region != "USA":
         st.caption(tr("deep_scan_jpcn_note"))
+    if region == "Europe":
+        st.caption(tr("deep_scan_gbp_note"))
     # Universe status: curated floor + live screener overlay, with freshness.
     _dyn, _dyn_ts = get_dynamic_universe(region)
     _curated_n = len(DEEP_UNIVERSES.get(region, []))
@@ -3722,7 +3732,172 @@ def page_deep_scan() -> None: render_deep_scan()
 def page_us() -> None: render_us_conviction(_session_results())
 def page_audit() -> None: render_engine_audit(st.session_state.get("_update_prices", True))
 def page_sell() -> None: render_sell_signals()
+def page_portfolio() -> None:
+    render_portfolio()
+
+
 def page_help() -> None: render_help()
+
+
+
+# ----------------------------------------------------------------------------
+# My Trades — Rakuten CSV upload, review queue, search, currency toggle
+# ----------------------------------------------------------------------------
+def _pf_signature(files) -> tuple:
+    """Identity of the current upload set: (name, size) per file. Parsing is keyed on
+    this, so Streamlit's constant reruns (every widget click) reuse the parsed frame
+    instead of re-decoding cp932 and re-parsing every CSV."""
+    return tuple(sorted((f.name, getattr(f, "size", 0)) for f in (files or [])))
+
+
+def _pf_load(files) -> tuple:
+    """Parse an upload set -> (combined canonical frame, per-file diagnostics).
+    IO + Streamlit-specific bits only; every transformation lives in portfolio.py."""
+    frames, diags = [], []
+    for f in files or []:
+        try:
+            f.seek(0)
+            raw = pd.read_csv(f, encoding="cp932")      # Rakuten exports are Shift-JIS
+        except UnicodeDecodeError:
+            f.seek(0)
+            raw = pd.read_csv(f, encoding="utf-8-sig")  # tolerate a re-saved file
+        except Exception as e:
+            diags.append({"file": f.name, "kind": "—", "rows": 0, "note": str(e)[:60]})
+            continue
+        kind = pf.detect_kind(raw)
+        if kind is None:
+            diags.append({"file": f.name, "kind": "—", "rows": 0,
+                          "note": tr("pf_unknown_layout")})
+            continue
+        norm = pf.normalize_trades(raw, kind)
+        frames.append(norm)
+        diags.append({"file": f.name, "kind": kind, "rows": len(norm), "note": ""})
+    return pf.combine_trades(frames), diags
+
+
+def _pf_money(v: float, currency: str) -> str:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "—"
+    return f"${v:,.2f}" if currency == "USD" else f"¥{v:,.0f}"
+
+
+def render_portfolio() -> None:
+    if pf is None:
+        st.error(tr("pf_module_missing"))
+        return
+    st.caption(tr("pf_intro"))
+
+    files = st.file_uploader(tr("pf_upload_label"), type=["csv"],
+                             accept_multiple_files=True, key="pf_files")
+
+    # --- session caching -----------------------------------------------------
+    # Reparse ONLY when the upload set changes. st.session_state survives reruns, so
+    # switching currency, searching, or clicking any button reuses these frames.
+    sig = _pf_signature(files)
+    if files and sig != st.session_state.get("pf_sig"):
+        with st.spinner(tr("pf_parsing")):
+            df, diags = _pf_load(files)
+        st.session_state["pf_sig"] = sig
+        st.session_state["pf_trades"] = df
+        st.session_state["pf_diags"] = diags
+    elif not files and st.session_state.get("pf_sig") and st.session_state.get("pf_clear_on_empty", True):
+        pass   # keep the last upload in memory after the widget is cleared
+
+    df = st.session_state.get("pf_trades")
+    if df is None or df.empty:
+        st.info(tr("pf_no_data"))
+        return
+
+    for d in st.session_state.get("pf_diags", []):
+        if d["kind"] == "—":
+            st.warning(f"{d['file']}: {d['note']}")
+    st.caption(tr("pf_loaded", files=len(st.session_state.get("pf_diags", [])),
+                  rows=len(df), symbols=int(df["symbol"].nunique())))
+
+    # --- currency toggle -----------------------------------------------------
+    currency = st.radio(tr("pf_currency"), ["JPY", "USD"], horizontal=True, key="pf_ccy")
+    val_col = "value_usd" if currency == "USD" else "value_jpy"
+
+    # --- needs review --------------------------------------------------------
+    sells = pf.recent_sells(df, limit=10)
+    if sells.empty:
+        st.success(tr("pf_no_sells"))
+    else:
+        st.warning(tr("pf_review_header", n=len(sells)))
+        rev = pd.DataFrame({
+            tr("col_date"): sells["date"].dt.strftime("%Y-%m-%d"),
+            tr("col_ticker"): sells["symbol"],
+            tr("col_company"): sells["name"],
+            tr("pf_col_qty"): sells["qty"],
+            tr("pf_col_value"): [_pf_money(v, currency) for v in sells[val_col]],
+        })
+        st.dataframe(rev, width="stretch", hide_index=True)
+        syms = [s for s in sells["symbol"].unique() if s]
+        rc = st.columns([1, 2])
+        if rc[0].button(tr("pf_send_to_sell"), key="pf_to_sell"):
+            # Prefill the Sell Scanner's paste box and jump there.
+            st.session_state["sell_paste"] = ", ".join(syms)
+            page = _PAGES.get("sell")
+            if page is not None:
+                st.switch_page(page)
+        rc[1].caption(tr("pf_review_note"))
+
+    # --- summary -------------------------------------------------------------
+    smry = pf.summary(df, currency)
+    mc = st.columns(4)
+    mc[0].markdown(metric_card(tr("pf_m_trades"), f"{smry['trades']:,}"), unsafe_allow_html=True)
+    mc[1].markdown(metric_card(tr("pf_m_symbols"), f"{smry['symbols']:,}"), unsafe_allow_html=True)
+    mc[2].markdown(metric_card(tr("pf_m_bought"), _pf_money(smry["buy_value"], currency)),
+                   unsafe_allow_html=True)
+    mc[3].markdown(metric_card(tr("pf_m_sold"), _pf_money(smry["sell_value"], currency)),
+                   unsafe_allow_html=True)
+    if smry["missing"]:
+        st.caption(tr("pf_missing_note", n=smry["missing"], ccy=currency))
+    st.caption(tr("pf_cashflow_note"))
+
+    # --- autocomplete search -------------------------------------------------
+    st.markdown(f"#### {tr('pf_search_header')}")
+    opts = pf.search_options(df)
+    picked = st.selectbox(tr("pf_search_label"), opts, index=None,
+                          placeholder=tr("pf_search_placeholder"), key="pf_search")
+    if picked:
+        sym = pf.option_to_symbol(picked, df)
+        rows = pf.trades_for(df, sym)
+        det = pd.DataFrame({
+            tr("col_date"): rows["date"].dt.strftime("%Y-%m-%d"),
+            tr("pf_col_side"): rows["side"],
+            tr("pf_col_qty"): rows["qty"],
+            tr("pf_col_price"): rows["price_local"],
+            tr("pf_col_value"): [("≈ " if est and currency == "JPY" else "") + _pf_money(v, currency)
+                                 for v, est in zip(rows[val_col], rows["jpy_estimated"])],
+            tr("pf_col_account"): rows["account"],
+        })
+        st.dataframe(det, width="stretch", hide_index=True)
+        net = pf.net_qty(df, sym)   # module owns the arithmetic (handles 入庫/出庫)
+        st.caption(tr("pf_net_qty", sym=sym, qty=f"{net:,.0f}"))
+        results = st.session_state.get("results") or []
+        if any(x.get("ticker") == sym for x in results):
+            if st.button(tr("pf_open_deep_dive"), key="pf_to_dd"):
+                st.session_state["deep_dive_pick"] = sym
+                page = _PAGES.get("deep_dive")
+                if page is not None:
+                    st.switch_page(page)
+        else:
+            st.caption(tr("pf_not_in_scan", sym=sym))
+
+    # --- full history --------------------------------------------------------
+    with st.expander(tr("pf_all_trades")):
+        allt = pd.DataFrame({
+            tr("col_date"): df["date"].dt.strftime("%Y-%m-%d"),
+            tr("col_ticker"): df["symbol"],
+            tr("col_company"): df["name"],
+            tr("pf_col_side"): df["side"],
+            tr("pf_col_qty"): df["qty"],
+            tr("pf_col_value"): [("≈ " if est and currency == "JPY" else "") + _pf_money(v, currency)
+                                 for v, est in zip(df[val_col], df["jpy_estimated"])],
+        })
+        st.dataframe(allt, width="stretch", hide_index=True)
+        st.caption(tr("pf_estimated_note"))
 
 
 def _build_navigation() -> "st.navigation":
@@ -3740,12 +3915,13 @@ def _build_navigation() -> "st.navigation":
         "us": st.Page(page_us, title=tr("tab_us"), url_path="us-conviction"),
         "audit": st.Page(page_audit, title=tr("tab_audit"), url_path="audit"),
         "sell": st.Page(page_sell, title=tr("tab_sell"), url_path="sell"),
+        "trades": st.Page(page_portfolio, title=tr("tab_trades"), url_path="my-trades"),
         "help": st.Page(page_help, title=tr("tab_help"), url_path="help"),
     }
     return st.navigation({
         tr("nav_scan"): [_PAGES["top"], _PAGES["regional"], _PAGES["category"], _PAGES["themes"]],
         tr("nav_research"): [_PAGES["deep_dive"], _PAGES["deep_scan"], _PAGES["us"]],
-        tr("nav_audit"): [_PAGES["audit"], _PAGES["sell"]],
+        tr("nav_audit"): [_PAGES["audit"], _PAGES["sell"], _PAGES["trades"]],
         tr("nav_info"): [_PAGES["help"]],
     })
 
@@ -3889,6 +4065,19 @@ def main() -> None:
     if _LAST_HYPE_FETCHED_AT:
         _msg = tr("hype_updated", ago=_ago(_LAST_HYPE_FETCHED_AT))
         st.caption(f"{_LAST_HYPE_STATUS} · {_msg}" if _LAST_HYPE_STATUS else _msg)
+
+    # App-wide "needs review" banner: once trades are loaded, unreviewed sells stay
+    # visible on every page (not just My Trades) until dismissed for the session.
+    _pf_df = st.session_state.get("pf_trades")
+    if (pf is not None and _pf_df is not None and not _pf_df.empty
+            and not st.session_state.get("pf_alert_dismissed")):
+        _n = len(pf.recent_sells(_pf_df, limit=50))
+        if _n:
+            _ac = st.columns([5, 1])
+            _ac[0].warning(tr("pf_banner", n=_n))
+            if _ac[1].button(tr("pf_banner_dismiss"), key="pf_dismiss"):
+                st.session_state["pf_alert_dismissed"] = True
+                st.rerun()
 
     # Render ONLY the selected page (lazy — the whole point of st.navigation).
     pg.run()

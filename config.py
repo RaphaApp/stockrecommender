@@ -148,8 +148,54 @@ CN_DEEP_TICKERS = [
     "300750.SZ", "002415.SZ", "000001.SZ", "600887.SS", "601012.SS", "600031.SS",
 ]
 
+# Europe deep universe (~145). PRIMARY listings only — the home exchange has the
+# deepest volume and the most reliable Yahoo history/fundamentals, which is what the
+# stage-1 volume-surge and ATR math depend on; German secondary lines (.DE/.SG) of
+# foreign names are often thin and gappy. All of these are tradeable via Tradegate /
+# Börse Stuttgart in EUR, so screening on the primary listing costs nothing in
+# executability. Names that redomiciled to US exchanges (CRH, Linde, Flutter,
+# Ferguson, Arm) are deliberately absent — their primary is no longer European.
+# NOTE: Yahoo quotes UK (.L) stocks in PENCE, so price/entry/target/stop for those
+# names are pence, not pounds (see deep_scan_gbp_note in TRANSLATIONS).
+EU_DEEP_TICKERS = [
+    # France
+    "MC.PA", "OR.PA", "RMS.PA", "TTE.PA", "SAN.PA", "AIR.PA", "SU.PA", "EL.PA",
+    "AI.PA", "BNP.PA", "CS.PA", "DG.PA", "KER.PA", "SAF.PA", "RI.PA", "CAP.PA",
+    "ORA.PA", "ACA.PA", "GLE.PA", "ML.PA", "LR.PA", "SGO.PA", "HO.PA", "DSY.PA",
+    "BN.PA", "VIE.PA",
+    # Germany
+    "SAP.DE", "SIE.DE", "ALV.DE", "DTE.DE", "MUV2.DE", "BAS.DE", "BAYN.DE", "BMW.DE",
+    "MBG.DE", "VOW3.DE", "DBK.DE", "DB1.DE", "IFX.DE", "ADS.DE", "MRK.DE", "RWE.DE",
+    "EOAN.DE", "HEN3.DE", "VNA.DE", "HEI.DE", "BEI.DE", "DHL.DE", "RHM.DE", "P911.DE",
+    "ENR.DE", "SHL.DE",
+    # Netherlands
+    "ASML.AS", "INGA.AS", "AD.AS", "PHIA.AS", "HEIA.AS", "WKL.AS", "DSFIR.AS",
+    "ASM.AS", "BESI.AS", "PRX.AS", "ADYEN.AS", "ABN.AS", "KPN.AS", "AKZA.AS",
+    # Italy
+    "ISP.MI", "UCG.MI", "ENI.MI", "ENEL.MI", "G.MI", "RACE.MI", "MONC.MI", "LDO.MI",
+    "TRN.MI", "SRG.MI", "CPR.MI", "MB.MI",
+    # Spain
+    "SAN.MC", "BBVA.MC", "ITX.MC", "IBE.MC", "REP.MC", "TEF.MC", "AENA.MC",
+    "CABK.MC", "AMS.MC", "ELE.MC",
+    # Switzerland
+    "NESN.SW", "ROG.SW", "NOVN.SW", "ZURN.SW", "UBSG.SW", "ABBN.SW", "CFR.SW",
+    "SIKA.SW", "LONN.SW", "GIVN.SW", "SREN.SW", "HOLN.SW", "ALC.SW", "GEBN.SW",
+    # United Kingdom (prices in pence — see note above)
+    "SHEL.L", "AZN.L", "HSBA.L", "ULVR.L", "BP.L", "GSK.L", "DGE.L", "RIO.L",
+    "BATS.L", "LSEG.L", "REL.L", "NG.L", "GLEN.L", "AAL.L", "VOD.L", "BARC.L",
+    "LLOY.L", "NWG.L", "PRU.L", "TSCO.L", "IMB.L", "CPG.L", "BA.L", "RR.L",
+    "SGE.L", "SSE.L",
+    # Nordics — curated only: excluded from the live screener because SEK/DKK/NOK are
+    # ~10x weaker than EUR, so a single EUR-scale market-cap floor would let small
+    # caps through. Curated membership keeps the quality bar without that distortion.
+    "NOVO-B.CO", "DSV.CO", "ORSTED.CO", "CARL-B.CO", "MAERSK-B.CO",
+    "VOLV-B.ST", "ATCO-A.ST", "ERIC-B.ST", "SAND.ST", "HEXA-B.ST", "ASSA-B.ST",
+    "EQNR.OL", "DNB.OL", "NHY.OL", "NOKIA.HE", "NESTE.HE", "SAMPO.HE",
+]
+
 # Region -> deep universe. Europe intentionally omitted (per request).
-DEEP_UNIVERSES = {"USA": DEEP_US_TICKERS, "Japan": JP_DEEP_TICKERS, "China": CN_DEEP_TICKERS}
+DEEP_UNIVERSES = {"USA": DEEP_US_TICKERS, "Japan": JP_DEEP_TICKERS,
+                  "China": CN_DEEP_TICKERS, "Europe": EU_DEEP_TICKERS}
 
 # ---------------------------------------------------------------------------
 # LIVE deep-universe refresh via Yahoo's screener (yfinance yf.screen)
@@ -165,6 +211,12 @@ DYNAMIC_UNIVERSE_SPEC = {
     "USA":   {"regions": ["us"],       "top_cap": 100, "movers": 25, "min_cap": 2_000_000_000},
     "Japan": {"regions": ["jp"],       "top_cap": 60,  "movers": 15, "min_cap": 300_000_000_000},
     "China": {"regions": ["hk", "cn"], "top_cap": 60,  "movers": 15, "min_cap": 20_000_000_000},
+    # Europe: only the EUR/GBP/CHF venues are screened live — those currencies are
+    # within ~20% of each other, so one 2bn floor is meaningful across them. Nordic
+    # exchanges (SEK/DKK/NOK) are covered by the curated list instead; including them
+    # here would apply an effectively ~10x lower real floor.
+    "Europe": {"regions": ["gb", "fr", "de", "nl", "it", "es", "ch"],
+               "top_cap": 80, "movers": 20, "min_cap": 2_000_000_000},
 }
 # Symbol suffixes accepted per market ("" = unsuffixed US listing). Anything else
 # the screener returns (warrants, odd venues) is dropped.
@@ -172,6 +224,7 @@ DYNAMIC_ALLOWED_SUFFIXES = {
     "USA": {""},
     "Japan": {".T"},
     "China": {".HK", ".SS", ".SZ"},
+    "Europe": {".L", ".PA", ".DE", ".AS", ".MI", ".MC", ".SW"},
 }
 
 # ---------------------------------------------------------------------------
@@ -454,6 +507,40 @@ TRANSLATIONS = {
         "themes_delta_note": "Δ Mom compares average momentum with the previous recorded full scan (quick scans aren't recorded, so deltas compare like with like). History lives in the local SQLite DB — on Streamlit Cloud it resets at every redeploy, so trends accumulate meaningfully when run locally.",
         "tab_deep_scan": "🔬 Deep Scan",
         "tab_help": "❓ Help",
+        "tab_trades": "💼 My Trades",
+        "pf_intro": "Upload your Rakuten trade-history CSVs (Shift-JIS is handled automatically). Files are parsed in memory for this session only — nothing is written to the database or sent anywhere.",
+        "pf_upload_label": "Rakuten trade history CSV(s) — JP and/or US, multiple files OK",
+        "pf_parsing": "Parsing trade history…",
+        "pf_module_missing": "portfolio.py is missing from the app folder — copy it next to app.py and reload.",
+        "pf_unknown_layout": "Unrecognised layout (no ティッカー or 銘柄コード column) — skipped.",
+        "pf_no_data": "No trades loaded yet. Upload one or more Rakuten CSV exports above.",
+        "pf_loaded": "{files} file(s) · {rows} trades · {symbols} instruments",
+        "pf_currency": "Currency",
+        "pf_no_sells": "✅ No sell transactions in the uploaded history — nothing to review.",
+        "pf_review_header": "⚠️ Needs review — {n} recent sell(s). Re-check the technicals before deciding whether to re-enter or stay out.",
+        "pf_review_note": "Sends these tickers to the Sell Scanner, which scores analyst, insider, technical and momentum signals for each.",
+        "pf_send_to_sell": "📉 Review in Sell Scanner",
+        "pf_banner": "⚠️ {n} sold position(s) awaiting review — open My Trades.",
+        "pf_banner_dismiss": "Dismiss",
+        "pf_m_trades": "Trades",
+        "pf_m_symbols": "Instruments",
+        "pf_m_bought": "Bought (gross)",
+        "pf_m_sold": "Sold (gross)",
+        "pf_cashflow_note": "Gross cash flows, not profit/loss: sells aren't matched to specific purchase lots and transferred-in shares (入庫) carry no cost basis.",
+        "pf_missing_note": "{n} row(s) have no {ccy} value — the JP export contains no FX rate, so yen-only trades can't be shown in USD. They're excluded from the totals above rather than converted at a guessed rate.",
+        "pf_estimated_note": "≈ marks a yen figure derived from 約定代金［USドル］ × 為替レート, because Rakuten reports 受渡金額［円］ as '-' on USD-settled trades.",
+        "pf_search_header": "Search your trades",
+        "pf_search_label": "Ticker or company — type to filter",
+        "pf_search_placeholder": "e.g. NVDA, or 3382",
+        "pf_col_side": "Side",
+        "pf_col_qty": "Qty",
+        "pf_col_price": "Price",
+        "pf_col_value": "Value",
+        "pf_col_account": "Account",
+        "pf_net_qty": "Net position in {sym}: {qty} shares — buys and transfers-in (入庫) minus sells and transfers-out, within the uploaded files only.",
+        "pf_open_deep_dive": "🔍 Open in Deep Dive",
+        "pf_not_in_scan": "{sym} isn't in the current scan results — run a scan covering it to see its factor breakdown.",
+        "pf_all_trades": "All trades",
         "hero_title": "⚡ Alpha Quant Engine",
         "hero_sub": "Scans US, Japanese, European and Chinese stocks, scores every name on six KPI factors (momentum, value, technical, hype, quality, theme) and turns the blend into BUY / HOLD / SELL calls. Run your first scan to populate every tab — the quick scan covers the top 10 names per region and takes about a minute.",
         "hero_btn": "⚡ Run quick scan",
@@ -480,7 +567,9 @@ TRANSLATIONS = {
         "deep_region_us": "🇺🇸 US (~215)",
         "deep_region_jp": "🇯🇵 Japan (~100)",
         "deep_region_cn": "🇨🇳 China (~85)",
-        "deep_scan_jpcn_note": "Japan/China run on yfinance only — Stooq's free fallback is US-only, so a Yahoo throttle here can thin the screen. Lists are curated (TSE / HK-weighted) and may include stale tickers; invalid ones are skipped.",
+        "deep_region_eu": "🇪🇺 Europe (~145)",
+        "deep_scan_gbp_note": "⚠️ UK (.L) names: Yahoo quotes London stocks in PENCE, so their price, entry zone, target and stop are in pence — divide by 100 for pounds. Scores and % returns are unaffected (all relative). Continental names are in their local currency (EUR/CHF/SEK/DKK/NOK); all are tradeable via Tradegate / Börse Stuttgart in EUR.",
+        "deep_scan_jpcn_note": "Non-US markets run on yfinance only — Stooq's free fallback and 13F smart-money data are US-only, so a Yahoo throttle here can thin the screen. Lists are curated primary listings and may include stale tickers; invalid ones are skipped.",
         "deep_scan_btn": "🔬 Run deep scan",
         "deep_scan_running": "Stage 1: bulk price screen across the deep list…",
         "deep_scan_scoring": "Stage 2: full scoring on the finalists…",
@@ -769,6 +858,40 @@ TRANSLATIONS = {
         "themes_delta_note": "Δモメンタムは前回記録されたフルスキャンとの平均モメンタム比較です（クイックスキャンは記録されないため、同条件同士の比較になります）。履歴はローカルのSQLite DBに保存され、Streamlit Cloudでは再デプロイごとにリセットされます。ローカル実行でこそトレンドが蓄積されます。",
         "tab_deep_scan": "🔬 ディープスキャン",
         "tab_help": "❓ ヘルプ",
+        "tab_trades": "💼 取引履歴",
+        "pf_intro": "楽天証券の取引履歴CSVをアップロードしてください（Shift-JISは自動処理）。ファイルはこのセッションのメモリ上でのみ解析され、データベースへの保存や外部送信は行いません。",
+        "pf_upload_label": "楽天証券 取引履歴CSV（国内株・米国株、複数可）",
+        "pf_parsing": "取引履歴を解析中…",
+        "pf_module_missing": "portfolio.py がアプリのフォルダにありません。app.py と同じ場所に配置して再読み込みしてください。",
+        "pf_unknown_layout": "レイアウトを判別できません（ティッカー／銘柄コード列なし）。スキップしました。",
+        "pf_no_data": "取引データがまだありません。上から楽天証券のCSVをアップロードしてください。",
+        "pf_loaded": "{files}ファイル · {rows}取引 · {symbols}銘柄",
+        "pf_currency": "通貨",
+        "pf_no_sells": "✅ 売付取引はありません。確認が必要な項目はありません。",
+        "pf_review_header": "⚠️ 要確認 — 直近の売付{n}件。再エントリーの是非を判断する前にテクニカルを再確認してください。",
+        "pf_review_note": "これらの銘柄を売却シグナルスキャナーに送り、アナリスト・インサイダー・テクニカル・モメンタムの各指標を評価します。",
+        "pf_send_to_sell": "📉 売却スキャナーで確認",
+        "pf_banner": "⚠️ 売却済み{n}件が未確認です。「取引履歴」ページを開いてください。",
+        "pf_banner_dismiss": "閉じる",
+        "pf_m_trades": "取引数",
+        "pf_m_symbols": "銘柄数",
+        "pf_m_bought": "買付合計",
+        "pf_m_sold": "売付合計",
+        "pf_cashflow_note": "損益ではなく総額のキャッシュフローです。売付と個別の買付ロットの対応付けは行っておらず、入庫株には取得原価がありません。",
+        "pf_missing_note": "{n}件は{ccy}建ての金額がありません。国内株CSVには為替レートが含まれないため、円建て取引は推定レートで換算せず合計から除外しています。",
+        "pf_estimated_note": "「≈」は 約定代金［USドル］×為替レート から算出した円価格です（米ドル決済の場合、楽天の受渡金額［円］は「-」のため）。",
+        "pf_search_header": "取引を検索",
+        "pf_search_label": "ティッカー・銘柄名（入力で絞り込み）",
+        "pf_search_placeholder": "例：NVDA、3382",
+        "pf_col_side": "売買",
+        "pf_col_qty": "数量",
+        "pf_col_price": "単価",
+        "pf_col_value": "金額",
+        "pf_col_account": "口座",
+        "pf_net_qty": "{sym} のネット保有：{qty}株（買付・入庫 −（売付・出庫）、アップロードしたファイル内のみ）。",
+        "pf_open_deep_dive": "🔍 詳細分析を開く",
+        "pf_not_in_scan": "{sym} は現在のスキャン結果に含まれていません。対象を含むスキャンを実行すると要因分解を表示できます。",
+        "pf_all_trades": "全取引",
         "hero_title": "⚡ Alpha Quant Engine",
         "hero_sub": "米国・日本・欧州・中国の株式をスキャンし、6つのKPIファクター（モメンタム・バリュー・テクニカル・ハイプ・クオリティ・テーマ）で採点、加重コンポジットから BUY / HOLD / SELL を判定します。まずはスキャンを実行してください。クイックスキャンは各地域の上位10銘柄が対象で、約1分で完了します。",
         "hero_btn": "⚡ クイックスキャンを実行",
@@ -795,7 +918,9 @@ TRANSLATIONS = {
         "deep_region_us": "🇺🇸 米国（約215）",
         "deep_region_jp": "🇯🇵 日本（約100）",
         "deep_region_cn": "🇨🇳 中国（約85）",
-        "deep_scan_jpcn_note": "日本・中国はyfinanceのみで動作します（Stooqの無料フォールバックは米国専用）。そのためレート制限を受けると対象が減ることがあります。リストは厳選（東証・香港中心）で古い銘柄を含む可能性があり、無効な銘柄はスキップされます。",
+        "deep_region_eu": "🇪🇺 欧州（約145）",
+        "deep_scan_gbp_note": "⚠️ 英国（.L）銘柄：Yahooはロンドン上場株を「ペンス」で表示するため、価格・エントリー帯・ターゲット・ストップはペンス単位です（100で割るとポンド）。スコアと騰落率は相対値なので影響ありません。大陸欧州銘柄は現地通貨（EUR/CHF/SEK/DKK/NOK）表示で、いずれもTradegate／シュツットガルト証券取引所でユーロ取引が可能です。",
+        "deep_scan_jpcn_note": "米国以外の市場はyfinanceのみで動作します（Stooqの無料フォールバックと13Fデータは米国専用）。レート制限を受けると対象が減ることがあります。リストは厳選した主要上場銘柄で、古い銘柄を含む可能性があり、無効な銘柄はスキップされます。",
         "deep_scan_btn": "🔬 ディープスキャン実行",
         "deep_scan_running": "ステージ1：ディープリストの一括価格スクリーニング…",
         "deep_scan_scoring": "ステージ2：ファイナリストの完全評価…",
