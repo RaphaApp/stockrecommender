@@ -244,3 +244,128 @@ def summary(df: pd.DataFrame, currency: str = "JPY") -> dict:
         "missing": int(vals.isna().sum()),
         "currency": currency.upper(),
     }
+
+
+def holdings(df: pd.DataFrame) -> pd.DataFrame:
+    """Positions still OPEN (net shares > 0) — the set a sell scanner is actually for.
+
+    avg_buy_price is the qty-weighted average of 買付 rows in the local currency. It is
+    NOT a lot-matched cost basis: transfers-in (入庫) have no purchase price and, after
+    a partial sale, which lots remain is unknown. Treat it as "what I paid on average",
+    not as a tax-grade basis.
+    """
+    pos = net_positions(df)
+    if pos.empty:
+        return pos
+    held = pos[pos["net_qty"] > 0].copy()
+    if held.empty:
+        return held
+    buys = df[df["side"] == SIDE_BUY]
+    avg, last = {}, {}
+    for sym, g in buys.groupby("symbol", sort=False):
+        q = g["qty"].fillna(0.0)
+        px = g["price_local"]
+        w = (px * q).sum(min_count=1)
+        avg[sym] = float(w / q.sum()) if q.sum() > 0 and pd.notna(w) else float("nan")
+    for sym, g in df.groupby("symbol", sort=False):
+        last[sym] = g["date"].max()
+    held["avg_buy_price"] = held["symbol"].map(avg)
+    held["last_trade"] = held["symbol"].map(last)
+    # invested = gross bought minus gross sold, in yen (available for every row because
+    # US yen values are derived from the FX rate when Rakuten omits them)
+    held["invested_jpy"] = held["bought_jpy"].fillna(0.0) - held["sold_jpy"].fillna(0.0)
+    held["invested_usd"] = held["bought_usd"].fillna(0.0) - held["sold_usd"].fillna(0.0)
+    return held.sort_values("invested_jpy", ascending=False).reset_index(drop=True)
+
+
+def closed_positions(df: pd.DataFrame) -> pd.DataFrame:
+    """Fully exited positions (net == 0 and at least one sell) — a re-entry watchlist,
+    not a sell-review queue: there is nothing left to sell."""
+    pos = net_positions(df)
+    if pos.empty:
+        return pos
+    sold = set(df.loc[df["side"] == SIDE_SELL, "symbol"])
+    out = pos[(pos["net_qty"] == 0) & (pos["symbol"].isin(sold))].copy()
+    if out.empty:
+        return out
+    last_sell = (df[df["side"] == SIDE_SELL].groupby("symbol")["date"].max())
+    out["exited"] = out["symbol"].map(last_sell)
+    return out.sort_values("exited", ascending=False).reset_index(drop=True)
+
+
+def incomplete_positions(df: pd.DataFrame) -> pd.DataFrame:
+    """Symbols whose net share count is NEGATIVE. This is not a short position — it
+    means the opening purchase happened before the uploaded export's date range, so
+    the history is partial. Surfaced rather than silently treated as a holding."""
+    pos = net_positions(df)
+    if pos.empty:
+        return pos
+    return pos[pos["net_qty"] < 0].reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Instrument index — searchable ticker / English name / Japanese name lookup
+# ---------------------------------------------------------------------------
+def instrument_index(names_en: dict | None = None, names_ja: dict | None = None,
+                     trades: pd.DataFrame | None = None,
+                     results: list | None = None) -> dict:
+    """Merge every name source into {ticker: {"en": str, "ja": str}}.
+
+    Priority is static-first, then live sources fill gaps rather than overwrite:
+      1. config.COMPANY_NAMES / config.INSTRUMENT_JA — the curated base.
+      2. An uploaded Rakuten CSV — 銘柄名 is Japanese for TSE rows and English for US
+         rows, so each row fills whichever side is missing.
+      3. Scan results — yfinance long names, English.
+
+    That means a Rakuten upload automatically extends the picker to every stock you
+    have ever traded, including names the app's universe has never heard of.
+    """
+    idx: dict[str, dict] = {}
+
+    def _put(ticker, en=None, ja=None, overwrite=False):
+        t = str(ticker or "").strip()
+        if not t or t.lower() == "nan":
+            return
+        cur = idx.setdefault(t, {"en": "", "ja": ""})
+        for k, v in (("en", en), ("ja", ja)):
+            v = str(v or "").strip()
+            if v and (overwrite or not cur[k]):
+                cur[k] = v
+
+    for t, n in (names_en or {}).items():
+        _put(t, en=n)
+    for t, n in (names_ja or {}).items():
+        _put(t, ja=n)
+
+    if trades is not None and not trades.empty:
+        for sym, nm, mkt in zip(trades["symbol"], trades["name"], trades["market"]):
+            # JP export names are Japanese; US export names are English.
+            _put(sym, ja=nm) if mkt == "JP" else _put(sym, en=nm)
+
+    for r in (results or []):
+        _put(r.get("ticker"), en=r.get("name"))
+
+    return idx
+
+
+def instrument_labels(index: dict) -> list[str]:
+    """Picker labels: 'AAPL — Apple Inc. / アップル'. Both names sit in the one string,
+    so Streamlit's built-in selectbox/multiselect filtering matches a ticker, an
+    English fragment or a Japanese fragment with no custom search code."""
+    labels = []
+    for t, n in (index or {}).items():
+        en, ja = n.get("en", ""), n.get("ja", "")
+        if en and ja and en != ja:
+            labels.append(f"{t} — {en} / {ja}")
+        elif en or ja:
+            labels.append(f"{t} — {en or ja}")
+        else:
+            labels.append(str(t))
+    return sorted(labels)
+
+
+def label_to_ticker(label: str) -> str | None:
+    """'AAPL — Apple Inc. / アップル' -> 'AAPL'."""
+    if not label:
+        return None
+    return str(label).split(" — ", 1)[0].strip() or None

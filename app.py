@@ -447,6 +447,12 @@ from config import (
 )
 # Deep-scan promotion settings (new). getattr-style fallback so an older config.py
 # without these blocks still runs — promotions just start empty with the 5/3/2 quota.
+# Japanese names for the instrument picker; empty dict on an older config.py (the
+# picker then shows English names only).
+try:
+    from config import INSTRUMENT_JA
+except ImportError:
+    INSTRUMENT_JA = {}
 try:
     from config import PROMOTED_TICKERS, PROMOTION_QUOTA
 except ImportError:
@@ -3500,10 +3506,37 @@ def render_sell_signals() -> None:
     st.caption(tr("sell_disclaimer"))
     st.caption(tr("sell_privacy_note"))
 
+    # Cross-page handoff (e.g. "Review holdings" on My Trades) arrives in a PLAIN
+    # session key, consumed here just before the widget is built. Writing straight to
+    # "sell_paste" from another page doesn't survive: with st.navigation the paste box
+    # isn't rendered while you're elsewhere, and Streamlit garbage-collects widget
+    # state for widgets that aren't on screen — which is why the autofill was lost.
+    _pre = st.session_state.pop("sell_prefill", None)
+    if _pre:
+        st.session_state["sell_paste"] = _pre
+
     pasted = st.text_area(tr("sell_paste_label"), key="sell_paste", placeholder="AAPL, MSFT, NVDA")
+
+    # Searchable instrument picker: type a ticker, an English name or a Japanese name.
+    # Options come from the curated tables plus every name your uploaded trade history
+    # or last scan introduced, so it covers stocks outside the app's universe too.
+    picked: list = []
+    if pf is not None:
+        _idx = pf.instrument_index(COMPANY_NAMES, INSTRUMENT_JA,
+                                   trades=st.session_state.get("pf_trades"),
+                                   results=st.session_state.get("results"))
+        if _idx:
+            _labels = pf.instrument_labels(_idx)
+            _chosen = st.multiselect(tr("sell_pick_label"), _labels, key="sell_picks",
+                                     placeholder=tr("sell_pick_placeholder"))
+            picked = [t for t in (pf.label_to_ticker(l) for l in _chosen) if t]
+            st.caption(tr("sell_pick_note", n=len(_labels)))
+
     uploaded = st.file_uploader(tr("sell_upload_label"), type=["csv"], key="sell_csv")
 
+    # Pasted text, picker choices and an uploaded CSV all feed the same list.
     tickers = _parse_portfolio_input(pasted, uploaded)
+    tickers = list(dict.fromkeys([t for t in (list(tickers) + picked) if t]))
     if tickers:
         # Stored in session_state only — never written to the SQLite DB — so each
         # user's portfolio stays private in a shared/multi-user deployment.
@@ -3818,29 +3851,62 @@ def render_portfolio() -> None:
     currency = st.radio(tr("pf_currency"), ["JPY", "USD"], horizontal=True, key="pf_ccy")
     val_col = "value_usd" if currency == "USD" else "value_jpy"
 
-    # --- needs review --------------------------------------------------------
-    sells = pf.recent_sells(df, limit=10)
-    if sells.empty:
-        st.success(tr("pf_no_sells"))
+    # --- OPEN POSITIONS: the real sell-review queue ---------------------------
+    # The Sell Scanner answers "should I exit this?", which only applies to something
+    # still held — so holdings drive this panel. Closed trades are a re-entry (buy-side)
+    # question and live in the expander below, pointed at the Deep Dive instead.
+    held = pf.holdings(df)
+    if held.empty:
+        st.info(tr("pf_no_holdings"))
     else:
-        st.warning(tr("pf_review_header", n=len(sells)))
-        rev = pd.DataFrame({
-            tr("col_date"): sells["date"].dt.strftime("%Y-%m-%d"),
-            tr("col_ticker"): sells["symbol"],
-            tr("col_company"): sells["name"],
-            tr("pf_col_qty"): sells["qty"],
-            tr("pf_col_value"): [_pf_money(v, currency) for v in sells[val_col]],
+        st.warning(tr("pf_holdings_header", n=len(held)))
+        inv_col = "invested_usd" if currency == "USD" else "invested_jpy"
+        hv = pd.DataFrame({
+            tr("col_ticker"): held["symbol"],
+            tr("col_company"): held["name"],
+            tr("pf_col_net_qty"): held["net_qty"],
+            tr("pf_col_avg_buy"): [
+                ("—" if math.isnan(p) else (f"${p:,.2f}" if mk == "US" else f"¥{p:,.1f}"))
+                for p, mk in zip(held["avg_buy_price"], held["market"])],
+            tr("pf_col_invested"): [_pf_money(v, currency) for v in held[inv_col]],
+            tr("pf_col_last"): held["last_trade"].dt.strftime("%Y-%m-%d"),
         })
-        st.dataframe(rev, width="stretch", hide_index=True)
-        syms = [s for s in sells["symbol"].unique() if s]
-        rc = st.columns([1, 2])
-        if rc[0].button(tr("pf_send_to_sell"), key="pf_to_sell"):
-            # Prefill the Sell Scanner's paste box and jump there.
-            st.session_state["sell_paste"] = ", ".join(syms)
+        st.dataframe(hv, width="stretch", hide_index=True)
+        st.caption(tr("pf_avg_buy_note"))
+
+        # Trim before sending: the Sell Scanner does per-ticker analyst/insider fetches,
+        # so firing all 38 at once is slow and invites Yahoo throttling.
+        all_syms = [x for x in held["symbol"].tolist() if x]
+        chosen = st.multiselect(tr("pf_select_holdings"), all_syms, default=all_syms[:10],
+                                key="pf_hold_pick")
+        hc = st.columns([1, 2])
+        if hc[0].button(tr("pf_send_holdings"), key="pf_to_sell", disabled=not chosen):
+            st.session_state["sell_prefill"] = ", ".join(chosen)
             page = _PAGES.get("sell")
             if page is not None:
                 st.switch_page(page)
-        rc[1].caption(tr("pf_review_note"))
+        hc[1].caption(tr("pf_holdings_note", n=len(chosen)))
+
+    # --- partial history warning ---------------------------------------------
+    inc = pf.incomplete_positions(df)
+    if not inc.empty:
+        st.caption(tr("pf_incomplete_note",
+                      syms=", ".join(f"{r.symbol} ({r.net_qty:+.0f})" for r in inc.itertuples())))
+
+    # --- closed positions: re-entry watchlist, NOT a sell queue ---------------
+    closed = pf.closed_positions(df)
+    if not closed.empty:
+        with st.expander(tr("pf_closed_header", n=len(closed))):
+            cv = pd.DataFrame({
+                tr("pf_col_exited"): closed["exited"].dt.strftime("%Y-%m-%d"),
+                tr("col_ticker"): closed["symbol"],
+                tr("col_company"): closed["name"],
+                tr("pf_col_sold_value"): [_pf_money(v, currency) for v in
+                                          (closed["sold_usd"] if currency == "USD"
+                                           else closed["sold_jpy"])],
+            })
+            st.dataframe(cv, width="stretch", hide_index=True)
+            st.caption(tr("pf_closed_note"))
 
     # --- summary -------------------------------------------------------------
     smry = pf.summary(df, currency)
@@ -4071,7 +4137,7 @@ def main() -> None:
     _pf_df = st.session_state.get("pf_trades")
     if (pf is not None and _pf_df is not None and not _pf_df.empty
             and not st.session_state.get("pf_alert_dismissed")):
-        _n = len(pf.recent_sells(_pf_df, limit=50))
+        _n = len(pf.holdings(_pf_df))
         if _n:
             _ac = st.columns([5, 1])
             _ac[0].warning(tr("pf_banner", n=_n))

@@ -184,3 +184,102 @@ def test_net_qty_transfer_in_is_not_a_sale():
     df = combine_trades([normalize_trades(_read(JP_CSV))])
     assert net_qty(df, "3382.T") == pytest.approx(300.0)
     assert net_qty(df, "NOPE") == 0.0
+
+
+# ------------------------------------------------------- holdings vs closed vs gaps
+ROUNDTRIP_CSV = (
+    "約定日,受渡日,ティッカー,銘柄名,口座,取引区分,売買区分,信用区分,弁済期限,決済通貨,"
+    "数量［株］,単価［USドル］,約定代金［USドル］,為替レート,手数料［USドル］,税金［USドル］,"
+    "受渡金額［USドル］,受渡金額［円］\n"
+    '"2025/1/10","2025/1/14","XYZ","XYZ CORP","特定","現物","買付","-","-","米ドル",'
+    '"10","100.0000","1,000.00","150.000","0.00","0.00","1,000.00","-"\n'
+    '"2025/6/10","2025/6/12","XYZ","XYZ CORP","特定","現物","売付","-","-","米ドル",'
+    '"10","120.0000","1,200.00","155.000","0.00","0.00","1,200.00","-"\n'
+    '"2025/2/10","2025/2/12","HOLD","HOLD CORP","特定","現物","買付","-","-","米ドル",'
+    '"4","50.0000","200.00","150.000","0.00","0.00","200.00","-"\n'
+    '"2025/3/10","2025/3/12","HOLD","HOLD CORP","特定","現物","買付","-","-","米ドル",'
+    '"6","100.0000","600.00","150.000","0.00","0.00","600.00","-"\n'
+)
+
+
+def _combined():
+    from portfolio import normalize_trades
+    return combine_trades([normalize_trades(_read(US_CSV)),
+                           normalize_trades(_read(JP_CSV)),
+                           normalize_trades(_read(ROUNDTRIP_CSV))])
+
+
+def test_holdings_only_open_positions():
+    from portfolio import holdings
+    h = holdings(_combined()).set_index("symbol")
+    # open: JPM (bought 2), 3382.T (100 bought + 200 transferred in), HOLD (4+6)
+    assert set(h.index) == {"JPM", "3382.T", "HOLD"}
+    assert h.loc["3382.T", "net_qty"] == 300.0
+    # XYZ was bought AND fully sold -> not a holding
+    assert "XYZ" not in h.index
+    # BAC has a sell with no matching buy in the file -> negative, not a holding
+    assert "BAC" not in h.index
+
+
+def test_holdings_avg_buy_is_qty_weighted():
+    from portfolio import holdings
+    h = holdings(_combined()).set_index("symbol")
+    # HOLD: 4 @ $50 + 6 @ $100 -> (200+600)/10 = $80, not the $75 simple mean
+    assert h.loc["HOLD", "avg_buy_price"] == pytest.approx(80.0)
+
+
+def test_closed_positions_are_the_reentry_list():
+    from portfolio import closed_positions
+    c = closed_positions(_combined())
+    assert list(c["symbol"]) == ["XYZ"]        # net 0 AND had a sell
+    assert pd.notna(c.iloc[0]["exited"])
+
+
+def test_incomplete_positions_flags_negative_net():
+    from portfolio import incomplete_positions
+    inc = incomplete_positions(_combined())
+    assert list(inc["symbol"]) == ["BAC"] and inc.iloc[0]["net_qty"] == -15.0
+
+
+def test_holdings_empty_frame_is_safe():
+    from portfolio import holdings, closed_positions, incomplete_positions
+    empty = pd.DataFrame()
+    assert holdings(empty).empty
+    assert closed_positions(empty).empty
+    assert incomplete_positions(empty).empty
+
+
+# ------------------------------------------------------- instrument index / search
+def test_instrument_index_merges_sources_without_overwriting_base():
+    from portfolio import instrument_index, normalize_trades
+    trades = normalize_trades(_read(JP_CSV))          # JP names are Japanese
+    idx = instrument_index({"AAPL": "Apple"}, {"AAPL": "アップル"},
+                           trades=trades, results=[{"ticker": "MSFT", "name": "Microsoft"}])
+    assert idx["AAPL"] == {"en": "Apple", "ja": "アップル"}   # curated base intact
+    assert idx["3382.T"]["ja"].startswith("セブン")            # from the JP CSV
+    assert idx["MSFT"]["en"] == "Microsoft"                    # from scan results
+    # a US CSV name fills the ENGLISH side, not the Japanese one
+    idx2 = instrument_index({}, {}, trades=normalize_trades(_read(US_CSV)))
+    assert idx2["BAC"]["en"] == "BANK OF AMERICA" and idx2["BAC"]["ja"] == ""
+
+
+def test_instrument_labels_and_reverse():
+    from portfolio import instrument_labels, label_to_ticker
+    idx = {"AAPL": {"en": "Apple", "ja": "アップル"},
+           "GILD": {"en": "Gilead", "ja": ""},
+           "9999.T": {"en": "", "ja": "テスト社"}}
+    labels = instrument_labels(idx)
+    assert "AAPL — Apple / アップル" in labels
+    assert "GILD — Gilead" in labels                  # no JA -> English only
+    assert "9999.T — テスト社" in labels               # no EN -> Japanese only
+    for l in labels:                                   # round-trips for every label
+        assert label_to_ticker(l) in idx
+    assert label_to_ticker("") is None
+
+
+def test_instrument_labels_searchable_by_all_three_fields():
+    # this is what makes Streamlit's built-in filtering act as tri-lingual autocomplete
+    from portfolio import instrument_labels
+    labels = instrument_labels({"NVDA": {"en": "Nvidia", "ja": "エヌビディア"}})
+    for query in ("NVDA", "nvidia", "エヌビ"):
+        assert any(query.lower() in l.lower() for l in labels), query
