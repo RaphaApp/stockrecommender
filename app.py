@@ -456,8 +456,8 @@ except ImportError:
 try:
     from config import PROMOTED_TICKERS, PROMOTION_QUOTA
 except ImportError:
-    PROMOTED_TICKERS = {"USA": [], "Japan": [], "China": []}
-    PROMOTION_QUOTA = {"USA": 5, "Japan": 3, "China": 2}
+    PROMOTED_TICKERS = {"USA": [], "Japan": [], "Europe": [], "China": []}
+    PROMOTION_QUOTA = {"USA": 8, "Japan": 5, "Europe": 5, "China": 3}
 # Live-universe + theme-bridge settings (new); fallbacks keep an older config.py running.
 try:
     from config import DYNAMIC_UNIVERSE_SPEC, DYNAMIC_ALLOWED_SUFFIXES, THEME_INDUSTRY_KEYWORDS
@@ -972,7 +972,7 @@ def get_recommendations() -> pd.DataFrame:
 
 # ----------------------------------------------------------------------------
 # Deep-scan promotions — a small rotating layer of deep-scan winners that rides
-# along with the standard TICKER_UNIVERSE on every main scan (quota: US 5 / JP 3 /
+# along with the standard TICKER_UNIVERSE on every main scan (quota: PROMOTION_QUOTA,
 # CN 2). Two layers, merged: the SQLite table (written by the Deep Scan tab's
 # Promote button; ephemeral on Streamlit Cloud) takes priority, then the
 # PROMOTED_TICKERS block in config.py (the persistent, hand-pasted layer). Names
@@ -2254,7 +2254,7 @@ def run_engine(limit_per_region: int | None = None,
     # Only scan the regions the user selected (defaults to all). On a quick scan,
     # also cap to the first N tickers per region — fewer requests means a faster
     # run and a much lower chance of Yahoo rate-limiting the server's IP.
-    # Promoted deep-scan names (US 5 / JP 3 / CN 2 max) ride along AFTER the cap,
+    # Promoted deep-scan names (PROMOTION_QUOTA per market) ride along AFTER the cap,
     # so even a quick scan always covers the current promotion layer.
     selected = regions if regions else list(TICKER_UNIVERSE.keys())
     promoted_map = get_promoted_universe()
@@ -2799,7 +2799,7 @@ def render_deep_scan() -> None:
                  width="stretch", hide_index=True)
     st.caption(tr("deep_scan_note"))
 
-    # Promote this market's best finalists (US 5 / JP 3 / CN 2) into the main scan.
+    # Promote this market's best finalists (PROMOTION_QUOTA per market) into the main scan.
     # Ranked by composite; names already in the base TICKER_UNIVERSE are skipped so
     # promotion never double-scans a name. Replaces this region's previous
     # promotions — re-running deep scans naturally rotates the layer.
@@ -3657,12 +3657,19 @@ get nudged **up**; factors that scored highly on *losers* get nudged **down** �
 factor ever dies completely. The **Systems Audit** tab charts the weight evolution and win rate.
 The new Theme factor starts small (12%) and must earn a bigger weight through this loop."""),
         ("🔬 Deep Scan & promotions",
-         """The Deep Scan is a two-stage funnel per market. **Stage 1** downloads prices for a few hundred
-names in one bulk request and ranks them on a pure price screen (momentum blend, volume surge,
-52-week-high proximity, with a falling-knife cap). **Stage 2** runs full fundamental scoring on the
-top finalists only. The best finalists can be **promoted** (US 5 / JP 3 / CN 2) into your main daily
-scan; promotions rotate each time you re-run and promote. On cloud deployments the promotion table
-resets on redeploy — paste the offered `PROMOTED_TICKERS` snippet into `config.py` to make it stick."""),
+         """The Deep Scan is a two-stage funnel, available for **four markets**: US (~215 names),
+Europe (~145), Japan (~97) and China (~84). **Stage 1** downloads prices for the whole list in one
+bulk request and ranks them on a pure price screen (momentum blend, volume surge, 52-week-high
+proximity, with a falling-knife cap). **Stage 2** runs full fundamental scoring on the top 25
+finalists only, which is what keeps the request count bounded. Each market's list is curated primary
+listings and can be refreshed from Yahoo's live screener with the 🔄 button.
+
+The best finalists can be **promoted** into your main daily scan — up to **US 8 / Europe 5 / JP 5 /
+CN 3**. Promoted names ride along on every scan (including Quick scans), show a ⭐ in the tables, and
+rotate each time you re-run and promote. They are the data-driven counterweight to the fixed
+universe, which stays deliberately stable because most of its names are the constituents the Themes
+baskets are measured on. On cloud deployments the promotion table resets on redeploy — paste the
+offered `PROMOTED_TICKERS` snippet into `config.py` to make it stick."""),
         ("📡 Data sources & limitations",
          """Prices and fundamentals come from **Yahoo Finance** (with a free Stooq fallback for US names and
 an optional FMP key for fundamentals). Sentiment comes from **Reddit**, **GDELT news**, and the
@@ -3708,11 +3715,17 @@ Yahoo!掲示板「みんなの評価」（日本株）・踏み上げ（ショ�
 ます（下限付き）。**システム監査**タブで重みの推移と勝率を確認できます。新設のテーマファクターは
 12%の小さな重みから始まり、このループで実力に応じて調整されます。"""),
         ("🔬 ディープスキャンとプロモート",
-         """市場ごとの2段階ファネルです。**ステージ1**は数百銘柄の株価を一括取得し、価格スクリーン
-（モメンタムブレンド・出来高サージ・52週高値近接度・急落キャップ）でランク付け。**ステージ2**は
-上位ファイナリストのみファンダメンタルズを含むフル採点を行います。最上位は（米5・日3・中2の枠で）
-メインスキャンに**プロモート**でき、再実行のたびに入れ替わります。クラウド環境では再デプロイで
-プロモートが消えるため、表示される `PROMOTED_TICKERS` スニペットを `config.py` に貼り付けると永続化できます。"""),
+         """**4市場**（米国 約215銘柄・欧州 約145・日本 約97・中国 約84）に対応した2段階ファネルです。
+**ステージ1**はリスト全体の株価を一括取得し、価格スクリーン（モメンタムブレンド・出来高サージ・
+52週高値近接度・急落キャップ）でランク付け。**ステージ2**は上位25銘柄のみファンダメンタルズを含む
+フル採点を行い、これにより通信量を抑えています。各市場のリストは厳選した主要上場銘柄で、🔄ボタンで
+Yahooのスクリーナーから最新銘柄を取り込めます。
+
+上位ファイナリストは**米8・欧州5・日5・中3**の枠でメインスキャンに**プロモート**できます。
+プロモート銘柄はクイックスキャンを含む毎回のスキャンに同乗し、表では⭐が付き、再実行のたびに
+入れ替わります。固定ユニバースはテーマ分析の構成銘柄でもあるため意図的に安定させており、
+プロモート枠がその対となる「データ駆動」の層です。クラウド環境では再デプロイでプロモートが消えるため、
+表示される `PROMOTED_TICKERS` スニペットを `config.py` に貼り付けると永続化できます。"""),
         ("📡 データソースと制限",
          """株価・ファンダメンタルズは **Yahoo Finance**（米国株はStooqフォールバック、任意でFMP APIキー）、
 センチメントは **Reddit**・**GDELTニュース**・日本株は **Yahoo!掲示板「みんなの評価」** を利用します。
@@ -3874,11 +3887,24 @@ def render_portfolio() -> None:
         st.dataframe(hv, width="stretch", hide_index=True)
         st.caption(tr("pf_avg_buy_note"))
 
-        # Trim before sending: the Sell Scanner does per-ticker analyst/insider fetches,
-        # so firing all 38 at once is slow and invites Yahoo throttling.
+        # How many to review. The Sell Scanner spends ~3 cached Yahoo requests per name
+        # (fundamentals + analyst + insider; a 4th for .T names' 掲示板 poll) and paces
+        # ~0.55s each on a cold cache — price history is bulk-fetched once for the whole
+        # list, so it costs nothing per name. There is no hard technical limit: the
+        # slider just makes that cost visible instead of hiding it behind a default.
         all_syms = [x for x in held["symbol"].tolist() if x]
-        chosen = st.multiselect(tr("pf_select_holdings"), all_syms, default=all_syms[:10],
-                                key="pf_hold_pick")
+        n_default = min(20, len(all_syms))
+        top_n = st.slider(tr("pf_review_count"), 1, max(1, len(all_syms)), n_default,
+                          key="pf_hold_n") if len(all_syms) > 1 else len(all_syms)
+        manual = st.multiselect(tr("pf_select_holdings"), all_syms, default=[],
+                                key="pf_hold_pick", placeholder=tr("pf_select_placeholder"))
+        chosen = manual or all_syms[:top_n]     # a manual pick overrides the slider
+
+        jp_n = sum(1 for t in chosen if t.endswith(".T"))
+        reqs = 3 * len(chosen) + jp_n
+        secs = 0.55 * len(chosen) + 0.25 * jp_n
+        st.caption(tr("pf_cost_estimate", n=len(chosen), reqs=reqs, secs=f"{secs:.0f}"))
+
         hc = st.columns([1, 2])
         if hc[0].button(tr("pf_send_holdings"), key="pf_to_sell", disabled=not chosen):
             st.session_state["sell_prefill"] = ", ".join(chosen)

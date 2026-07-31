@@ -270,7 +270,14 @@ THEME_INDUSTRY_KEYWORDS = [
 # ---------------------------------------------------------------------------
 # How many deep-scan winners per market may ride along with the standard
 # TICKER_UNIVERSE on every main scan (US 5 / Japan 3 / China 2 = +10 max).
-PROMOTION_QUOTA = {"USA": 5, "Japan": 3, "China": 2}
+# How many deep-scan finalists may ride along in the main scan, per market. Raised
+# from 5/3/2 and extended to Europe (whose deep scan previously had NO promote button,
+# because the button only renders when a market has a quota). The fixed universe is
+# mostly THEMES scaffolding — 62 of its 80 names are theme members, so it can't shrink
+# much without thinning the Themes tab; growing this data-driven layer is the better
+# lever. Promoted names ride along even on a Quick scan, so each slot costs ~2 Yahoo
+# requests per scan.
+PROMOTION_QUOTA = {"USA": 8, "Japan": 5, "Europe": 5, "China": 3}
 
 # The PERSISTENT layer of promoted tickers. The Deep Scan tab's "Promote" button
 # writes promotions into the local SQLite DB, which Streamlit Cloud wipes on every
@@ -280,6 +287,7 @@ PROMOTION_QUOTA = {"USA": 5, "Japan": 3, "China": 2}
 PROMOTED_TICKERS = {
     "USA": [],
     "Japan": [],
+    "Europe": [],
     "China": [],
 }
 
@@ -567,7 +575,10 @@ TRANSLATIONS = {
         "pf_currency": "Currency",
         "pf_no_holdings": "No open positions in the uploaded history — every traded name is fully closed.",
         "pf_holdings_header": "📌 Review your open positions — {n} still held. These are what the Sell Scanner can act on.",
-        "pf_holdings_note": "Sends {n} ticker(s) to the Sell Scanner, which scores analyst, insider, technical, momentum and short-interest signals for each. Each name costs a few Yahoo requests, so trim the list if it gets throttled.",
+        "pf_holdings_note": "Sends {n} ticker(s) to the Sell Scanner, which scores analyst, insider, technical, momentum and short-interest signals for each.",
+        "pf_review_count": "How many positions to review (largest first)",
+        "pf_select_placeholder": "Leave empty to use the slider, or pick specific names",
+        "pf_cost_estimate": "{n} name(s) ≈ {reqs} Yahoo requests, ~{secs}s on a cold cache (results are cached 30 min, so a re-run is instant). Running locally this is comfortable; on Streamlit Cloud's shared IP, large batches are likelier to be throttled.",
         "pf_send_holdings": "📉 Review holdings in Sell Scanner",
         "pf_banner": "📌 {n} open position(s) loaded — review them for exit signals in My Trades.",
         "pf_banner_dismiss": "Dismiss",
@@ -932,7 +943,10 @@ TRANSLATIONS = {
         "pf_currency": "通貨",
         "pf_no_holdings": "保有中のポジションはありません（すべて決済済み）。",
         "pf_holdings_header": "📌 保有ポジションの確認 — {n}銘柄を保有中。売却スキャナーで判断できるのはこれらです。",
-        "pf_holdings_note": "{n}銘柄を売却スキャナーに送り、アナリスト・インサイダー・テクニカル・モメンタム・空売り比率を評価します。1銘柄ごとにYahooへの通信が発生するため、制限がかかる場合は絞ってください。",
+        "pf_holdings_note": "{n}銘柄を売却スキャナーに送り、アナリスト・インサイダー・テクニカル・モメンタム・空売り比率を評価します。",
+        "pf_review_count": "確認するポジション数（投資額の大きい順）",
+        "pf_select_placeholder": "空欄ならスライダーの件数を使用。個別指定も可能です",
+        "pf_cost_estimate": "{n}銘柄 ≈ Yahooへの通信{reqs}回、初回約{secs}秒（結果は30分キャッシュされ再実行は即時）。ローカル実行なら余裕がありますが、Streamlit Cloudの共有IPでは大量実行時に制限がかかりやすくなります。",
         "pf_send_holdings": "📉 保有銘柄を売却スキャナーで確認",
         "pf_banner": "📌 保有{n}銘柄を読み込みました。「取引履歴」ページで売却シグナルを確認できます。",
         "pf_banner_dismiss": "閉じる",
