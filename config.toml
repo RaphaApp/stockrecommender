@@ -1,11 +1,13 @@
-# Optional but recommended. Commit this alongside app.py (in a .streamlit/ folder).
+# Streamlit's own chrome (widgets, menus, tables) is themed here so it matches the
+# design system injected in app.inject_css — otherwise the framework's default blue
+# and font fight the 藍/paper palette. Edit here and in inject_css together.
 [theme]
-base = "dark"
-primaryColor = "#3b82f6"
+base = "light"
+primaryColor = "#1B4D8F"          # 藍 indigo — interaction only
+backgroundColor = "#F6F7F9"       # paper ground
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#101A2B"             # ink
+font = "sans serif"
 
 [server]
-# Keep reruns snappy on the 1 GB free tier.
-runOnSave = false
-
-[browser]
-gatherUsageStats = false
+headless = true

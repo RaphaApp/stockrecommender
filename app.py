@@ -524,52 +524,155 @@ st.set_page_config(
 # ----------------------------------------------------------------------------
 # Styling & UI Engine
 # ----------------------------------------------------------------------------
-def inject_css(accent: str = "#3b82f6", card_bg: str = "rgba(255,255,255,0.03)") -> None:
+def inject_css(accent: str = "#1B4D8F", card_bg: str = "#FFFFFF") -> None:
+    """Design system: 藍 (ai / indigo) & paper.
+
+    Direction notes, so future edits stay coherent:
+      * This is a *numbers instrument*, not a consumer dashboard — so the display
+        role is carried by tabular monospace figures at size, not by a decorative
+        heading face. Digits align down every column; that alignment is the design.
+      * Type: IBM Plex Sans (Latin UI) + IBM Plex Mono (all figures), webfonts, and
+        the OS Japanese face for kanji/kana. Loading Plex Sans JP as a webfont was
+        the purer pairing but the wrong trade on a phone: CJK families run to
+        megabytes, and this app is read on mobile, sometimes behind a corporate
+        proxy that may block fonts.googleapis.com. Hiragino (iOS/macOS), Noto Sans
+        CJK (Android) and Yu Gothic (Windows) are all high-quality humanist gothics
+        that pair cleanly with Plex, cost nothing to fetch, and render instantly.
+        Net effect: only ~2 small Latin webfonts travel the wire, and if they're
+        blocked entirely the design degrades to the system stack, not to nothing.
+      * Accent is 藍 indigo (#1B4D8F), a nod to where this tool is used, kept for
+        interaction only. Gains/losses use jade/rose so a signal never competes with
+        the brand colour for attention.
+      * Restraint: hairline rules instead of shadows, 6px radii instead of pills,
+        one 120ms colour transition, motion disabled under prefers-reduced-motion.
+    """
     st.markdown(
         f"""
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
         :root {{
             --accent: {accent};
-            --card-bg: {card_bg};
-            --pos: #16a34a;
-            --neg: #dc2626;
-            --muted: #94a3b8;
+            --accent-deep: #12356A;
+            --accent-tint: #EAF0F9;
+            --ink: #101A2B;
+            --ink-2: #1E2C43;
+            --paper: #F6F7F9;
+            --surface: {card_bg};
+            --rule: #E2E6ED;
+            --muted: #67717F;
+            --pos: #0F7B5A;
+            --neg: #B3283C;
+            --warn: #A96A05;
+            /* Latin glyphs resolve to Plex; Japanese glyphs aren't in the Latin subset,
+               so they fall through to the OS face — Hiragino on iOS/macOS, Noto Sans
+               CJK on Android, Yu Gothic/Meiryo on Windows. All three are neutral
+               humanist gothics that sit correctly beside Plex, and none of them costs
+               a download. */
+            --font-ui: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont,
+                       'Hiragino Kaku Gothic ProN','Hiragino Sans','Noto Sans CJK JP',
+                       'Noto Sans JP','Yu Gothic','Meiryo','Segoe UI', sans-serif;
+            --font-num: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo,
+                        'Hiragino Kaku Gothic ProN','Noto Sans CJK JP', monospace;
         }}
-        /* Clear Streamlit's fixed top toolbar so the tab bar below the header
-           doesn't slide underneath it. The previous 1.4rem was too tight. */
+        html, body, [class*="css"], .stApp {{ font-family: var(--font-ui); color: var(--ink); }}
+        .stApp {{ background: var(--paper); }}
+
+        /* Clear Streamlit's fixed top toolbar so content doesn't slide underneath. */
         .block-container,
         [data-testid="stMainBlockContainer"] {{ padding-top: 3.75rem; padding-bottom: 3rem; }}
-        .qc-card {{
-            background: var(--card-bg);
-            border: 1px solid rgba(148,163,184,0.18);
-            border-radius: 16px;
-            padding: 16px 18px;
-            margin-bottom: 14px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.10);
-            transition: transform .12s ease, border-color .12s ease;
+
+        h1, h2, h3, h4 {{ font-family: var(--font-ui); letter-spacing: -0.015em; color: var(--ink); }}
+        h3 {{ font-size: 1.15rem; font-weight: 600; }}
+        h4 {{ font-size: 1rem; font-weight: 600; }}
+
+        /* ---- signature: 株価ボード status strip -------------------------------
+           A market board reads left to right in fixed fields. Each cell here is a
+           real piece of engine state (universe size, scan depth, holdings, feed),
+           so the strip informs rather than decorates. */
+        .qc-board {{
+            display: flex; flex-wrap: wrap; align-items: stretch;
+            background: var(--ink); border-radius: 6px; overflow: hidden;
+            border-left: 4px solid var(--accent); margin: 0 0 18px 0;
         }}
-        .qc-card:hover {{ transform: translateY(-2px); border-color: var(--accent); }}
-        .qc-label {{ font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }}
-        .qc-value {{ font-size: 1.55rem; font-weight: 700; line-height: 1.15; margin-top: 2px; }}
-        .qc-delta {{ font-size: 0.9rem; font-weight: 600; margin-top: 2px; }}
+        .qc-board-cell {{ padding: 9px 16px; border-right: 1px solid rgba(255,255,255,0.08); }}
+        .qc-board-cell:last-child {{ border-right: 0; }}
+        .qc-board-k {{
+            font-family: var(--font-num); font-size: 0.62rem; font-weight: 500;
+            letter-spacing: .14em; text-transform: uppercase; color: #8FA3BF;
+        }}
+        .qc-board-v {{
+            font-family: var(--font-num); font-size: 0.95rem; font-weight: 600;
+            color: #FFFFFF; font-variant-numeric: tabular-nums; margin-top: 2px;
+        }}
+        .qc-board-v.dim {{ color: #6F82A0; }}
+
+        /* ---- cards: instrument panels, not consumer tiles ---- */
+        .qc-card {{
+            background: var(--surface);
+            border: 1px solid var(--rule);
+            border-radius: 6px;
+            padding: 14px 16px;
+            margin-bottom: 12px;
+            transition: border-color .12s ease;
+        }}
+        .qc-card:hover {{ border-color: var(--accent); }}
+        .qc-label {{
+            font-family: var(--font-num); font-size: 0.66rem; font-weight: 500;
+            color: var(--muted); text-transform: uppercase; letter-spacing: .12em;
+        }}
+        .qc-value {{
+            font-family: var(--font-num); font-size: 1.6rem; font-weight: 600;
+            font-variant-numeric: tabular-nums; line-height: 1.1; margin-top: 4px;
+            color: var(--ink); letter-spacing: -0.02em;
+        }}
+        .qc-delta {{
+            font-family: var(--font-num); font-size: 0.85rem; font-weight: 500;
+            font-variant-numeric: tabular-nums; margin-top: 3px;
+        }}
         .qc-pos {{ color: var(--pos); }}
         .qc-neg {{ color: var(--neg); }}
-        .qc-pill {{ display:inline-block; padding: 3px 12px; border-radius: 999px; font-weight: 700; font-size: 0.8rem; }}
-        .qc-buy  {{ background: rgba(22,163,74,0.15);  color: var(--pos); }}
-        .qc-hold {{ background: rgba(148,163,184,0.18); color: var(--muted); }}
-        .qc-sell {{ background: rgba(220,38,38,0.15);  color: var(--neg); }}
-        .qc-ticker {{ font-size: 1.25rem; font-weight: 800; }}
-        .qc-sub {{ font-size: 0.82rem; color: var(--muted); }}
+
+        /* ---- signal tags: a rule of colour, not a candy pill ---- */
+        .qc-pill {{
+            display: inline-block; padding: 3px 10px; border-radius: 3px;
+            font-family: var(--font-num); font-weight: 600; font-size: 0.72rem;
+            letter-spacing: .08em; text-transform: uppercase;
+            border-left: 3px solid currentColor;
+        }}
+        .qc-buy  {{ background: rgba(15,123,90,0.10);  color: var(--pos); }}
+        .qc-hold {{ background: rgba(103,113,127,0.12); color: var(--muted); }}
+        .qc-sell {{ background: rgba(179,40,60,0.10);  color: var(--neg); }}
+        .qc-ticker {{ font-family: var(--font-num); font-size: 1.1rem; font-weight: 600; letter-spacing: -0.01em; }}
+        .qc-sub {{ font-size: 0.8rem; color: var(--muted); }}
         .qc-chip {{
-            display: inline-block; padding: 3px 12px; border-radius: 999px;
-            font-size: 0.78rem; font-weight: 600; color: var(--muted);
-            background: var(--card-bg); border: 1px solid rgba(148,163,184,0.25);
+            display: inline-block; padding: 3px 10px; border-radius: 3px;
+            font-family: var(--font-num); font-size: 0.72rem; font-weight: 500;
+            letter-spacing: .06em; color: var(--muted);
+            background: var(--surface); border: 1px solid var(--rule);
             margin-bottom: 8px;
         }}
+
+        /* ---- Streamlit chrome ---- */
+        [data-testid="stSidebar"] {{ background: #FFFFFF; border-right: 1px solid var(--rule); }}
+        .stButton > button {{
+            font-family: var(--font-ui); font-weight: 600; border-radius: 4px;
+            border: 1px solid var(--rule); transition: border-color .12s ease, background .12s ease;
+        }}
+        .stButton > button:hover {{ border-color: var(--accent); color: var(--accent); }}
+        .stButton > button[kind="primary"] {{ background: var(--accent); border-color: var(--accent); }}
+        .stButton > button[kind="primary"]:hover {{ background: var(--accent-deep); color: #fff; }}
+        /* Figures in tables align only if they are tabular — the whole point of a screener. */
+        [data-testid="stDataFrame"] {{ font-family: var(--font-num); font-variant-numeric: tabular-nums; }}
+        [data-testid="stMetricValue"] {{ font-family: var(--font-num); font-variant-numeric: tabular-nums; }}
+        [data-testid="stCaptionContainer"], .stCaption {{ color: var(--muted); }}
+        [data-testid="stExpander"] details {{ border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); }}
+        div[data-baseweb="tab-list"] {{ gap: 2px; }}
+
         @media (max-width: 640px) {{
-            .qc-value {{ font-size: 1.3rem; }}
-            .qc-ticker {{ font-size: 1.1rem; }}
+            .qc-value {{ font-size: 1.35rem; }}
+            .qc-ticker {{ font-size: 1rem; }}
             .qc-card {{ padding: 12px 14px; margin-bottom: 10px; }}
+            .qc-board-cell {{ padding: 7px 12px; }}
             .block-container {{ padding-left: .6rem; padding-right: .6rem; }}
             /* Streamlit does not stack st.columns on narrow screens by default,
                so the 3- and 4-up card rows get badly squished on a phone.
@@ -582,10 +685,30 @@ def inject_css(accent: str = "#3b82f6", card_bg: str = "rgba(255,255,255,0.03)")
                 min-width: 100% !important;
             }}
         }}
+        @media (prefers-reduced-motion: reduce) {{
+            * {{ transition: none !important; animation: none !important; }}
+        }}
         </style>
         """,
         unsafe_allow_html=True,
     )
+
+
+def board_strip(cells: list[tuple[str, str, bool]]) -> str:
+    """The signature element: a market-board status strip.
+
+    `cells` is [(label, value, is_live)] — each one a real piece of engine state, so
+    the strip is instrumentation rather than ornament. Values that aren't populated
+    yet render dimmed instead of being hidden, so the field layout stays constant
+    between runs the way a real board does.
+    """
+    out = []
+    for label, value, live in cells:
+        dim = "" if live else " dim"
+        out.append(f'<div class="qc-board-cell"><div class="qc-board-k">{label}</div>'
+                   f'<div class="qc-board-v{dim}">{value}</div></div>')
+    return f'<div class="qc-board">{"".join(out)}</div>'
+
 
 def metric_card(label: str, value: str, delta: str | None = None, positive: bool | None = None) -> str:
     delta_html = ""
@@ -4157,6 +4280,25 @@ def main() -> None:
     if _LAST_HYPE_FETCHED_AT:
         _msg = tr("hype_updated", ago=_ago(_LAST_HYPE_FETCHED_AT))
         st.caption(f"{_LAST_HYPE_STATUS} · {_msg}" if _LAST_HYPE_STATUS else _msg)
+
+    # Signature board strip — real engine state, constant field layout, every page.
+    _res = st.session_state.get("results") or []
+    _held = 0
+    if pf is not None:
+        _t = st.session_state.get("pf_trades")
+        if _t is not None and not _t.empty:
+            _held = len(pf.holdings(_t))
+    _quick = st.session_state.get("scan_is_quick")
+    _cells = [
+        (tr("board_universe"), f"{len(_res)}" if _res else "—", bool(_res)),
+        (tr("board_depth"),
+         (tr("board_quick") if _quick else tr("board_full")) if _res else "—", bool(_res)),
+        (tr("board_holdings"), f"{_held}" if _held else "—", bool(_held)),
+        (tr("board_feed"),
+         (_ago(_LAST_HYPE_FETCHED_AT) if _LAST_HYPE_FETCHED_AT else "—"),
+         bool(_LAST_HYPE_FETCHED_AT)),
+    ]
+    st.markdown(board_strip(_cells), unsafe_allow_html=True)
 
     # App-wide "needs review" banner: once trades are loaded, unreviewed sells stay
     # visible on every page (not just My Trades) until dismissed for the session.
