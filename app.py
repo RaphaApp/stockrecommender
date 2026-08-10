@@ -653,7 +653,37 @@ def inject_css(accent: str = "#1B4D8F", card_bg: str = "#FFFFFF") -> None:
         }}
 
         /* ---- Streamlit chrome ---- */
+        /* The design pins a light ground, but Streamlit's own chrome follows ITS theme
+           (.streamlit/config.toml, or the viewer's OS preference when that file isn't
+           deployed). Forcing a white sidebar without also forcing the foreground left
+           near-white nav text on white — invisible. So ground AND text are set together
+           here, and never inherited from Streamlit. */
         [data-testid="stSidebar"] {{ background: #FFFFFF; border-right: 1px solid var(--rule); }}
+        [data-testid="stSidebar"], [data-testid="stSidebar"] p, [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] span, [data-testid="stSidebar"] li {{ color: var(--ink); }}
+        [data-testid="stSidebarNav"] a, [data-testid="stSidebarNav"] a span,
+        [data-testid="stSidebarNavLink"] span, [data-testid="stSidebarNavItems"] span {{
+            color: var(--ink) !important; font-family: var(--font-ui);
+        }}
+        [data-testid="stSidebarNav"] a:hover {{ background: var(--accent-tint); }}
+        [data-testid="stSidebarNav"] a[aria-current="page"],
+        [data-testid="stSidebarNavLink"][aria-current="page"] {{
+            background: var(--accent-tint) !important;
+            box-shadow: inset 3px 0 0 var(--accent);
+        }}
+        [data-testid="stSidebarNav"] a[aria-current="page"] span {{
+            color: var(--accent-deep) !important; font-weight: 600;
+        }}
+        /* Inputs render on Streamlit's theme too — pin them to the light palette so a
+           dark-mode viewer doesn't get black controls floating on paper. */
+        [data-baseweb="select"] > div, [data-baseweb="input"] > div,
+        [data-baseweb="textarea"] > div, [data-baseweb="popover"] [role="listbox"],
+        [data-testid="stSidebar"] input, [data-testid="stSidebar"] textarea {{
+            background: #FFFFFF !important; color: var(--ink) !important;
+            border-color: var(--rule) !important;
+        }}
+        [data-baseweb="popover"] [role="option"] {{ color: var(--ink) !important; }}
+        [data-baseweb="popover"] [role="option"]:hover {{ background: var(--accent-tint) !important; }}
         .stButton > button {{
             font-family: var(--font-ui); font-weight: 600; border-radius: 4px;
             border: 1px solid var(--rule); transition: border-color .12s ease, background .12s ease;
@@ -703,9 +733,12 @@ def board_strip(cells: list[tuple[str, str, bool]]) -> str:
     between runs the way a real board does.
     """
     out = []
-    for label, value, live in cells:
+    for cell in cells:
+        label, value, live = cell[0], cell[1], cell[2]
+        hint = cell[3] if len(cell) > 3 else ""
         dim = "" if live else " dim"
-        out.append(f'<div class="qc-board-cell"><div class="qc-board-k">{label}</div>'
+        title = f' title="{hint}"' if hint else ""
+        out.append(f'<div class="qc-board-cell"{title}><div class="qc-board-k">{label}</div>'
                    f'<div class="qc-board-v{dim}">{value}</div></div>')
     return f'<div class="qc-board">{"".join(out)}</div>'
 
@@ -4289,14 +4322,19 @@ def main() -> None:
         if _t is not None and not _t.empty:
             _held = len(pf.holdings(_t))
     _quick = st.session_state.get("scan_is_quick")
+    # Empty cells say WHY they're empty rather than showing a bare dash — a board with
+    # four dashes tells you nothing about what would fill it.
     _cells = [
-        (tr("board_universe"), f"{len(_res)}" if _res else "—", bool(_res)),
+        (tr("board_universe"), f"{len(_res)}" if _res else tr("board_no_scan"),
+         bool(_res), tr("board_universe_hint")),
         (tr("board_depth"),
-         (tr("board_quick") if _quick else tr("board_full")) if _res else "—", bool(_res)),
-        (tr("board_holdings"), f"{_held}" if _held else "—", bool(_held)),
+         (tr("board_quick") if _quick else tr("board_full")) if _res else tr("board_no_scan"),
+         bool(_res), tr("board_depth_hint")),
+        (tr("board_holdings"), f"{_held}" if _held else tr("board_no_csv"),
+         bool(_held), tr("board_holdings_hint")),
         (tr("board_feed"),
-         (_ago(_LAST_HYPE_FETCHED_AT) if _LAST_HYPE_FETCHED_AT else "—"),
-         bool(_LAST_HYPE_FETCHED_AT)),
+         (_ago(_LAST_HYPE_FETCHED_AT) if _LAST_HYPE_FETCHED_AT else tr("board_not_run")),
+         bool(_LAST_HYPE_FETCHED_AT), tr("board_feed_hint")),
     ]
     st.markdown(board_strip(_cells), unsafe_allow_html=True)
 
