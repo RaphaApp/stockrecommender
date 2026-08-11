@@ -5,6 +5,12 @@ deep-scan lists and UI translations — extracted from app.py so the main module
 focused on logic. No app dependencies; safe to import anywhere.
 """
 
+# Bumped whenever app.py starts depending on new keys in this file. app.py compares
+# against its own expected value and warns if the two files were deployed out of
+# step — which otherwise shows up as raw keys like "board_no_csv" on screen.
+CONFIG_SCHEMA_VERSION = 8
+
+
 
 # Expanded global universe. Trim any list to speed up scans (each symbol adds
 # a price fetch + a fundamentals call, so ~60 tickers takes a couple of minutes).
@@ -106,7 +112,7 @@ DEEP_US_TICKERS = [
     "LMT", "GE", "MMM", "EMR", "ETN", "ITW", "GD", "NOC", "CSX", "NSC",
     "FDX", "WM", "PH", "ROP", "CARR", "OTIS", "JCI", "CMI", "PCAR", "TXT",
     "LHX", "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY",
-    "WMB", "KMI", "HAL", "DVN", "HES", "BKR", "FANG", "LIN", "APD", "SHW",
+    "WMB", "KMI", "HAL", "DVN", "BKR", "FANG",   # HES removed: Chevron acquisition completed 2024 "LIN", "APD", "SHW",
     "FCX", "ECL", "NEM", "DOW", "NUE", "CTVA", "NEE", "DUK", "SO", "D",
     "AEP", "EXC", "SRE", "XEL", "ED", "PEG", "PLD", "AMT", "EQIX", "CCI",
     "PSA", "O", "SPG", "WELL", "DLR", "ENPH", "FSLR",
@@ -573,6 +579,11 @@ TRANSLATIONS = {
         "board_depth_hint": "Quick = first 10 per region; Full = the whole universe.",
         "board_holdings_hint": "Open positions from Rakuten CSVs uploaded on the My Trades page (this session only).",
         "board_feed_hint": "How long ago the Reddit/GDELT sentiment feed was fetched. Blank when a scan was restored from the database rather than run fresh.",
+        "config_stale": "⚠️ config.py is out of date (v{have}, app.py expects v{want}). Some labels will look wrong — copy the latest config.py and .streamlit/config.toml into the app folder and redeploy.",
+        "deep_health_header": "Symbol health — {miss} missed this run, {parked} parked",
+        "deep_missed_note": "No price data returned this run: {syms}. A single miss is usually Yahoo under load, not a delisting — these stay in the list and are retried next run.",
+        "deep_parked_note": "Parked after repeated consecutive misses (skipped to save requests): {syms}. Any successful download resets a symbol automatically.",
+        "deep_unpark_btn": "↺ Un-park all symbols",
         "board_universe": "Universe",
         "board_depth": "Depth",
         "board_quick": "Quick",
@@ -955,6 +966,11 @@ TRANSLATIONS = {
         "board_depth_hint": "クイック＝各地域の先頭10銘柄／フル＝全ユニバース。",
         "board_holdings_hint": "「取引履歴」ページでアップロードした楽天CSVから算出した保有ポジション数（当セッションのみ）。",
         "board_feed_hint": "Reddit／GDELTセンチメントの最終取得からの経過時間。DBから復元したスキャンでは空欄になります。",
+        "config_stale": "⚠️ config.py が古いバージョンです（v{have}／app.py は v{want} を想定）。ラベルが正しく表示されません。最新の config.py と .streamlit/config.toml を配置して再デプロイしてください。",
+        "deep_health_header": "銘柄ヘルス — 今回{miss}件取得失敗、{parked}件を除外中",
+        "deep_missed_note": "今回価格データを取得できなかった銘柄：{syms}。1回の失敗は多くの場合Yahooの一時的な混雑であり上場廃止ではありません。リストには残り、次回再試行されます。",
+        "deep_parked_note": "連続失敗により除外中（通信量節約のためスキップ）：{syms}。取得に成功すると自動的に解除されます。",
+        "deep_unpark_btn": "↺ 除外をすべて解除",
         "board_universe": "銘柄数",
         "board_depth": "スキャン",
         "board_quick": "クイック",

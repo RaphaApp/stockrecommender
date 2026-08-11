@@ -51,6 +51,16 @@ except Exception:
 
 logger = logging.getLogger("alpha_quant")
 
+# yfinance prints a multi-line "possibly delisted; no price data found" block to the
+# terminal for every symbol a bulk download misses. Those misses are transient far
+# more often than they are real delistings, and the app now tracks and displays them
+# properly (symbol_health + the Deep Scan health panel), so the raw chatter is noise
+# that makes a healthy scan look broken. Quiet it to ERROR, with an escape hatch:
+#   STOCKREC_VERBOSE_YF=1  restores yfinance's own logging.
+if os.environ.get("STOCKREC_VERBOSE_YF") != "1":
+    for _n in ("yfinance", "yfinance.data", "yfinance.utils", "peewee"):
+        logging.getLogger(_n).setLevel(logging.CRITICAL)
+
 # ----------------------------------------------------------------------------
 # Networking — corporate-friendly SSL handling for yfinance
 # ----------------------------------------------------------------------------
@@ -450,6 +460,12 @@ from config import (
 # Japanese names for the instrument picker; empty dict on an older config.py (the
 # picker then shows English names only).
 try:
+    from config import CONFIG_SCHEMA_VERSION
+except ImportError:
+    CONFIG_SCHEMA_VERSION = 0
+EXPECTED_CONFIG_SCHEMA = 8
+
+try:
     from config import INSTRUMENT_JA
 except ImportError:
     INSTRUMENT_JA = {}
@@ -503,7 +519,13 @@ def get_lang() -> str:
 def tr(key: str, **kwargs) -> str:
     """Look up a UI string for the active language, falling back to English."""
     table = TRANSLATIONS.get(get_lang(), TRANSLATIONS["en"])
-    text = table.get(key) or TRANSLATIONS["en"].get(key, key)
+    text = table.get(key) or TRANSLATIONS["en"].get(key)
+    if text is None:
+        # Last-resort humanisation. A missing key means config.py is older than
+        # app.py; showing "no csv" is a poor label but "board_no_csv" looks broken.
+        # The sidebar schema warning tells the user what actually needs fixing.
+        stem = key.split("_", 1)[-1] if "_" in key else key
+        text = stem.replace("_", " ").strip().capitalize()
     return text.format(**kwargs) if kwargs else text
 
 def region_name(key: str) -> str:
@@ -684,6 +706,74 @@ def inject_css(accent: str = "#1B4D8F", card_bg: str = "#FFFFFF") -> None:
         }}
         [data-baseweb="popover"] [role="option"] {{ color: var(--ink) !important; }}
         [data-baseweb="popover"] [role="option"]:hover {{ background: var(--accent-tint) !important; }}
+
+        /* ---- theme-proofing ---------------------------------------------------
+           If .streamlit/config.toml isn't deployed, Streamlit follows the VIEWER's
+           OS preference — so a phone in dark mode renders black buttons, a black
+           expander header and near-white tab labels on top of this light design.
+           Every surface Streamlit themes is therefore pinned explicitly below.
+           NOTE: st.dataframe is the one exception — it paints on a canvas from
+           Streamlit's theme object, which CSS cannot reach, so the config file is
+           still required for tables to match. */
+        .stButton > button, .stDownloadButton > button,
+        [data-testid="baseButton-secondary"], [data-testid="stBaseButton-secondary"] {{
+            background: #FFFFFF !important; color: var(--ink) !important;
+            border: 1px solid var(--rule) !important;
+        }}
+        .stButton > button:hover, [data-testid="baseButton-secondary"]:hover {{
+            border-color: var(--accent) !important; color: var(--accent-deep) !important;
+        }}
+        .stButton > button[kind="primary"], [data-testid="baseButton-primary"],
+        [data-testid="stBaseButton-primary"] {{
+            background: var(--accent) !important; color: #FFFFFF !important;
+            border-color: var(--accent) !important;
+        }}
+        [data-testid="stExpander"] details, [data-testid="stExpander"] summary,
+        [data-testid="stExpander"] summary p, [data-testid="stExpander"] summary span {{
+            background: var(--surface) !important; color: var(--ink) !important;
+        }}
+        [data-testid="stExpander"] summary svg {{ fill: var(--ink) !important; }}
+        [data-baseweb="tab"], [data-baseweb="tab"] p {{ color: var(--muted) !important; }}
+        [data-baseweb="tab"][aria-selected="true"],
+        [data-baseweb="tab"][aria-selected="true"] p {{
+            color: var(--accent-deep) !important; font-weight: 600;
+        }}
+        [data-baseweb="tab-highlight"], [data-baseweb="tab-border"] {{ background: var(--accent) !important; }}
+        [data-baseweb="tab-list"] {{ background: transparent !important; }}
+        /* Multiselect chips (Regions to Scan, Sentiment Sources).
+           Two problems with a solid indigo fill: setting `color` on the chip does not
+           reach the label, which lives in a nested span that keeps Streamlit's dark
+           text colour — dark-on-indigo, barely legible. And a saturated fill is too
+           heavy for a filter control at this size. So: light indigo tint, deep indigo
+           text set on the children explicitly, hairline border.
+           Also: baseweb sizes the chip from its own font metrics, and IBM Plex Sans is
+           wider than the default face, so the label could overflow and clip its first
+           character. Explicit padding + visible overflow + no max-width fixes that. */
+        [data-baseweb="tag"] {{
+            background: var(--accent-tint) !important;
+            border: 1px solid rgba(27,77,143,0.28) !important;
+            border-radius: 3px !important;
+            padding: 2px 8px !important;
+            margin: 2px 4px 2px 0 !important;
+            max-width: none !important;
+            overflow: visible !important;
+        }}
+        [data-baseweb="tag"], [data-baseweb="tag"] span, [data-baseweb="tag"] div,
+        [data-baseweb="tag"] * {{
+            color: var(--accent-deep) !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
+            font-family: var(--font-ui);
+        }}
+        [data-baseweb="tag"] svg {{ fill: var(--accent-deep) !important; }}
+        [data-baseweb="tag"]:hover {{ background: #DCE6F5 !important; }}
+        /* The multiselect's own box needs room so chips can wrap instead of clipping. */
+        [data-testid="stMultiSelect"] [data-baseweb="select"] > div {{
+            min-height: 2.5rem; height: auto !important; padding: 2px 4px !important;
+        }}
+        [data-testid="stAlert"] {{ color: var(--ink); }}
+        [data-testid="stToggle"] label, [data-testid="stCheckbox"] label,
+        [data-testid="stRadio"] label, [data-testid="stSlider"] label {{ color: var(--ink) !important; }}
         .stButton > button {{
             font-family: var(--font-ui); font-weight: 600; border-radius: 4px;
             border: 1px solid var(--rule); transition: border-color .12s ease, background .12s ease;
@@ -1004,6 +1094,17 @@ def init_db() -> None:
         # Per-theme aggregates recorded once per FULL scan (quick scans skipped) so
         # the Themes tab can show momentum deltas vs the previous scan. Local-only
         # persistence: on Streamlit Cloud this resets at every redeploy.
+        # Symbol health: consecutive bulk-download failures per ticker. A single 404
+        # from Yahoo means nothing (large, obviously-listed names like MMC or FI fail
+        # under load), so a symbol is only skipped after repeated consecutive misses —
+        # and one success resets it. This self-heals a curated list instead of
+        # requiring someone to judge "delisted?" from a one-off error.
+        conn.execute(_ddl("""
+            CREATE TABLE IF NOT EXISTS symbol_health (
+                symbol TEXT PRIMARY KEY,
+                fails INTEGER NOT NULL DEFAULT 0,
+                last_fail TEXT, last_ok TEXT
+            )"""))
         conn.execute(_ddl("""
             CREATE TABLE IF NOT EXISTS theme_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1267,6 +1368,54 @@ def get_dynamic_universe(region: str) -> tuple[list[str], str | None]:
     if not rows:
         return [], None
     return [r["ticker"] for r in rows], rows[0]["fetched_at"]
+
+SYMBOL_SKIP_AFTER = 3   # consecutive failed downloads before a symbol is parked
+
+
+def record_symbol_results(ok: list, failed: list) -> None:
+    """Reset the failure counter for symbols that returned data; increment it for
+    those that didn't. Fail-safe: health tracking must never break a scan."""
+    now = datetime.now().isoformat(timespec="seconds")
+    try:
+        with get_conn() as conn:
+            for t in ok:
+                conn.execute(
+                    "INSERT INTO symbol_health (symbol, fails, last_ok) VALUES (?,0,?) "
+                    "ON CONFLICT(symbol) DO UPDATE SET fails = 0, last_ok = ?",
+                    (t, now, now))
+            for t in failed:
+                conn.execute(
+                    "INSERT INTO symbol_health (symbol, fails, last_fail) VALUES (?,1,?) "
+                    "ON CONFLICT(symbol) DO UPDATE SET fails = symbol_health.fails + 1, "
+                    "last_fail = ?", (t, now, now))
+    except Exception as e:
+        logger.warning("symbol health write skipped: %s", e)
+
+
+def skipped_symbols(threshold: int = SYMBOL_SKIP_AFTER) -> dict:
+    """{symbol: consecutive_failures} for symbols at or past the strike limit."""
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT symbol, fails FROM symbol_health WHERE fails >= ?",
+                (threshold,)).fetchall()
+        return {r[0]: int(r[1]) for r in rows}
+    except Exception as e:
+        logger.warning("symbol health read skipped: %s", e)
+        return {}
+
+
+def clear_symbol_health(symbol: str | None = None) -> None:
+    """Give a parked symbol (or all of them) another chance."""
+    try:
+        with get_conn() as conn:
+            if symbol:
+                conn.execute("DELETE FROM symbol_health WHERE symbol = ?", (symbol,))
+            else:
+                conn.execute("DELETE FROM symbol_health")
+    except Exception as e:
+        logger.warning("symbol health clear skipped: %s", e)
+
 
 def deep_universe_for(region: str) -> tuple[list[str], int]:
     """Curated deep list + live screener names (deduped). Returns (tickers, n_live)."""
@@ -2831,12 +2980,18 @@ def run_deep_scan(region: str) -> tuple[list, int]:
     DEEP_FINALISTS per-ticker calls. Finalists also get a theme classification
     from the sector/industry that stage 2 fetches anyway."""
     tickers, _n_live = deep_universe_for(region)
+    # Park symbols that have missed repeatedly; one success elsewhere resets them.
+    _parked = skipped_symbols()
+    tickers = [t for t in tickers if t not in _parked]
     # 1y (~252 trading days), not 8mo: screen_metrics' 52-week-high proximity reads
     # closes.iloc[-252:], so an 8-month frame silently turned it into an 8-month
     # high — flattering names that peaked 9-12 months ago and bled since, the exact
     # profile the falling-knife cap exists to exclude. One bulk download either way.
     histories = get_histories(tickers, period="1y")
     n_screened = len(histories)
+    _missing = [t for t in tickers if t not in histories]
+    record_symbol_results(ok=list(histories.keys()), failed=_missing)
+    st.session_state[f"deep_missing_{region}"] = _missing
     finalists = _screen_rank(histories, DEEP_FINALISTS)
     weights = get_latest_weights()
     scored: list[tuple[dict, dict]] = []
@@ -2927,6 +3082,18 @@ def render_deep_scan() -> None:
     if not res:
         st.info(tr("deep_scan_hint"))
         return
+    _missed = st.session_state.get(f"deep_missing_{region}") or []
+    _parked = skipped_symbols()
+    if _missed or _parked:
+        with st.expander(tr("deep_health_header", miss=len(_missed), parked=len(_parked))):
+            if _missed:
+                st.caption(tr("deep_missed_note", syms=", ".join(_missed[:40])))
+            if _parked:
+                st.caption(tr("deep_parked_note",
+                              syms=", ".join(f"{k} ({v}x)" for k, v in sorted(_parked.items()))))
+                if st.button(tr("deep_unpark_btn"), key=f"unpark_{region}"):
+                    clear_symbol_health()
+                    st.rerun()
     st.caption(tr("deep_scan_done", screened=st.session_state.get(f"deep_screened_{region}", 0),
                total=len(deep_universe_for(region)[0]), finalists=len(res)))
 
@@ -4313,6 +4480,27 @@ def main() -> None:
     if _LAST_HYPE_FETCHED_AT:
         _msg = tr("hype_updated", ago=_ago(_LAST_HYPE_FETCHED_AT))
         st.caption(f"{_LAST_HYPE_STATUS} · {_msg}" if _LAST_HYPE_STATUS else _msg)
+
+    # Deploying app.py without config.py is the single most common breakage here
+    # (it shows up as raw keys and stale labels), so say so plainly rather than
+    # letting the user hunt for it.
+    # Always show which config.py is actually loaded — this project has now hit the
+    # stale-file problem several times, and a visible version is faster to check than
+    # inferring it from odd labels.
+    st.sidebar.caption(f"config v{CONFIG_SCHEMA_VERSION} · app expects v{EXPECTED_CONFIG_SCHEMA}"
+                       + ("  ✅" if CONFIG_SCHEMA_VERSION >= EXPECTED_CONFIG_SCHEMA else "  ⚠️"))
+    if CONFIG_SCHEMA_VERSION < EXPECTED_CONFIG_SCHEMA:
+        # Deliberately NOT tr(): the message is about config.py being out of date,
+        # so it cannot live in config.py — a stale file would render the warning
+        # itself as a blank or humanised key, exactly when it is needed most.
+        _msg = ("⚠️ config.py is out of date (v{have}, app.py expects v{want}). "
+                "Labels will look wrong. Copy the latest config.py AND the "
+                ".streamlit/config.toml folder next to app.py, then redeploy."
+                if get_lang() != "ja" else
+                "⚠️ config.py が古いバージョンです（v{have}／app.py は v{want} を想定）。"
+                "表示が崩れます。最新の config.py と .streamlit/config.toml を "
+                "app.py と同じ場所に配置して再デプロイしてください。")
+        st.sidebar.error(_msg.format(have=CONFIG_SCHEMA_VERSION, want=EXPECTED_CONFIG_SCHEMA))
 
     # Signature board strip — real engine state, constant field layout, every page.
     _res = st.session_state.get("results") or []
