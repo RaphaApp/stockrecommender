@@ -463,7 +463,7 @@ try:
     from config import CONFIG_SCHEMA_VERSION
 except ImportError:
     CONFIG_SCHEMA_VERSION = 0
-EXPECTED_CONFIG_SCHEMA = 8
+EXPECTED_CONFIG_SCHEMA = 9
 
 try:
     from config import INSTRUMENT_JA
@@ -3401,6 +3401,71 @@ def refresh_levels_for(r: dict) -> bool:
         return False
 
 
+def normalize_news(raw, limit: int = 6) -> list[dict]:
+    """Flatten either yfinance news schema to [{title, publisher, url, ts}].
+
+    yfinance changed shape across versions: older releases return a flat list of
+    dicts (title / publisher / link / providerPublishTime), newer ones wrap the same
+    information in item["content"] with nested provider and canonicalUrl objects and
+    an ISO pubDate. Both are handled, because pinning a yfinance version for one
+    cosmetic panel isn't worth it. Pure function — no network, no Streamlit.
+    """
+    out = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        c = item.get("content") if isinstance(item.get("content"), dict) else item
+        title = str(c.get("title") or item.get("title") or "").strip()
+        if not title:
+            continue
+        prov = c.get("provider") if isinstance(c.get("provider"), dict) else {}
+        publisher = str(prov.get("displayName") or item.get("publisher")
+                        or c.get("publisher") or "").strip()
+        url = str(item.get("link") or "")
+        for key in ("canonicalUrl", "clickThroughUrl"):
+            v = c.get(key)
+            if isinstance(v, dict) and v.get("url"):
+                url = str(v["url"]); break
+            if isinstance(v, str) and v:
+                url = v; break
+        ts = float("nan")
+        epoch = item.get("providerPublishTime") or c.get("providerPublishTime")
+        if epoch:
+            ts = safe_float(epoch)
+        else:
+            for key in ("pubDate", "displayTime"):
+                if c.get(key):
+                    try:
+                        ts = float(pd.Timestamp(c[key]).timestamp()); break
+                    except Exception:
+                        pass
+        out.append({"title": title, "publisher": publisher, "url": url, "ts": ts})
+        if len(out) >= limit:
+            break
+    return out
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_news(ticker: str, limit: int = 6) -> list[dict]:
+    """Recent headlines for one ticker from yfinance (already a dependency — no
+    scraping, no extra package, works on Streamlit Cloud unlike a forum scraper).
+
+    This is CONTEXT FOR THE READER, never a scoring input: nothing here reaches the
+    composite, the factors or the walk-forward loop. Turning headlines into a signal
+    would need sentiment analysis this app deliberately doesn't do.
+    Fail-safe: [] on any error, and coverage is genuinely patchy outside the US.
+    """
+    if yf is None:
+        return []
+    try:
+        time.sleep(0.15)   # pace the per-ticker endpoint; cache misses only
+        raw = _ticker(ticker).news or []
+    except Exception as e:
+        logger.warning("news fetch failed for %s: %s", ticker, e)
+        return []
+    return normalize_news(raw, limit)
+
+
 def render_deep_dive(results: list[dict]) -> None:
     if not results:
         st.info(tr("need_run_history"))
@@ -3563,6 +3628,23 @@ def render_deep_dive(results: list[dict]) -> None:
         st.caption(_LAST_HYPE_STATUS)
     if _LAST_HYPE_FETCHED_AT:
         st.caption(tr("hype_updated", ago=_ago(_LAST_HYPE_FETCHED_AT)))
+
+    # --- Recent news -------------------------------------------------------
+    # Deliberately last and visually separate: it is reading material, not part of
+    # the score. Fetched on demand for the selected name only, so it costs one
+    # request per stock you actually open rather than one per name scanned.
+    st.markdown(f"##### {tr('news_header')}")
+    _news = fetch_news(pick)
+    if not _news:
+        st.caption(tr("news_none"))
+    else:
+        for _n in _news:
+            _age = _ago(_n["ts"]) if not math.isnan(_n["ts"]) else ""
+            _meta = " · ".join(x for x in (_n["publisher"], _age) if x)
+            _head = f"[{_n['title']}]({_n['url']})" if _n["url"] else _n["title"]
+            st.markdown(f"- {_head}  \n  <span class='qc-sub'>{_meta}</span>",
+                        unsafe_allow_html=True)
+        st.caption(tr("news_note"))
 
 def render_engine_audit(update_prices: bool = True) -> None:
     st.markdown(f"### {tr('audit_header_text')}")

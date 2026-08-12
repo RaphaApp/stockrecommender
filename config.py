@@ -8,7 +8,7 @@ focused on logic. No app dependencies; safe to import anywhere.
 # Bumped whenever app.py starts depending on new keys in this file. app.py compares
 # against its own expected value and warns if the two files were deployed out of
 # step — which otherwise shows up as raw keys like "board_no_csv" on screen.
-CONFIG_SCHEMA_VERSION = 8
+CONFIG_SCHEMA_VERSION = 9
 
 
 
@@ -584,6 +584,9 @@ TRANSLATIONS = {
         "deep_missed_note": "No price data returned this run: {syms}. A single miss is usually Yahoo under load, not a delisting — these stay in the list and are retried next run.",
         "deep_parked_note": "Parked after repeated consecutive misses (skipped to save requests): {syms}. Any successful download resets a symbol automatically.",
         "deep_unpark_btn": "↺ Un-park all symbols",
+        "news_header": "📰 Recent news",
+        "news_none": "No recent headlines returned for this ticker. Coverage is thinnest for Japanese, Chinese and smaller European listings — an empty list here means Yahoo has nothing, not that nothing happened.",
+        "news_note": "Headlines are reading context only — they are not scored and do not affect the composite, the factors or the learning loop. Turning news into a signal would require sentiment analysis this engine deliberately doesn't do.",
         "board_universe": "Universe",
         "board_depth": "Depth",
         "board_quick": "Quick",
@@ -971,6 +974,9 @@ TRANSLATIONS = {
         "deep_missed_note": "今回価格データを取得できなかった銘柄：{syms}。1回の失敗は多くの場合Yahooの一時的な混雑であり上場廃止ではありません。リストには残り、次回再試行されます。",
         "deep_parked_note": "連続失敗により除外中（通信量節約のためスキップ）：{syms}。取得に成功すると自動的に解除されます。",
         "deep_unpark_btn": "↺ 除外をすべて解除",
+        "news_header": "📰 最近のニュース",
+        "news_none": "この銘柄の最近のニュースは取得できませんでした。日本株・中国株や小型の欧州銘柄では収録が少なく、空欄はYahooにデータがないことを意味します（何も起きていないという意味ではありません）。",
+        "news_note": "ニュースは参考情報のみです。スコア化されず、総合スコア・各ファクター・学習ループには一切影響しません。ニュースをシグナル化するには本エンジンが意図的に採用していないセンチメント分析が必要になります。",
         "board_universe": "銘柄数",
         "board_depth": "スキャン",
         "board_quick": "クイック",
