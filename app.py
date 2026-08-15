@@ -741,33 +741,39 @@ def inject_css(accent: str = "#1B4D8F", card_bg: str = "#FFFFFF") -> None:
         [data-baseweb="tab-highlight"], [data-baseweb="tab-border"] {{ background: var(--accent) !important; }}
         [data-baseweb="tab-list"] {{ background: transparent !important; }}
         /* Multiselect chips (Regions to Scan, Sentiment Sources).
-           Two problems with a solid indigo fill: setting `color` on the chip does not
-           reach the label, which lives in a nested span that keeps Streamlit's dark
-           text colour — dark-on-indigo, barely legible. And a saturated fill is too
-           heavy for a filter control at this size. So: light indigo tint, deep indigo
-           text set on the children explicitly, hairline border.
-           Also: baseweb sizes the chip from its own font metrics, and IBM Plex Sans is
-           wider than the default face, so the label could overflow and clip its first
-           character. Explicit padding + visible overflow + no max-width fixes that. */
-        [data-baseweb="tag"] {{
-            background: var(--accent-tint) !important;
-            border: 1px solid rgba(27,77,143,0.28) !important;
+           Streamlit paints these with primaryColor — the indigo from
+           .streamlit/config.toml — and that rule beats a light-tint override, which
+           left dark text on a saturated fill. So go WITH the indigo fill and force the
+           label white instead: consistent whichever rule wins, since the background is
+           indigo either way. -webkit-text-fill-color is included because some of
+           Streamlit's emotion styles set it directly and it outranks plain `color`.
+           Padding/overflow are explicit because baseweb sizes the chip from its own
+           font metrics and IBM Plex Sans is wider, which clipped the first character. */
+        [data-baseweb="tag"],
+        [data-testid="stMultiSelect"] [data-baseweb="tag"],
+        [data-testid="stSidebar"] [data-baseweb="tag"] {{
+            background-color: var(--accent) !important;
+            border: 1px solid var(--accent-deep) !important;
             border-radius: 3px !important;
             padding: 2px 8px !important;
             margin: 2px 4px 2px 0 !important;
             max-width: none !important;
             overflow: visible !important;
         }}
-        [data-baseweb="tag"], [data-baseweb="tag"] span, [data-baseweb="tag"] div,
-        [data-baseweb="tag"] * {{
-            color: var(--accent-deep) !important;
+        [data-baseweb="tag"] *,
+        [data-testid="stMultiSelect"] [data-baseweb="tag"] *,
+        [data-testid="stSidebar"] [data-baseweb="tag"] * {{
+            color: #FFFFFF !important;
+            -webkit-text-fill-color: #FFFFFF !important;
+            fill: #FFFFFF !important;
+            background: transparent !important;
             overflow: visible !important;
             text-overflow: clip !important;
             font-family: var(--font-ui);
+            font-weight: 500;
         }}
-        [data-baseweb="tag"] svg {{ fill: var(--accent-deep) !important; }}
-        [data-baseweb="tag"]:hover {{ background: #DCE6F5 !important; }}
-        /* The multiselect's own box needs room so chips can wrap instead of clipping. */
+        [data-baseweb="tag"]:hover {{ background-color: var(--accent-deep) !important; }}
+        /* Room for chips to wrap instead of clipping. */
         [data-testid="stMultiSelect"] [data-baseweb="select"] > div {{
             min-height: 2.5rem; height: auto !important; padding: 2px 4px !important;
         }}
