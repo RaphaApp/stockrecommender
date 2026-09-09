@@ -463,7 +463,7 @@ try:
     from config import CONFIG_SCHEMA_VERSION
 except ImportError:
     CONFIG_SCHEMA_VERSION = 0
-EXPECTED_CONFIG_SCHEMA = 9
+EXPECTED_CONFIG_SCHEMA = 10
 
 try:
     from config import INSTRUMENT_JA
@@ -1100,6 +1100,26 @@ def init_db() -> None:
         # Per-theme aggregates recorded once per FULL scan (quick scans skipped) so
         # the Themes tab can show momentum deltas vs the previous scan. Local-only
         # persistence: on Streamlit Cloud this resets at every redeploy.
+        # V2.1 observation ledger. The existing learning loop trains on 6 picks per
+        # scan (top-3 momentum + top-3 dividend), which is a selected, momentum-biased
+        # sample: it can only learn "among names already chosen for momentum, what
+        # worked". This table records EVERY scored name with its factor snapshot, then
+        # measures realised excess return vs its own benchmark at 5/20/60 TRADING days.
+        # It is measurement only — nothing here feeds scoring, thresholds or the
+        # walk-forward optimiser, so the current engine's behaviour is unchanged and
+        # the two can be compared later on real out-of-sample data.
+        conn.execute(_ddl("""
+            CREATE TABLE IF NOT EXISTS observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id TEXT NOT NULL, obs_date TEXT NOT NULL, ticker TEXT NOT NULL,
+                region TEXT, benchmark TEXT, price REAL, composite REAL,
+                recommendation TEXT, rank_pct REAL, factors TEXT,
+                x5 REAL, x20 REAL, x60 REAL, r5 REAL, r20 REAL, r60 REAL,
+                last_eval TEXT
+            )"""))
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_scan ON observations(scan_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_ticker ON observations(ticker, obs_date)")
+
         # Symbol health: consecutive bulk-download failures per ticker. A single 404
         # from Yahoo means nothing (large, obviously-listed names like MMC or FI fail
         # under load), so a symbol is only skipped after repeated consecutive misses —
@@ -2170,6 +2190,138 @@ def evaluate_outcomes_only() -> int:
 # ----------------------------------------------------------------------------
 # Walk-Forward Optimisation: mock portfolio + factor-attribution feedback loop
 # ----------------------------------------------------------------------------
+OBS_HORIZONS = (5, 20, 60)   # trading days; different signals have different half-lives
+
+
+def _close_after_sessions(hist, start, sessions: int) -> tuple:
+    """(price_at_start, price_after_N_trading_sessions). Uses the index position, so
+    'N days' means N actual sessions, not calendar days across weekends/holidays.
+    Returns NaN for the second element when the horizon hasn't matured yet."""
+    if hist is None or getattr(hist, "empty", True) or "Close" not in hist.columns:
+        return (float("nan"), float("nan"))
+    idx = hist.index
+    try:
+        pos = int(idx.searchsorted(pd.Timestamp(start)))
+    except Exception:
+        return (float("nan"), float("nan"))
+    if pos >= len(idx):
+        return (float("nan"), float("nan"))
+    p0 = safe_float(hist["Close"].iloc[pos])
+    tgt = pos + sessions
+    p1 = safe_float(hist["Close"].iloc[tgt]) if tgt < len(idx) else float("nan")
+    return (p0, p1)
+
+
+def record_observations(results: list[dict]) -> int:
+    """Log EVERY scored name from this scan with its factor snapshot. One row per
+    stock per scan (~100/scan; a daily habit is ~25k rows/year, trivial for SQLite
+    or Postgres). Deduped per ticker per calendar day so reruns don't inflate it."""
+    if not results:
+        return 0
+    ranked = sorted(results, key=lambda r: safe_float(r.get("composite"), float("-inf")),
+                    reverse=True)
+    n = len(ranked)
+    scan_id = datetime.now().isoformat(timespec="seconds")
+    today = date.today().isoformat()
+    rows = []
+    for i, r in enumerate(ranked):
+        rows.append((
+            scan_id, today, r["ticker"], r.get("region", ""), benchmark_for(r["ticker"]),
+            safe_float(r.get("price")), safe_float(r.get("composite")),
+            str(r.get("recommendation", "")), round((n - i) / n * 100.0, 2),
+            json.dumps({f: safe_float(r.get("hype_score" if f == "hype" else f))
+                        for f in FACTORS}),
+        ))
+    try:
+        with get_conn() as conn:
+            conn.execute("DELETE FROM observations WHERE obs_date = ?", (today,))
+            conn.executemany(
+                "INSERT INTO observations (scan_id, obs_date, ticker, region, benchmark, "
+                "price, composite, recommendation, rank_pct, factors) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+    except Exception as e:
+        logger.warning("observation write skipped: %s", e)
+        return 0
+    return len(rows)
+
+
+def evaluate_observations(limit_tickers: int = 120) -> int:
+    """Fill realised returns for matured observations: stock return AND benchmark
+    return over the same window, stored as CONTINUOUS excess return per horizon —
+    not the binary win/loss the old loop uses, so magnitude survives."""
+    try:
+        with get_conn() as conn:
+            pending = conn.execute(
+                "SELECT id, ticker, obs_date, benchmark, x5, x20, x60 FROM observations "
+                "WHERE x60 IS NULL ORDER BY obs_date ASC").fetchall()
+    except Exception as e:
+        logger.warning("observation read skipped: %s", e)
+        return 0
+    if not pending:
+        return 0
+    rows = [dict(zip(("id", "ticker", "obs_date", "benchmark", "x5", "x20", "x60"), p))
+            for p in pending]
+    symbols = list({r["ticker"] for r in rows})[:limit_tickers]
+    symbols += list({r["benchmark"] for r in rows if r["benchmark"]})
+    hists = get_histories(sorted(set(symbols)), period="1y")
+    updated = 0
+    try:
+        with get_conn() as conn:
+            for r in rows:
+                h = hists.get(r["ticker"])
+                bh = hists.get(r["benchmark"])
+                if h is None:
+                    continue
+                vals, changed = {}, False
+                for horizon in OBS_HORIZONS:
+                    key = f"x{horizon}"
+                    if r.get(key) is not None:
+                        continue
+                    p0, p1 = _close_after_sessions(h, r["obs_date"], horizon)
+                    if math.isnan(p0) or math.isnan(p1) or p0 <= 0:
+                        continue          # not matured (or no data) -> leave NULL
+                    stock = p1 / p0 - 1.0
+                    b0, b1 = _close_after_sessions(bh, r["obs_date"], horizon)
+                    bench = (b1 / b0 - 1.0) if (not math.isnan(b0) and not math.isnan(b1)
+                                                and b0 > 0) else 0.0
+                    vals[f"r{horizon}"] = stock * 100.0
+                    vals[key] = (stock - bench) * 100.0
+                    changed = True
+                if changed:
+                    sets = ", ".join(f"{k} = ?" for k in vals) + ", last_eval = ?"
+                    conn.execute(f"UPDATE observations SET {sets} WHERE id = ?",
+                                 (*vals.values(), date.today().isoformat(), r["id"]))
+                    updated += 1
+    except Exception as e:
+        logger.warning("observation evaluation skipped: %s", e)
+    return updated
+
+
+def observation_buckets(horizon: int = 20) -> pd.DataFrame:
+    """Mean realised excess return by composite-score bucket — the honest version of
+    'does a high score mean anything?'. Descriptive statistics on matured
+    observations; NOT a forecast and deliberately not converted into a probability
+    until there is enough out-of-sample history to calibrate one."""
+    col = f"x{horizon}"
+    try:
+        with get_conn() as conn:
+            df = pd.read_sql_query(
+                f"SELECT composite, {col} AS excess FROM observations "
+                f"WHERE {col} IS NOT NULL", conn)
+    except Exception as e:
+        logger.warning("bucket read skipped: %s", e)
+        return pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame()
+    edges = [0, 50, 60, 70, 80, 90, 101]
+    labels = ["<50", "50-59", "60-69", "70-79", "80-89", "90+"]
+    df["bucket"] = pd.cut(df["composite"], bins=edges, labels=labels, right=False)
+    out = (df.groupby("bucket", observed=False)["excess"]
+             .agg(["count", "mean", "median"]).reset_index())
+    out = out[out["count"] > 0]
+    return out
+
+
 def save_mock_portfolio(results: list[dict]) -> None:
     """Log today's Top-3 Growth and Top-3 Dividend picks with a full KPI snapshot.
 
@@ -2653,6 +2805,7 @@ def run_engine(limit_per_region: int | None = None,
     # never sink an otherwise-successful scan.
     try:
         save_mock_portfolio(results)
+        record_observations(results)   # V2.1: log every name, not just the 6 picks
     except Exception:
         pass
     save_scan_snapshot(results, is_quick=limit_per_region is not None)
@@ -3786,6 +3939,35 @@ def render_engine_audit(update_prices: bool = True) -> None:
                        tr("col_target"): "{:,.2f}", tr("col_stop"): "{:,.2f}"}, na_rep="—"))
     st.dataframe(styled, width="stretch", hide_index=True)
     st.caption(tr("audit_one_per_note") if one_per else tr("historical_perf_note"))
+    # --- Model Lab (V2.1 measurement) -------------------------------------
+    # Does a high composite actually precede excess return? This reports realised
+    # numbers only. No expected-return or probability figure is shown, because those
+    # would need out-of-sample calibration this dataset can't yet support — inventing
+    # them would be exactly the false precision the rest of the app avoids.
+    with st.expander(tr("lab_header")):
+        try:
+            with get_conn() as _c:
+                _tot = _c.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+                _mat = _c.execute(
+                    "SELECT COUNT(*) FROM observations WHERE x20 IS NOT NULL").fetchone()[0]
+        except Exception:
+            _tot, _mat = 0, 0
+        st.caption(tr("lab_intro", total=_tot, matured=_mat))
+        _h = st.radio(tr("lab_horizon"), list(OBS_HORIZONS), horizontal=True,
+                      format_func=lambda d: tr("lab_days", d=d), key="lab_h")
+        _b = observation_buckets(int(_h))
+        if _b.empty:
+            st.info(tr("lab_empty"))
+        else:
+            _disp = _b.rename(columns={"bucket": tr("lab_col_bucket"),
+                                       "count": tr("lab_col_n"),
+                                       "mean": tr("lab_col_mean"),
+                                       "median": tr("lab_col_median")})
+            st.dataframe(_disp.style.format({tr("lab_col_mean"): "{:+.2f}%",
+                         tr("lab_col_median"): "{:+.2f}%"}, na_rep="—"),
+                         width="stretch", hide_index=True)
+            st.caption(tr("lab_note"))
+
     if update_prices:
         unpriced = sorted({t for t in uniq if pd.isna(prices.get(t, float("nan")))})
         if unpriced:
@@ -4444,6 +4626,9 @@ def main() -> None:
         try: evaluate_outcomes_only()
         except Exception: pass
         try: walk_forward_update()
+        except Exception: pass
+        # V2.1 measurement pass — independent of the learning loop above.
+        try: evaluate_observations()
         except Exception: pass
         st.session_state["_maintenance_done"] = True
 

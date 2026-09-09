@@ -8,7 +8,7 @@ focused on logic. No app dependencies; safe to import anywhere.
 # Bumped whenever app.py starts depending on new keys in this file. app.py compares
 # against its own expected value and warns if the two files were deployed out of
 # step — which otherwise shows up as raw keys like "board_no_csv" on screen.
-CONFIG_SCHEMA_VERSION = 9
+CONFIG_SCHEMA_VERSION = 10
 
 
 
@@ -587,6 +587,16 @@ TRANSLATIONS = {
         "news_header": "📰 Recent news",
         "news_none": "No recent headlines returned for this ticker. Coverage is thinnest for Japanese, Chinese and smaller European listings — an empty list here means Yahoo has nothing, not that nothing happened.",
         "news_note": "Headlines are reading context only — they are not scored and do not affect the composite, the factors or the learning loop. Turning news into a signal would require sentiment analysis this engine deliberately doesn't do.",
+        "lab_header": "🔬 Model Lab — does the score predict anything?",
+        "lab_intro": "{total} observations logged, {matured} matured to 20 days. Every scored name is recorded each scan with its factor snapshot, then measured against its own benchmark at 5/20/60 trading days. This runs alongside the existing engine and changes no scores.",
+        "lab_horizon": "Horizon",
+        "lab_days": "{d} trading days",
+        "lab_empty": "No matured observations yet. The first 5-day results appear about a week after your first scan on this build; 20-day results about a month. Until then there is nothing honest to report.",
+        "lab_col_bucket": "Score bucket",
+        "lab_col_n": "Observations",
+        "lab_col_mean": "Mean excess",
+        "lab_col_median": "Median excess",
+        "lab_note": "Realised excess return vs each stock's own benchmark — descriptive, not a forecast. If the higher buckets don't out-earn the lower ones over a few hundred observations, the composite isn't adding value and the weights need rethinking. Small samples are noise: treat any bucket under ~30 observations as unreadable.",
         "board_universe": "Universe",
         "board_depth": "Depth",
         "board_quick": "Quick",
@@ -977,6 +987,16 @@ TRANSLATIONS = {
         "news_header": "📰 最近のニュース",
         "news_none": "この銘柄の最近のニュースは取得できませんでした。日本株・中国株や小型の欧州銘柄では収録が少なく、空欄はYahooにデータがないことを意味します（何も起きていないという意味ではありません）。",
         "news_note": "ニュースは参考情報のみです。スコア化されず、総合スコア・各ファクター・学習ループには一切影響しません。ニュースをシグナル化するには本エンジンが意図的に採用していないセンチメント分析が必要になります。",
+        "lab_header": "🔬 モデルラボ — スコアに予測力はあるか？",
+        "lab_intro": "観測{total}件を記録、うち20日経過は{matured}件。スキャンごとに全銘柄をファクター値とともに記録し、5/20/60営業日後にベンチマーク対比で測定します。既存エンジンと並行して動作し、スコアには一切影響しません。",
+        "lab_horizon": "期間",
+        "lab_days": "{d}営業日",
+        "lab_empty": "まだ評価可能な観測がありません。5日結果は初回スキャンから約1週間後、20日結果は約1か月後に表示されます。それまでは正直に報告できる内容がありません。",
+        "lab_col_bucket": "スコア帯",
+        "lab_col_n": "観測数",
+        "lab_col_mean": "平均超過収益",
+        "lab_col_median": "中央値超過収益",
+        "lab_note": "各銘柄のベンチマークに対する実測超過収益です（予測ではなく実績）。数百件蓄積しても上位帯が下位帯を上回らないなら、総合スコアは付加価値を生んでおらず重み付けの見直しが必要です。30件未満の帯はノイズとして扱ってください。",
         "board_universe": "銘柄数",
         "board_depth": "スキャン",
         "board_quick": "クイック",
