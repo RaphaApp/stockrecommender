@@ -282,3 +282,168 @@ def trade_levels(price: float, sma20: float, sma50: float, atr: float,
     stop = min(stop, entry_lo - 0.25 * a)     # always strictly below the entry zone
     return {"entry_lo": float(entry_lo), "entry_hi": float(entry_hi),
             "target": float(target), "stop": float(stop)}
+
+
+# ---------------------------------------------------------------------------
+# Early Setup — measurement-only pre-breakout detector
+# ---------------------------------------------------------------------------
+SETUP_STATES = ("SETUP FAILED", "NO SETUP", "EARLY WATCH", "SETUP STRENGTHENING",
+                "CONFIRMED", "EXTENDED")
+
+# Component weights. Deliberately spread: no single component can carry a setup,
+# which is what stops a merely-oversold name from scoring well on one axis.
+_SETUP_WEIGHTS = {"macd": 0.20, "slope": 0.18, "rel_strength": 0.15,
+                  "compression": 0.15, "accumulation": 0.14, "pullback": 0.13,
+                  "revisions": 0.05}
+
+
+def _slope_pct(s: pd.Series, k: int = 5) -> float:
+    s = s.dropna()
+    if len(s) < k + 1:
+        return 0.0
+    base = float(s.iloc[-k - 1])
+    return 0.0 if base == 0 else float(s.iloc[-1]) / base - 1.0
+
+
+def early_setup(close: pd.Series, volume: pd.Series | None = None,
+                bench_close: pd.Series | None = None,
+                revision_score: float | None = None) -> dict | None:
+    """Pre-breakout "conditions improving" score (0-100) + a state label.
+
+    This is NOT a buy signal and never becomes one: it is deliberately measured
+    against forward returns in the Model Lab before anyone trusts it.
+
+    NO LOOK-AHEAD BY CONSTRUCTION: every component reads `close`/`volume` up to and
+    including the LAST bar only, never an index beyond it. Truncating the series to
+    an earlier date therefore reproduces exactly what would have been computed on
+    that date — which is what the confirmation test pins down.
+
+    Components (each 0-100, 50 = neutral):
+      macd         — histogram acceleration, with a bonus while still BELOW zero,
+                     since that is the improving-but-unconfirmed window this is for
+      slope        — SMA20/SMA50 turning up
+      rel_strength — 5-session return vs the home benchmark (needs bench_close)
+      compression  — Bollinger bandwidth vs its own 60-day median (tight = coiled)
+      accumulation — up-day volume vs down-day volume over 20 sessions
+      pullback     — off the 52w high but still above the long-term average
+      revisions    — optional external fundamental/analyst input; neutral if absent
+
+    Guards, which matter more than the score:
+      * falling knife  (1M return < -15%, or price far below the long average)
+        -> SETUP FAILED, score capped. Stops the detector catching downtrends.
+      * extended       (stretched above SMA20 relative to its own volatility)
+        -> EXTENDED. Stops it calling a name that has already run.
+      * being oversold is NOT rewarded anywhere: RSI is not an input, and the
+        pullback component requires price ABOVE the long-term average.
+
+    Returns None when there is too little history (<60 bars) to judge.
+    """
+    c = close.dropna()
+    if len(c) < 60:
+        return None
+    last = float(c.iloc[-1])
+    if last <= 0:
+        return None
+
+    sma20 = c.rolling(20).mean()
+    sma50 = c.rolling(50).mean()
+    long_win = min(200, max(60, len(c) // 2))
+    sma_long = c.rolling(long_win).mean()
+    sl = float(sma_long.iloc[-1]) if pd.notna(sma_long.iloc[-1]) else last
+    ret_1m = (last / float(c.iloc[-22]) - 1.0) if len(c) > 22 else float("nan")
+
+    # ---- guards ----------------------------------------------------------
+    knife = (not np.isnan(ret_1m) and ret_1m < -0.15) or (sl > 0 and last < sl * 0.90)
+    daily_vol = float(c.pct_change().tail(20).std() or 0.0)
+    s20v = float(sma20.iloc[-1]) if pd.notna(sma20.iloc[-1]) else last
+    stretch = (last / s20v - 1.0) if s20v > 0 else 0.0
+    extended = stretch > max(0.08, 3.0 * daily_vol)
+
+    # ---- components ------------------------------------------------------
+    comp: dict[str, float] = {}
+
+    _, _, hist = compute_macd(c)
+    h = hist.dropna()
+    if len(h) >= 6:
+        scale = float(h.tail(60).abs().mean()) or 1.0
+        delta = float(h.iloc[-1]) - float(h.iloc[-4])
+        base = clamp(50.0 + (delta / scale) * 25.0)
+        # improving while still negative is the early window this detector targets
+        comp["macd"] = clamp(base + (10.0 if (float(h.iloc[-1]) < 0 and delta > 0) else 0.0))
+    else:
+        comp["macd"] = 50.0
+
+    comp["slope"] = clamp(50.0 + _slope_pct(sma20) * 1500.0 + _slope_pct(sma50) * 1000.0)
+
+    if bench_close is not None and len(bench_close.dropna()) > 6 and len(c) > 6:
+        b = bench_close.dropna()
+        r5 = last / float(c.iloc[-6]) - 1.0
+        br5 = float(b.iloc[-1]) / float(b.iloc[-6]) - 1.0
+        comp["rel_strength"] = clamp(50.0 + (r5 - br5) * 1000.0)
+    else:
+        comp["rel_strength"] = 50.0
+
+    mid, up, lo, _ = compute_bollinger(c)
+    width = ((up - lo) / mid.replace(0, np.nan)).dropna()
+    if len(width) >= 40:
+        med = float(width.tail(60).median())
+        comp["compression"] = clamp(50.0 + (1.0 - float(width.iloc[-1]) / med) * 100.0) \
+            if med > 0 else 50.0
+    else:
+        comp["compression"] = 50.0
+
+    if volume is not None:
+        v = volume.dropna()
+        if len(v) >= 21 and len(c) >= 21:
+            ch = c.pct_change().tail(20)
+            vv = v.tail(20).reindex(ch.index).fillna(0.0)
+            up_v, dn_v = float(vv[ch > 0].sum()), float(vv[ch < 0].sum())
+            ratio = (up_v / dn_v) if dn_v > 0 else (2.0 if up_v > 0 else 1.0)
+            comp["accumulation"] = clamp(50.0 + (ratio - 1.0) * 50.0)
+        else:
+            comp["accumulation"] = 50.0
+    else:
+        comp["accumulation"] = 50.0
+
+    hi = float(c.tail(252).max())
+    dist_hi = (last / hi - 1.0) if hi > 0 else 0.0
+    above_long = (last / sl - 1.0) if sl > 0 else 0.0
+    if above_long > 0 and -0.18 <= dist_hi <= -0.02:
+        comp["pullback"] = clamp(60.0 + above_long * 200.0)   # the textbook setup
+    elif above_long > 0:
+        comp["pullback"] = 55.0
+    else:
+        comp["pullback"] = 30.0                               # below trend: not a setup
+
+    comp["revisions"] = 50.0 if (revision_score is None or np.isnan(float(revision_score))) \
+        else clamp(float(revision_score))
+
+    score = sum(_SETUP_WEIGHTS[k] * comp[k] for k in _SETUP_WEIGHTS)
+
+    # ---- confirmation & state -------------------------------------------
+    vol_expanding = False
+    if volume is not None:
+        v = volume.dropna()
+        if len(v) >= 20:
+            recent, basev = float(v.tail(5).mean()), float(v.tail(20).mean())
+            vol_expanding = basev > 0 and recent > basev * 1.10
+    breakout = (len(h) > 0 and float(h.iloc[-1]) > 0 and last > s20v
+                and _slope_pct(sma20) > 0)
+    confirmed = breakout and vol_expanding
+
+    if knife:
+        state, score = "SETUP FAILED", min(score, 35.0)
+    elif extended:
+        state = "EXTENDED"
+    elif score >= 60.0 and confirmed:
+        state = "CONFIRMED"
+    elif score >= 60.0:
+        state = "SETUP STRENGTHENING"
+    elif score >= 52.0:
+        state = "EARLY WATCH"
+    else:
+        state = "NO SETUP"
+
+    return {"score": float(score), "state": state, "components": comp,
+            "ret_1m_pct": float(ret_1m * 100.0) if not np.isnan(ret_1m) else float("nan"),
+            "confirmed": bool(confirmed), "extended": bool(extended), "knife": bool(knife)}

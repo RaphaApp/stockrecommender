@@ -448,6 +448,13 @@ DEFAULT_WEIGHTS = {
 LEARNING_RATE = 0.04
 MIN_WEIGHT = 0.05
 EVAL_HORIZON_DAYS = 14
+# Outcome sentinels for the recommendations table. NEUTRAL marks a call with no
+# directional claim (HOLD): it is stored so the row isn't re-evaluated forever, but
+# excluded from accuracy. Values are fixed for backward compatibility with rows
+# already written by earlier builds.
+OUTCOME_LOSS, OUTCOME_WIN, OUTCOME_NEUTRAL = 0, 1, 2
+DIRECTIONAL_CALLS = ("BUY", "SELL")
+
 BUY_THRESHOLD = 65.0
 SELL_THRESHOLD = 45.0
 
@@ -463,7 +470,7 @@ try:
     from config import CONFIG_SCHEMA_VERSION
 except ImportError:
     CONFIG_SCHEMA_VERSION = 0
-EXPECTED_CONFIG_SCHEMA = 10
+EXPECTED_CONFIG_SCHEMA = 11
 
 try:
     from config import INSTRUMENT_JA
@@ -482,7 +489,7 @@ except ImportError:
 from indicators import (
     compute_rsi, compute_macd, compute_bollinger, compute_hype, clamp, screen_metrics,
     forum_sentiment_score, forum_euphoria_sell_score, theme_strength_score,
-    payout_penalty, compute_atr, trade_levels,
+    payout_penalty, compute_atr, trade_levels, early_setup, SETUP_STATES,
 )
 ALL_TICKERS = [ticker for region in TICKER_UNIVERSE.values() for ticker in region]
 
@@ -1117,6 +1124,10 @@ def init_db() -> None:
                 x5 REAL, x20 REAL, x60 REAL, r5 REAL, r20 REAL, r60 REAL,
                 last_eval TEXT
             )"""))
+        # Early Setup columns — additive migration, safe on an existing ledger.
+        for _c, _t in (("setup_score", "REAL"), ("setup_state", "TEXT"),
+                       ("setup_components", "TEXT"), ("ret_1m", "REAL")):
+            _ensure_column(conn, "observations", _c, _t)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_scan ON observations(scan_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_ticker ON observations(ticker, obs_date)")
 
@@ -2121,6 +2132,22 @@ def _close_on_or_after(h: pd.DataFrame | None, when) -> float:
     sub = h[dates >= when_ts]
     return safe_float(sub["Close"].iloc[0]) if not sub.empty else float("nan")
 
+def directional_outcome(recommendation: str, excess: float) -> int:
+    """Win/loss for a directional call, from its excess (or absolute) return.
+
+    A BUY is right when the name outperforms; a SELL is right when it UNDERPERFORMS.
+    Scoring both the same way — as an earlier build did — silently inverted every
+    bearish call in the accuracy stat. HOLD makes no directional claim and never
+    reaches here; it is stored as OUTCOME_NEUTRAL and excluded from accuracy.
+    """
+    rec = str(recommendation or "").upper()
+    if rec == "BUY":
+        return OUTCOME_WIN if excess > 0 else OUTCOME_LOSS
+    if rec == "SELL":
+        return OUTCOME_WIN if excess < 0 else OUTCOME_LOSS
+    return OUTCOME_NEUTRAL
+
+
 def evaluate_outcomes_only() -> int:
     """Resolve the forward OUTCOME of matured recommendations for the Systems Audit
     accuracy / win-rate panel — WITHOUT any weight update. This intentionally has no
@@ -2135,7 +2162,18 @@ def evaluate_outcomes_only() -> int:
     if df.empty:
         return 0
     cutoff = date.today() - timedelta(days=EVAL_HORIZON_DAYS)
-    pending = df[(df["outcome"].isna()) & (df["rec_date"].dt.date <= cutoff)]
+    # Evaluate directional calls only. HOLD is neutral, so mark it as excluded (2)
+    # rather than forcing it into a win/loss label or re-fetching it forever.
+    hold_ids = df.loc[df["outcome"].isna() & (df["recommendation"] == "HOLD"), "id"].tolist()
+    if hold_ids:
+        with get_conn() as conn:
+            conn.executemany(
+                f"UPDATE recommendations SET outcome={OUTCOME_NEUTRAL}, eval_date=? WHERE id=?",
+                [(date.today().isoformat(), int(i)) for i in hold_ids],
+            )
+    pending = df[(df["outcome"].isna())
+                 & (df["recommendation"].isin(DIRECTIONAL_CALLS))
+                 & (df["rec_date"].dt.date <= cutoff)]
     if pending.empty:
         return 0
 
@@ -2175,9 +2213,13 @@ def evaluate_outcomes_only() -> int:
             b_then = _close_on_or_after(bh, rec_dt)
             b_after = _close_on_or_after(bh, target)
             if not math.isnan(b_then) and not math.isnan(b_after) and b_then > 0:
-                win = 1 if stock_ret > (b_after / b_then - 1.0) else 0
+                excess = stock_ret - (b_after / b_then - 1.0)
+                # BUY wins on positive excess return; SELL wins on negative excess return.
+                win = directional_outcome(row["recommendation"], excess)
             else:
-                win = 1 if stock_ret > 0 else 0   # fallback when benchmark window missing
+                # Keep the same directional semantics when a benchmark is unavailable.
+                # Same directional semantics when no benchmark window is available.
+                win = directional_outcome(row["recommendation"], stock_ret)
 
             conn.execute(
                 "UPDATE recommendations SET price_after=?, outcome=?, eval_date=? WHERE id=?",
@@ -2212,6 +2254,55 @@ def _close_after_sessions(hist, start, sessions: int) -> tuple:
     return (p0, p1)
 
 
+def attach_early_setups(results: list[dict],
+                        histories: dict | None = None) -> int:
+    """Compute the measurement-only Early Setup score for a finished scan.
+
+    Runs as a post-pass so analyze_ticker and the scoring path stay untouched. The
+    only extra network cost is the handful of benchmark histories (one per region),
+    fetched once and shared, for the relative-strength component.
+    NOTHING here feeds the composite, the thresholds or the optimiser.
+    """
+    if not results:
+        return 0
+    # The result dict keeps ONLY Close (a deliberate Streamlit-Cloud memory fix), so
+    # volume must come from the caller's full OHLCV frame. Without it the accumulation
+    # component sat permanently at neutral 50 and vol_expanding was always False,
+    # making CONFIRMED unreachable on live scans — the unit tests missed this because
+    # they pass volume directly to the pure function.
+    histories = histories or {}
+    benches = sorted({benchmark_for(r["ticker"]) for r in results if r.get("ticker")})
+    try:
+        bhist = get_histories(benches, period="1y")
+    except Exception as e:
+        logger.warning("benchmark history for early setup unavailable: %s", e)
+        bhist = {}
+    n = 0
+    for r in results:
+        # Prefer the caller's full frame (has Volume); fall back to the Close-only
+        # result frame for restored snapshots and older callers.
+        hist = histories.get(r.get("ticker"))
+        if hist is None:
+            hist = r.get("history")
+        if hist is None or getattr(hist, "empty", True) or "Close" not in hist.columns:
+            continue
+        bh = bhist.get(benchmark_for(r["ticker"]))
+        try:
+            out = early_setup(hist["Close"],
+                              hist["Volume"] if "Volume" in hist.columns else None,
+                              bench_close=(bh["Close"] if bh is not None
+                                           and "Close" in getattr(bh, "columns", []) else None))
+        except Exception as e:
+            logger.warning("early setup failed for %s: %s", r.get("ticker"), e)
+            continue
+        if out:
+            r["setup_score"] = out["score"]
+            r["setup_state"] = out["state"]
+            r["setup_components"] = out["components"]
+            n += 1
+    return n
+
+
 def record_observations(results: list[dict]) -> int:
     """Log EVERY scored name from this scan with its factor snapshot. One row per
     stock per scan (~100/scan; a daily habit is ~25k rows/year, trivial for SQLite
@@ -2231,14 +2322,22 @@ def record_observations(results: list[dict]) -> int:
             str(r.get("recommendation", "")), round((n - i) / n * 100.0, 2),
             json.dumps({f: safe_float(r.get("hype_score" if f == "hype" else f))
                         for f in FACTORS}),
+            safe_float(r.get("setup_score")), str(r.get("setup_state") or ""),
+            json.dumps(r.get("setup_components") or {}), safe_float(r.get("ret_1m")),
         ))
     try:
         with get_conn() as conn:
-            conn.execute("DELETE FROM observations WHERE obs_date = ?", (today,))
+            # Replace only tickers present in this scan. Deleting the whole day used
+            # to erase observations from an earlier regional scan on the same date.
+            conn.executemany(
+                "DELETE FROM observations WHERE obs_date = ? AND ticker = ?",
+                [(today, r[2]) for r in rows],
+            )
             conn.executemany(
                 "INSERT INTO observations (scan_id, obs_date, ticker, region, benchmark, "
-                "price, composite, recommendation, rank_pct, factors) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+                "price, composite, recommendation, rank_pct, factors, "
+                "setup_score, setup_state, setup_components, ret_1m) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     except Exception as e:
         logger.warning("observation write skipped: %s", e)
         return 0
@@ -2251,9 +2350,18 @@ def evaluate_observations(limit_tickers: int = 120) -> int:
     not the binary win/loss the old loop uses, so magnitude survives."""
     try:
         with get_conn() as conn:
+            # Rows that can never fill — a delisted name, or a benchmark with no data
+            # for that window — would otherwise sit at the head of this queue forever
+            # and starve newer observations out of the per-run request budget. This is
+            # sharper now that ANY missing horizon selects a row. 60 sessions is ~84
+            # calendar days, so anything still incomplete after 200 days is abandoned
+            # rather than retried indefinitely. Cutoff computed in Python because
+            # SQLite and Postgres spell date arithmetic differently.
+            stale_before = (date.today() - timedelta(days=200)).isoformat()
             pending = conn.execute(
                 "SELECT id, ticker, obs_date, benchmark, x5, x20, x60 FROM observations "
-                "WHERE x60 IS NULL ORDER BY obs_date ASC").fetchall()
+                "WHERE (x5 IS NULL OR x20 IS NULL OR x60 IS NULL) AND obs_date >= ? "
+                "ORDER BY obs_date ASC, ticker ASC", (stale_before,)).fetchall()
     except Exception as e:
         logger.warning("observation read skipped: %s", e)
         return 0
@@ -2261,13 +2369,19 @@ def evaluate_observations(limit_tickers: int = 120) -> int:
         return 0
     rows = [dict(zip(("id", "ticker", "obs_date", "benchmark", "x5", "x20", "x60"), p))
             for p in pending]
-    symbols = list({r["ticker"] for r in rows})[:limit_tickers]
-    symbols += list({r["benchmark"] for r in rows if r["benchmark"]})
-    hists = get_histories(sorted(set(symbols)), period="1y")
+    # Deterministic batching prevents an arbitrary set order from starving the same
+    # pending names indefinitely when the ledger grows beyond the request cap.
+    selected_tickers = list(dict.fromkeys(r["ticker"] for r in rows))[:limit_tickers]
+    selected = set(selected_tickers)
+    benchmarks = {r["benchmark"] for r in rows
+                  if r["ticker"] in selected and r["benchmark"]}
+    hists = get_histories(sorted(selected | benchmarks), period="1y")
     updated = 0
     try:
         with get_conn() as conn:
             for r in rows:
+                if r["ticker"] not in selected:
+                    continue
                 h = hists.get(r["ticker"])
                 bh = hists.get(r["benchmark"])
                 if h is None:
@@ -2282,8 +2396,11 @@ def evaluate_observations(limit_tickers: int = 120) -> int:
                         continue          # not matured (or no data) -> leave NULL
                     stock = p1 / p0 - 1.0
                     b0, b1 = _close_after_sessions(bh, r["obs_date"], horizon)
-                    bench = (b1 / b0 - 1.0) if (not math.isnan(b0) and not math.isnan(b1)
-                                                and b0 > 0) else 0.0
+                    if math.isnan(b0) or math.isnan(b1) or b0 <= 0:
+                        # This ledger promises benchmark-relative outcomes. Leaving the
+                        # field NULL is more honest than silently substituting 0%.
+                        continue
+                    bench = b1 / b0 - 1.0
                     vals[f"r{horizon}"] = stock * 100.0
                     vals[key] = (stock - bench) * 100.0
                     changed = True
@@ -2295,6 +2412,62 @@ def evaluate_observations(limit_tickers: int = 120) -> int:
     except Exception as e:
         logger.warning("observation evaluation skipped: %s", e)
     return updated
+
+
+def setup_buckets(horizon: int = 20, modest_only: bool = False,
+                  modest_band: float = 5.0) -> pd.DataFrame:
+    """Realised forward excess return by EARLY SETUP bucket.
+
+    `modest_only` restricts to names whose prior 1-month return was within
+    +/-modest_band%. That is the honest test of a pre-breakout signal: among stocks
+    that have NOT already moved, does a high setup score still precede excess
+    return? If the edge only appears once a name has run, the detector is just
+    measuring momentum the composite already captures.
+    """
+    col = f"x{horizon}"
+    try:
+        with get_conn() as conn:
+            df = pd.read_sql_query(
+                f"SELECT setup_score, setup_state, composite, ret_1m, {col} AS excess "
+                f"FROM observations WHERE {col} IS NOT NULL AND setup_score IS NOT NULL", conn)
+    except Exception as e:
+        logger.warning("setup bucket read skipped: %s", e)
+        return pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame()
+    if modest_only:
+        df = df[df["ret_1m"].abs() <= modest_band]
+        if df.empty:
+            return pd.DataFrame()
+    edges = [0, 40, 52, 60, 70, 101]
+    labels = ["<40", "40-51", "52-59 (watch)", "60-69 (strengthening)", "70+"]
+    df["bucket"] = pd.cut(df["setup_score"], bins=edges, labels=labels, right=False)
+    out = (df.groupby("bucket", observed=False)["excess"]
+             .agg(["count", "mean", "median",
+                   ("positive_rate", lambda s: 100.0 * (s > 0).mean())]).reset_index())
+    return out[out["count"] > 0]
+
+
+def setup_state_performance(horizon: int = 20) -> pd.DataFrame:
+    """Forward excess return grouped by setup STATE — the check that the state
+    ladder is ordered sensibly (SETUP FAILED should not out-earn CONFIRMED)."""
+    col = f"x{horizon}"
+    try:
+        with get_conn() as conn:
+            df = pd.read_sql_query(
+                f"SELECT setup_state, {col} AS excess FROM observations "
+                f"WHERE {col} IS NOT NULL AND setup_state IS NOT NULL "
+                f"AND setup_state <> ''", conn)
+    except Exception as e:
+        logger.warning("setup state read skipped: %s", e)
+        return pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame()
+    out = (df.groupby("setup_state")["excess"]
+             .agg(["count", "mean", "median"]).reset_index())
+    order = {s: i for i, s in enumerate(SETUP_STATES)}
+    out["_o"] = out["setup_state"].map(lambda s: order.get(s, 99))
+    return out.sort_values("_o").drop(columns="_o")
 
 
 def observation_buckets(horizon: int = 20) -> pd.DataFrame:
@@ -2695,9 +2868,14 @@ def seed_demo_history() -> None:
             comp = float(np.mean(list(scores.values())))
             win = int(rng.random() < 0.62)
             price = float(rng.uniform(100, 300))
+            rec = "BUY" if comp > 60 else "HOLD"
+            # Demo rows must obey the same semantics as live ones: a HOLD carries no
+            # directional claim, so it is seeded NEUTRAL. Labelling seeded HOLDs 0/1
+            # let them leak into the directional accuracy panel.
+            outcome = win if rec in DIRECTIONAL_CALLS else OUTCOME_NEUTRAL
             conn.execute(
                 "INSERT INTO recommendations (ticker, rec_date, recommendation, composite, price_at_rec, momentum, value, technical, hype, quality, theme, price_after, outcome, eval_date) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (t, d, "BUY" if comp > 60 else "HOLD", comp, price, scores["momentum"], scores["value"], scores["technical"], scores["hype"], scores["quality"], scores["theme"], price * (1.06 if win else 0.94), win, d)
+                (t, d, rec, comp, price, scores["momentum"], scores["value"], scores["technical"], scores["hype"], scores["quality"], scores["theme"], price * (1.06 if win else 0.94), outcome, d)
             )
         conn.commit()
     w = dict(DEFAULT_WEIGHTS)
@@ -2805,6 +2983,8 @@ def run_engine(limit_per_region: int | None = None,
     # never sink an otherwise-successful scan.
     try:
         save_mock_portfolio(results)
+        # Pass the scan's full OHLCV frames: the result dicts hold Close only.
+        attach_early_setups(results, histories=bulk)
         record_observations(results)   # V2.1: log every name, not just the 6 picks
     except Exception:
         pass
@@ -3810,7 +3990,13 @@ def render_engine_audit(update_prices: bool = True) -> None:
     st.caption(tr("persistence_note"))
     st.caption(tr("benchmark_note"))
     df = get_recommendations()
-    done = df[df["outcome"].notna()] if not df.empty else pd.DataFrame()
+    # Directional accuracy = BUY/SELL only. Filtering on BOTH the outcome sentinel and
+    # the recommendation is deliberate: rows seeded by older builds already carry a
+    # binary outcome on HOLD rows, and the recommendation check excludes them without
+    # a destructive migration of anyone's existing database.
+    done = (df[df["outcome"].isin([OUTCOME_LOSS, OUTCOME_WIN])
+               & df["recommendation"].isin(DIRECTIONAL_CALLS)]
+            if not df.empty else pd.DataFrame())
 
     if df.empty:
         st.info(tr("no_tracks"))
@@ -3967,6 +4153,38 @@ def render_engine_audit(update_prices: bool = True) -> None:
                          tr("lab_col_median"): "{:+.2f}%"}, na_rep="—"),
                          width="stretch", hide_index=True)
             st.caption(tr("lab_note"))
+
+        # --- Early Setup comparison (measurement only) --------------------
+        st.markdown(f"**{tr('setup_lab_header')}**")
+        st.caption(tr("setup_lab_intro"))
+        _modest = st.checkbox(tr("setup_lab_modest"), value=False, key="lab_modest")
+        _sb = setup_buckets(int(_h), modest_only=_modest)
+        if _sb.empty:
+            st.info(tr("setup_lab_empty"))
+        else:
+            _sd = _sb.rename(columns={"bucket": tr("setup_col_bucket"),
+                                      "count": tr("lab_col_n"),
+                                      "mean": tr("lab_col_mean"),
+                                      "median": tr("lab_col_median"),
+                                      "positive_rate": tr("setup_col_posrate")})
+            st.dataframe(_sd.style.format({tr("lab_col_mean"): "{:+.2f}%",
+                         tr("lab_col_median"): "{:+.2f}%",
+                         tr("setup_col_posrate"): "{:.0f}%"}, na_rep="—"),
+                         width="stretch", hide_index=True)
+            _thin = _sb[_sb["count"] < 30]
+            if not _thin.empty:
+                st.caption(tr("setup_lab_thin",
+                              buckets=", ".join(str(b) for b in _thin[_sb.columns[0]])))
+            _st = setup_state_performance(int(_h))
+            if not _st.empty:
+                st.dataframe(_st.rename(columns={"setup_state": tr("setup_col_state"),
+                                                 "count": tr("lab_col_n"),
+                                                 "mean": tr("lab_col_mean"),
+                                                 "median": tr("lab_col_median")})
+                             .style.format({tr("lab_col_mean"): "{:+.2f}%",
+                                            tr("lab_col_median"): "{:+.2f}%"}, na_rep="—"),
+                             width="stretch", hide_index=True)
+            st.caption(tr("setup_lab_note"))
 
     if update_prices:
         unpriced = sorted({t for t in uniq if pd.isna(prices.get(t, float("nan")))})
