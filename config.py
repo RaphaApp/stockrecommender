@@ -8,7 +8,7 @@ focused on logic. No app dependencies; safe to import anywhere.
 # Bumped whenever app.py starts depending on new keys in this file. app.py compares
 # against its own expected value and warns if the two files were deployed out of
 # step — which otherwise shows up as raw keys like "board_no_csv" on screen.
-CONFIG_SCHEMA_VERSION = 10
+CONFIG_SCHEMA_VERSION = 11
 
 
 
@@ -587,6 +587,15 @@ TRANSLATIONS = {
         "news_header": "📰 Recent news",
         "news_none": "No recent headlines returned for this ticker. Coverage is thinnest for Japanese, Chinese and smaller European listings — an empty list here means Yahoo has nothing, not that nothing happened.",
         "news_note": "Headlines are reading context only — they are not scored and do not affect the composite, the factors or the learning loop. Turning news into a signal would require sentiment analysis this engine deliberately doesn't do.",
+        "setup_lab_header": "Early Setup — measurement only",
+        "setup_lab_intro": "An experimental pre-breakout score (MACD acceleration, MA slope, 5-day relative strength, volatility compression, accumulation volume, healthy-trend pullback, optional revisions). It is NOT a BUY, never feeds the composite, thresholds or the optimiser, and its states run NO SETUP → EARLY WATCH → SETUP STRENGTHENING → CONFIRMED, with EXTENDED and SETUP FAILED as rejections.",
+        "setup_lab_modest": "Only names whose prior 1-month return was within ±5% (the honest test: does it work BEFORE a stock has moved?)",
+        "setup_lab_empty": "No matured observations carry an Early Setup score yet. Scores are recorded from your next scan onward and mature at 5/20/60 trading sessions.",
+        "setup_col_bucket": "Setup score",
+        "setup_col_state": "State",
+        "setup_col_posrate": "Positive %",
+        "setup_lab_thin": "⚠️ Under 30 observations in: {buckets}. Treat those rows as noise.",
+        "setup_lab_note": "Realised results, not predictions. The signal is only worth trusting if higher buckets out-earn lower ones AND the edge survives the ±5% filter — otherwise it is re-measuring momentum the composite already has. Until then this stays informational.",
         "lab_header": "🔬 Model Lab — does the score predict anything?",
         "lab_intro": "{total} observations logged, {matured} matured to 20 days. Every scored name is recorded each scan with its factor snapshot, then measured against its own benchmark at 5/20/60 trading days. This runs alongside the existing engine and changes no scores.",
         "lab_horizon": "Horizon",
@@ -987,6 +996,15 @@ TRANSLATIONS = {
         "news_header": "📰 最近のニュース",
         "news_none": "この銘柄の最近のニュースは取得できませんでした。日本株・中国株や小型の欧州銘柄では収録が少なく、空欄はYahooにデータがないことを意味します（何も起きていないという意味ではありません）。",
         "news_note": "ニュースは参考情報のみです。スコア化されず、総合スコア・各ファクター・学習ループには一切影響しません。ニュースをシグナル化するには本エンジンが意図的に採用していないセンチメント分析が必要になります。",
+        "setup_lab_header": "アーリーセットアップ — 計測専用",
+        "setup_lab_intro": "ブレイク前の兆候を捉える実験的スコアです（MACD加速・移動平均の傾き・5日相対強度・ボラティリティ収縮・買い集め出来高・健全なトレンド内の押し目・任意の業績修正）。BUYではなく、総合スコア・判定閾値・最適化ループには一切影響しません。状態は NO SETUP → EARLY WATCH → SETUP STRENGTHENING → CONFIRMED、除外として EXTENDED と SETUP FAILED があります。",
+        "setup_lab_modest": "直近1か月騰落率が±5%以内の銘柄のみ（本質的な検証：株価が動く前に機能するか？）",
+        "setup_lab_empty": "セットアップスコア付きの評価済み観測はまだありません。次回スキャンから記録され、5/20/60営業日で評価されます。",
+        "setup_col_bucket": "セットアップスコア",
+        "setup_col_state": "状態",
+        "setup_col_posrate": "プラス率",
+        "setup_lab_thin": "⚠️ 観測30件未満：{buckets}。ノイズとして扱ってください。",
+        "setup_lab_note": "予測ではなく実測値です。上位帯が下位帯を上回り、かつ±5%フィルタ後も優位性が残る場合にのみ信頼に値します。そうでなければ総合スコアが既に捉えているモメンタムを再計測しているだけです。それまでは参考情報にとどめます。",
         "lab_header": "🔬 モデルラボ — スコアに予測力はあるか？",
         "lab_intro": "観測{total}件を記録、うち20日経過は{matured}件。スキャンごとに全銘柄をファクター値とともに記録し、5/20/60営業日後にベンチマーク対比で測定します。既存エンジンと並行して動作し、スコアには一切影響しません。",
         "lab_horizon": "期間",
