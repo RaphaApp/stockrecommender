@@ -29,6 +29,12 @@ class _St(types.ModuleType):
     def cache_resource(self, *a, **k): return (lambda f: f)
 
 
+def st_stub_session_keys(app_mod) -> set:
+    """Keys the app put in session state — used to prove scan-local data stays local."""
+    import streamlit as _st
+    return set(getattr(_st, "session_state", {}) or {})
+
+
 @pytest.fixture(scope="module")
 def app():
     sys.modules["streamlit"] = _St("streamlit")
@@ -261,17 +267,101 @@ def test_early_setup_receives_volume_from_the_scan(db, monkeypatch):
     assert with_vol[0]["setup_score"] != without[0]["setup_score"]
 
 
-def test_scan_call_site_hands_over_full_frames():
-    """Guard the WIRING, not just the function.
+def test_run_engine_hands_full_frames_including_bulk_misses(db, monkeypatch):
+    """Behavioural wiring test: run the real run_engine and capture what it actually
+    hands to attach_early_setups.
 
-    The test above passes `histories` explicitly, so it still passes even if the scan
-    forgets to — which is exactly how the original bug survived: the pure detector and
-    its unit tests were correct while the live path silently ran without volume.
-    A source-level assertion is crude, but it fails for the one mistake that actually
-    happened, which a behavioural test at this boundary cannot reach.
+    Covers the two paths that matter:
+      BULKED  — present in the initial bulk download;
+      MISSED  — absent from bulk and recovered by fetch_history() inside the scan.
+
+    The recovered frame used to vanish: analyze_ticker fetched it internally and the
+    result kept Close only, so Early Setup saw no volume for that name. This replaces
+    an earlier source-string assertion, which guarded the call site but proved nothing
+    about behaviour.
     """
-    import os
-    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py")).read()
-    assert "attach_early_setups(results, histories=bulk)" in src, (
-        "run_engine must hand its OHLCV frames to attach_early_setups; without them "
-        "accumulation is stuck at neutral and CONFIRMED is unreachable")
+    app = db
+    idx = pd.bdate_range("2026-01-05", periods=200)
+
+    def _frame(mult):
+        close = pd.Series([100.0 * (mult ** i) for i in range(200)], index=idx)
+        vol = pd.Series([1e6 + i for i in range(200)], index=idx)
+        return pd.DataFrame({"Close": close, "Volume": vol})
+
+    bulked, missed, bench = _frame(1.002), _frame(1.003), _frame(1.0)
+
+    monkeypatch.setattr(app, "TICKER_UNIVERSE", {"USA": ["BULKED", "MISSED"]})
+    monkeypatch.setattr(app, "effective_universe", lambda: {"USA": ["BULKED", "MISSED"]})
+    # bulk returns ONLY the first ticker -> the second must be recovered
+    monkeypatch.setattr(app, "get_histories",
+                        lambda syms, period="1y": {s: (bulked if s == "BULKED" else bench)
+                                                   for s in syms if s != "MISSED"})
+    fetched = []
+    def _fetch(t, period="1y"):
+        fetched.append(t)
+        assert t == "MISSED", "a ticker already in the bulk result must not be refetched"
+        return missed
+    monkeypatch.setattr(app, "fetch_history", _fetch)
+    monkeypatch.setattr(app, "fetch_hype_signals", lambda *a, **k: {})
+
+    def _fake_analyze(ticker, region, hype=0, jp_forum=None, hist=None):
+        assert hist is not None, f"{ticker} should receive a frame"
+        return {"ticker": ticker, "region": region, "name": ticker, "price": 150.0,
+                "momentum": 60.0, "value": 50.0, "technical": 55.0, "hype_score": 40.0,
+                "quality": 60.0, "theme": 50.0, "theme_match": None, "ret_1m": 1.0,
+                "history": hist[["Close"]]}          # exactly what the real one stores
+    monkeypatch.setattr(app, "analyze_ticker", _fake_analyze)
+
+    captured = {}
+    real_attach = app.attach_early_setups
+    def _spy(results, histories=None):
+        captured["histories"] = histories or {}
+        return real_attach(results, histories=histories)
+    monkeypatch.setattr(app, "attach_early_setups", _spy)
+
+    captured["ret"] = app.run_engine(regions=["USA"], sources=[])
+
+    hists = captured.get("histories", {})
+    assert "BULKED" in hists, "the bulk-downloaded frame must be handed over"
+    assert "MISSED" in hists, "a frame recovered by fetch_history must be handed over too"
+    assert fetched == ["MISSED"], "only the bulk miss may be fetched individually"
+    for name, frame in hists.items():
+        assert "Volume" in frame.columns, f"{name} frame reached Early Setup without Volume"
+    # The memory optimisation must survive: results keep Close only, and the
+    # scan-local map must not leak out of run_engine or into session state.
+    res, _failed = captured.get("ret", (None, None))
+    if res:
+        for r in res:
+            assert list(r["history"].columns) == ["Close"], \
+                "result['history'] must stay Close-only (session-state memory fix)"
+    assert "scan_histories" not in st_stub_session_keys(app), \
+        "scan_histories must be scan-local, never persisted in session state"
+
+
+def test_post_scan_tasks_are_isolated(app, monkeypatch):
+    """Unit-test the helper directly: each job guarded, one failure never skips
+    the rest, and Early Setup must run BEFORE the observation write (the ledger
+    persists setup_score/state/components)."""
+    order = []
+    monkeypatch.setattr(app, "save_mock_portfolio",
+                        lambda r: (_ for _ in ()).throw(RuntimeError("mock boom")))
+    monkeypatch.setattr(app, "attach_early_setups",
+                        lambda r, histories=None: order.append("setup"))
+    monkeypatch.setattr(app, "record_observations", lambda r: order.append("obs"))
+    app._run_post_scan_tasks([{"ticker": "AAA"}], {})
+    assert order == ["setup", "obs"], "a mock-portfolio failure must not skip the others"
+
+    order.clear()
+    monkeypatch.setattr(app, "save_mock_portfolio", lambda r: order.append("mock"))
+    monkeypatch.setattr(app, "attach_early_setups",
+                        lambda r, histories=None: (_ for _ in ()).throw(RuntimeError("setup boom")))
+    app._run_post_scan_tasks([{"ticker": "AAA"}], {})
+    assert order == ["mock", "obs"], "an Early Setup failure must not skip observations"
+
+    order.clear()
+    monkeypatch.setattr(app, "attach_early_setups",
+                        lambda r, histories=None: order.append("setup"))
+    monkeypatch.setattr(app, "record_observations",
+                        lambda r: (_ for _ in ()).throw(RuntimeError("obs boom")))
+    app._run_post_scan_tasks([{"ticker": "AAA"}], {})
+    assert order == ["mock", "setup"], "an observation failure must not hide the earlier work"

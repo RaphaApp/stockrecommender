@@ -444,6 +444,16 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
     else:
         state = "NO SETUP"
 
+    # Actionable levels, from the same 20-session window as the rest of the read:
+    #   trigger      — the recent high; clearing it is what confirms the coil
+    #   invalidation — the recent low; losing it says the setup is void
+    # Both are plain historical extremes of data already in hand: no look-ahead,
+    # no forecast, and they move with the window like every other component.
+    window = c.tail(20)
+    trigger = float(window.max())
+    invalidation = float(window.min())
+
     return {"score": float(score), "state": state, "components": comp,
+            "trigger": trigger, "invalidation": invalidation,
             "ret_1m_pct": float(ret_1m * 100.0) if not np.isnan(ret_1m) else float("nan"),
             "confirmed": bool(confirmed), "extended": bool(extended), "knife": bool(knife)}

@@ -470,7 +470,7 @@ try:
     from config import CONFIG_SCHEMA_VERSION
 except ImportError:
     CONFIG_SCHEMA_VERSION = 0
-EXPECTED_CONFIG_SCHEMA = 11
+EXPECTED_CONFIG_SCHEMA = 14
 
 try:
     from config import INSTRUMENT_JA
@@ -2299,6 +2299,8 @@ def attach_early_setups(results: list[dict],
             r["setup_score"] = out["score"]
             r["setup_state"] = out["state"]
             r["setup_components"] = out["components"]
+            r["setup_trigger"] = out.get("trigger")
+            r["setup_invalidation"] = out.get("invalidation")
             n += 1
     return n
 
@@ -2885,6 +2887,29 @@ def seed_demo_history() -> None:
         tot = sum(w.values())
         save_weights({f: w[f] / tot for f in FACTORS}, note="Demo backfill loop simulation")
 
+def _run_post_scan_tasks(results: list[dict], scan_histories: dict) -> None:
+    """Three unrelated post-scan jobs, independently guarded.
+
+    Ordering is load-bearing: attach_early_setups() must precede
+    record_observations(), because the ledger persists setup_score, setup_state
+    and setup_components. A failure in any one must not suppress the others —
+    they previously shared a single try/except, so a mock-portfolio error also
+    cost that day's observation rows.
+    """
+    try:
+        save_mock_portfolio(results)
+    except Exception as e:
+        logger.warning("mock portfolio save failed: %s", e)
+    try:
+        attach_early_setups(results, histories=scan_histories)
+    except Exception as e:
+        logger.warning("early setup attachment failed: %s", e)
+    try:
+        record_observations(results)
+    except Exception as e:
+        logger.warning("observation recording failed: %s", e)
+
+
 def run_engine(limit_per_region: int | None = None,
                regions: list | None = None,
                sources: list | None = None,
@@ -2925,6 +2950,12 @@ def run_engine(limit_per_region: int | None = None,
     # analyze_ticker only reads tail slices, so the longer frame changes nothing.
     all_symbols = [t for ticks in universe.values() for t in ticks]
     bulk = get_histories(all_symbols, period="1y")
+    # Scan-local map of the FULL OHLCV frames actually used. Seeded from the bulk
+    # download and extended below with any per-ticker recovery, so Early Setup sees
+    # volume for recovered names too. Deliberately local: never persisted, never put
+    # in session_state — result["history"] stays Close-only for the memory reason
+    # documented in analyze_ticker.
+    scan_histories: dict = dict(bulk)
 
     progress = st.progress(0.0, text=tr("scanning"))
 
@@ -2937,8 +2968,24 @@ def run_engine(limit_per_region: int | None = None,
             try:
                 jp_rating = (fetch_jp_forum_rating(t)
                              if (use_jp_forum and region == "Japan") else None)
+                # A bulk miss is recovered here rather than inside analyze_ticker, so
+                # the recovered frame lands in scan_histories with its Volume intact.
+                # fetch_history is @st.cache_data, so this is the same single call
+                # analyze_ticker would otherwise make — not an extra download.
+                frame = bulk.get(t)
+                if frame is None or getattr(frame, "empty", False):
+                    try:
+                        # period must match the bulk call: a recovered ticker
+                        # otherwise gets a shorter frame than a bulked one, which
+                        # changes the 252-session 52w-high window in early_setup.
+                        frame = fetch_history(t, period="1y")
+                    except Exception as e:
+                        logger.warning("history recovery failed for %s: %s", t, e)
+                        frame = None
+                if frame is not None:
+                    scan_histories[t] = frame
                 analysis = analyze_ticker(t, region, hype_counts.get(t, 0),
-                                          jp_forum=jp_rating, hist=bulk.get(t))
+                                          jp_forum=jp_rating, hist=frame)
                 if analysis is None:
                     failed.append(f"{t} (no data)")
                 else:
@@ -2981,13 +3028,7 @@ def run_engine(limit_per_region: int | None = None,
     # loop, persist the scan snapshot (survives refresh/new session), and stamp the
     # scan time for the freshness chip. All wrapped/fail-safe so bookkeeping can
     # never sink an otherwise-successful scan.
-    try:
-        save_mock_portfolio(results)
-        # Pass the scan's full OHLCV frames: the result dicts hold Close only.
-        attach_early_setups(results, histories=bulk)
-        record_observations(results)   # V2.1: log every name, not just the 6 picks
-    except Exception:
-        pass
+    _run_post_scan_tasks(results, scan_histories)
     save_scan_snapshot(results, is_quick=limit_per_region is not None)
     st.session_state["scan_ts"] = time.time()
     st.session_state["restored_scan"] = False
@@ -4593,6 +4634,98 @@ def page_portfolio() -> None:
     render_portfolio()
 
 
+def render_early_setups(results: list[dict]) -> None:
+    """Current-scan Early Setup watchlist.
+
+    These are NOT buy recommendations. The detector is measurement-only and still
+    unvalidated: the Model Lab is accumulating forward outcomes to test whether the
+    score precedes excess return at all. The page exists so the signal can be watched
+    while that evidence builds — deliberately separate from the Top Selections page,
+    which carries the production BUY/HOLD/SELL calls.
+    """
+    if not results:
+        st.info(tr("need_run_engine"))
+        return
+    scored = [r for r in results if r.get("setup_state")]
+    if not scored:
+        st.info(tr("setup_page_none"))
+        return
+
+    st.warning(tr("setup_page_disclaimer"))
+
+    # --- filters ----------------------------------------------------------
+    states = [s for s in SETUP_STATES if any(r.get("setup_state") == s for r in scored)]
+    default = [s for s in ("EARLY WATCH", "SETUP STRENGTHENING") if s in states]
+    f1, f2 = st.columns(2)
+    chosen = f1.multiselect(tr("setup_page_filter"), states, default=default or states,
+                            key="setup_states")
+    regions = sorted({r.get("region", "") for r in scored if r.get("region")})
+    reg_pick = f2.multiselect(tr("regions_to_scan"), regions, default=regions,
+                              key="setup_regions", format_func=region_name)
+    f3, f4 = st.columns(2)
+    min_score = f3.slider(tr("setup_page_min"), 0, 100, 0, key="setup_min")
+    calls = sorted({str(r.get("recommendation", "")) for r in scored if r.get("recommendation")})
+    call_pick = f4.multiselect(tr("why_call"), calls, default=calls, key="setup_calls")
+
+    rows = [r for r in scored
+            if r.get("setup_state") in chosen
+            and r.get("region", "") in reg_pick
+            and safe_float(r.get("setup_score"), -1.0) >= min_score
+            and str(r.get("recommendation", "")) in call_pick]
+    rows.sort(key=lambda r: safe_float(r.get("setup_score"), float("-inf")), reverse=True)
+    if not rows:
+        st.caption(tr("setup_page_empty_filter"))
+        return
+
+    def _c(r, key):
+        """Component value, tolerant of a restored snapshot with no components."""
+        return safe_float((r.get("setup_components") or {}).get(key), float("nan"))
+
+    df = pd.DataFrame([{
+        tr("col_ticker"): r["ticker"],
+        tr("col_company"): r.get("name", r["ticker"]),
+        tr("col_region"): region_name(r.get("region", "")),
+        tr("setup_col_bucket"): safe_float(r.get("setup_score")),
+        tr("setup_col_state"): r.get("setup_state"),
+        tr("col_overall_score"): safe_float(r.get("composite")),
+        tr("why_call"): str(r.get("recommendation", "—")),
+        tr("col_momentum_1m"): safe_float(r.get("ret_1m")),
+        # the four components that describe WHY it is an early setup
+        tr("setup_c_macd"): _c(r, "macd"),
+        tr("setup_c_compression"): _c(r, "compression"),
+        tr("setup_c_accumulation"): _c(r, "accumulation"),
+        tr("setup_c_rel_strength"): _c(r, "rel_strength"),
+        tr("setup_col_trigger"): safe_float(r.get("setup_trigger")),
+        tr("setup_col_invalidation"): safe_float(r.get("setup_invalidation")),
+    } for r in rows])
+    _num = {tr("setup_col_bucket"): "{:.1f}", tr("col_overall_score"): "{:.1f}",
+            tr("col_momentum_1m"): "{:+.1f}%"}
+    _num.update({tr(f"setup_c_{k}"): "{:.0f}" for k in
+                 ("macd", "compression", "accumulation", "rel_strength")})
+    _num.update({tr("setup_col_trigger"): "{:,.2f}",
+                 tr("setup_col_invalidation"): "{:,.2f}"})
+    st.dataframe(df.style.format(_num, na_rep="—"), width="stretch", hide_index=True)
+    st.caption(tr("setup_page_note"))
+
+    # component breakdown for one name — shows WHICH conditions are improving
+    st.markdown(f"#### {tr('setup_page_components')}")
+    pick = st.selectbox(tr("setup_page_select"), [r["ticker"] for r in rows],
+                        key="setup_pick")
+    chosen_row = next((r for r in rows if r["ticker"] == pick), None)
+    comps = (chosen_row or {}).get("setup_components") or {}
+    if comps:
+        cdf = pd.DataFrame([{tr("setup_col_component"): tr(f"setup_c_{k}"),
+                             tr("col_score"): safe_float(v)} for k, v in comps.items()])
+        cdf = cdf.sort_values(tr("col_score"), ascending=False)
+        st.dataframe(cdf.style.format({tr("col_score"): "{:.0f}"}, na_rep="—"),
+                     width="stretch", hide_index=True)
+        st.caption(tr("setup_page_comp_note"))
+
+
+def page_early_setups() -> None:
+    render_early_setups(st.session_state.get("results") or [])
+
+
 def page_help() -> None: render_help()
 
 
@@ -4815,6 +4948,8 @@ def _build_navigation() -> "st.navigation":
         "themes": st.Page(page_themes, title=tr("tab_themes"), url_path="themes"),
         "deep_dive": st.Page(page_deep_dive, title=tr("tab_deep"), url_path="deep-dive"),
         "deep_scan": st.Page(page_deep_scan, title=tr("tab_deep_scan"), url_path="deep-scan"),
+        "early_setups": st.Page(page_early_setups, title=tr("tab_early_setups"),
+                                url_path="early-setups"),
         "us": st.Page(page_us, title=tr("tab_us"), url_path="us-conviction"),
         "audit": st.Page(page_audit, title=tr("tab_audit"), url_path="audit"),
         "sell": st.Page(page_sell, title=tr("tab_sell"), url_path="sell"),
@@ -4823,7 +4958,7 @@ def _build_navigation() -> "st.navigation":
     }
     return st.navigation({
         tr("nav_scan"): [_PAGES["top"], _PAGES["regional"], _PAGES["category"], _PAGES["themes"]],
-        tr("nav_research"): [_PAGES["deep_dive"], _PAGES["deep_scan"], _PAGES["us"]],
+        tr("nav_research"): [_PAGES["deep_dive"], _PAGES["deep_scan"], _PAGES["early_setups"], _PAGES["us"]],
         tr("nav_audit"): [_PAGES["audit"], _PAGES["sell"], _PAGES["trades"]],
         tr("nav_info"): [_PAGES["help"]],
     })

@@ -160,6 +160,10 @@ def test_future_values_cannot_change_past_output():
     assert after["state"] == before["state"]
     for k, val in before["components"].items():
         assert after["components"][k] == pytest.approx(val), f"{k} leaked future data"
+    # trigger/invalidation are date-sensitive levels, so they must be pinned too
+    assert after["trigger"] == pytest.approx(before["trigger"]), "trigger leaked future data"
+    assert after["invalidation"] == pytest.approx(before["invalidation"]), \
+        "invalidation leaked future data"
 
 
 def test_confirmation_only_once_the_breakout_bar_exists():
@@ -176,3 +180,14 @@ def test_confirmation_only_once_the_breakout_bar_exists():
         "confirmation must use only information available on that date"
     assert after["confirmed"] or after["state"] in ("CONFIRMED", "EXTENDED"), \
         "once the breakout bars exist, the state should advance"
+
+
+def test_trigger_and_invalidation_are_window_extremes():
+    """Both levels are plain 20-session extremes of data already in hand — no
+    forecast, no look-ahead, and trigger must sit above invalidation."""
+    c, v = _uptrend_then(180, 1.002, [1 - 0.004 * i for i in range(10)])
+    out = early_setup(c, v)
+    tail = c.tail(20)
+    assert out["trigger"] == pytest.approx(float(tail.max()))
+    assert out["invalidation"] == pytest.approx(float(tail.min()))
+    assert out["trigger"] > out["invalidation"]
