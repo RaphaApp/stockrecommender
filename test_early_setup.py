@@ -187,7 +187,7 @@ def test_trigger_and_invalidation_are_window_extremes():
     forecast, no look-ahead, and trigger must sit above invalidation."""
     c, v = _uptrend_then(180, 1.002, [1 - 0.004 * i for i in range(10)])
     out = early_setup(c, v)
-    tail = c.tail(20)
-    assert out["trigger"] == pytest.approx(float(tail.max()))
-    assert out["invalidation"] == pytest.approx(float(tail.min()))
+    prior = c.iloc[-21:-1]
+    assert out["trigger"] == pytest.approx(float(prior.max()))
+    assert out["invalidation"] == pytest.approx(float(prior.min()))
     assert out["trigger"] > out["invalidation"]

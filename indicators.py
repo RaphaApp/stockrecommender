@@ -375,11 +375,19 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
 
     comp["slope"] = clamp(50.0 + _slope_pct(sma20) * 1500.0 + _slope_pct(sma50) * 1000.0)
 
-    if bench_close is not None and len(bench_close.dropna()) > 6 and len(c) > 6:
-        b = bench_close.dropna()
-        r5 = last / float(c.iloc[-6]) - 1.0
-        br5 = float(b.iloc[-1]) / float(b.iloc[-6]) - 1.0
-        comp["rel_strength"] = clamp(50.0 + (r5 - br5) * 1000.0)
+    if bench_close is not None:
+        # Match stock and benchmark on common dates. Positional tail comparison
+        # can mix different sessions around regional market holidays.
+        aligned = pd.concat(
+            [c.rename("stock"), bench_close.dropna().rename("bench")],
+            axis=1, join="inner",
+        ).dropna()
+        if len(aligned) > 6:
+            r5 = float(aligned["stock"].iloc[-1]) / float(aligned["stock"].iloc[-6]) - 1.0
+            br5 = float(aligned["bench"].iloc[-1]) / float(aligned["bench"].iloc[-6]) - 1.0
+            comp["rel_strength"] = clamp(50.0 + (r5 - br5) * 1000.0)
+        else:
+            comp["rel_strength"] = 50.0
     else:
         comp["rel_strength"] = 50.0
 
@@ -420,16 +428,25 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
 
     score = sum(_SETUP_WEIGHTS[k] * comp[k] for k in _SETUP_WEIGHTS)
 
-    # ---- confirmation & state -------------------------------------------
+    # ---- structural levels, confirmation & state ------------------------
+    # Exclude the current bar so trigger/invalidation are levels that were
+    # knowable before today's close. A breakout bar can then cross the trigger
+    # instead of moving the trigger upward with itself.
+    level_window = c.iloc[-21:-1]
+    trigger = float(level_window.max())
+    invalidation = float(level_window.min())
+
     vol_expanding = False
     if volume is not None:
         v = volume.dropna()
         if len(v) >= 20:
             recent, basev = float(v.tail(5).mean()), float(v.tail(20).mean())
             vol_expanding = basev > 0 and recent > basev * 1.10
-    breakout = (len(h) > 0 and float(h.iloc[-1]) > 0 and last > s20v
-                and _slope_pct(sma20) > 0)
-    confirmed = breakout and vol_expanding
+
+    price_breakout = last > trigger
+    technical_breakout = (len(h) > 0 and float(h.iloc[-1]) > 0 and last > s20v
+                          and _slope_pct(sma20) > 0)
+    confirmed = price_breakout and technical_breakout and vol_expanding
 
     if knife:
         state, score = "SETUP FAILED", min(score, 35.0)
@@ -444,16 +461,10 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
     else:
         state = "NO SETUP"
 
-    # Actionable levels, from the same 20-session window as the rest of the read:
-    #   trigger      — the recent high; clearing it is what confirms the coil
-    #   invalidation — the recent low; losing it says the setup is void
-    # Both are plain historical extremes of data already in hand: no look-ahead,
-    # no forecast, and they move with the window like every other component.
-    window = c.tail(20)
-    trigger = float(window.max())
-    invalidation = float(window.min())
-
     return {"score": float(score), "state": state, "components": comp,
             "trigger": trigger, "invalidation": invalidation,
             "ret_1m_pct": float(ret_1m * 100.0) if not np.isnan(ret_1m) else float("nan"),
+            "price_breakout": bool(price_breakout),
+            "technical_breakout": bool(technical_breakout),
+            "volume_confirmed": bool(vol_expanding),
             "confirmed": bool(confirmed), "extended": bool(extended), "knife": bool(knife)}
