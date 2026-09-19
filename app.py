@@ -470,7 +470,7 @@ try:
     from config import CONFIG_SCHEMA_VERSION
 except ImportError:
     CONFIG_SCHEMA_VERSION = 0
-EXPECTED_CONFIG_SCHEMA = 14
+EXPECTED_CONFIG_SCHEMA = 15
 
 try:
     from config import INSTRUMENT_JA
@@ -490,6 +490,7 @@ from indicators import (
     compute_rsi, compute_macd, compute_bollinger, compute_hype, clamp, screen_metrics,
     forum_sentiment_score, forum_euphoria_sell_score, theme_strength_score,
     payout_penalty, compute_atr, trade_levels, early_setup, SETUP_STATES,
+    EARLY_SETUP_MODEL_VERSION,
 )
 ALL_TICKERS = [ticker for region in TICKER_UNIVERSE.values() for ticker in region]
 
@@ -1126,7 +1127,12 @@ def init_db() -> None:
             )"""))
         # Early Setup columns — additive migration, safe on an existing ledger.
         for _c, _t in (("setup_score", "REAL"), ("setup_state", "TEXT"),
-                       ("setup_components", "TEXT"), ("ret_1m", "REAL")):
+                       ("setup_components", "TEXT"), ("ret_1m", "REAL"),
+                       ("setup_quality", "TEXT"), ("setup_metrics", "TEXT"),
+                       ("setup_model_version", "TEXT"),
+                       ("setup_is_new", "INTEGER DEFAULT 0"),
+                       ("setup_state_changed", "INTEGER DEFAULT 0"),
+                       ("setup_previous_state", "TEXT")):
             _ensure_column(conn, "observations", _c, _t)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_scan ON observations(scan_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_ticker ON observations(ticker, obs_date)")
@@ -2277,6 +2283,22 @@ def attach_early_setups(results: list[dict],
     except Exception as e:
         logger.warning("benchmark history for early setup unavailable: %s", e)
         bhist = {}
+    previous: dict = {}
+    try:
+        tickers = [r["ticker"] for r in results if r.get("ticker")]
+        if tickers:
+            marks = ",".join("?" for _ in tickers)
+            with get_conn() as conn:
+                prior = conn.execute(
+                    f"SELECT ticker, setup_state FROM observations WHERE ticker IN ({marks}) "
+                    "AND setup_state IS NOT NULL AND setup_state <> '' "
+                    "AND obs_date < ? ORDER BY obs_date DESC, id DESC",
+                    (*tickers, date.today().isoformat())).fetchall()
+            for row in prior:
+                previous.setdefault(row[0], row[1])
+    except Exception as e:
+        logger.warning("prior setup-state lookup skipped: %s", e)
+
     n = 0
     for r in results:
         # Prefer the caller's full frame (has Volume); fall back to the Close-only
@@ -2301,6 +2323,19 @@ def attach_early_setups(results: list[dict],
             r["setup_components"] = out["components"]
             r["setup_trigger"] = out.get("trigger")
             r["setup_invalidation"] = out.get("invalidation")
+            r["setup_metrics"] = {
+                "distance_to_trigger_pct": out.get("distance_to_trigger_pct"),
+                "distance_to_invalidation_pct": out.get("distance_to_invalidation_pct"),
+                "risk_range_pct": out.get("risk_range_pct"),
+            }
+            r["setup_data_quality"] = out.get("data_quality") or {}
+            r["setup_model_version"] = out.get("model_version", EARLY_SETUP_MODEL_VERSION)
+            prev = previous.get(r["ticker"])
+            active_states = ("EARLY WATCH", "SETUP STRENGTHENING", "CONFIRMED")
+            r["setup_previous_state"] = prev
+            r["setup_is_new"] = bool(out["state"] in active_states
+                                     and prev not in active_states)
+            r["setup_state_changed"] = bool(prev is not None and prev != out["state"])
             n += 1
     return n
 
@@ -2326,6 +2361,12 @@ def record_observations(results: list[dict]) -> int:
                         for f in FACTORS}),
             safe_float(r.get("setup_score")), str(r.get("setup_state") or ""),
             json.dumps(r.get("setup_components") or {}), safe_float(r.get("ret_1m")),
+            json.dumps(r.get("setup_data_quality") or {}),
+            json.dumps(r.get("setup_metrics") or {}),
+            str(r.get("setup_model_version") or ""),
+            1 if r.get("setup_is_new") else 0,
+            1 if r.get("setup_state_changed") else 0,
+            str(r.get("setup_previous_state") or ""),
         ))
     try:
         with get_conn() as conn:
@@ -2338,8 +2379,10 @@ def record_observations(results: list[dict]) -> int:
             conn.executemany(
                 "INSERT INTO observations (scan_id, obs_date, ticker, region, benchmark, "
                 "price, composite, recommendation, rank_pct, factors, "
-                "setup_score, setup_state, setup_components, ret_1m) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                "setup_score, setup_state, setup_components, ret_1m, setup_quality, "
+                "setup_metrics, setup_model_version, setup_is_new, "
+                "setup_state_changed, setup_previous_state) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     except Exception as e:
         logger.warning("observation write skipped: %s", e)
         return 0
@@ -4198,6 +4241,13 @@ def render_engine_audit(update_prices: bool = True) -> None:
         # --- Early Setup comparison (measurement only) --------------------
         st.markdown(f"**{tr('setup_lab_header')}**")
         st.caption(tr("setup_lab_intro"))
+        _cov = setup_coverage()
+        if _cov["total"]:
+            st.caption(tr("setup_lab_coverage", n=_cov["total"],
+                          avg=f"{_cov['avg_coverage_pct']:.0f}",
+                          vol=f"{_cov['volume_pct']:.0f}",
+                          bench=f"{_cov['benchmark_pct']:.0f}",
+                          year=f"{_cov['full_year_pct']:.0f}"))
         _modest = st.checkbox(tr("setup_lab_modest"), value=False, key="lab_modest")
         _sb = setup_buckets(int(_h), modest_only=_modest)
         if _sb.empty:
@@ -4634,6 +4684,43 @@ def page_portfolio() -> None:
     render_portfolio()
 
 
+def setup_coverage() -> dict:
+    """Read-only instrumentation coverage across the stored ledger.
+
+    Tells the Model Lab how much of the Early Setup evidence was computed on full
+    inputs. A bucket built mostly on rows lacking volume or a benchmark is measuring
+    a different (weaker) detector than one built on complete data.
+    """
+    empty = {"total": 0, "volume_pct": 0.0, "benchmark_pct": 0.0,
+             "full_year_pct": 0.0, "avg_coverage_pct": 0.0}
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT setup_quality FROM observations "
+                "WHERE setup_score IS NOT NULL AND setup_quality IS NOT NULL").fetchall()
+    except Exception as e:
+        logger.warning("setup coverage read skipped: %s", e)
+        return empty
+    quality = []
+    for row in rows:
+        try:
+            q = json.loads(row[0] or "{}")
+        except Exception:
+            q = {}
+        if q:
+            quality.append(q)
+    if not quality:
+        return empty
+    n = len(quality)
+    return {
+        "total": n,
+        "volume_pct": 100.0 * sum(bool(q.get("volume_available")) for q in quality) / n,
+        "benchmark_pct": 100.0 * sum(bool(q.get("benchmark_available")) for q in quality) / n,
+        "full_year_pct": 100.0 * sum(bool(q.get("price_history_full_year")) for q in quality) / n,
+        "avg_coverage_pct": sum(float(q.get("coverage_pct", 0.0)) for q in quality) / n,
+    }
+
+
 def render_early_setups(results: list[dict]) -> None:
     """Current-scan Early Setup watchlist.
 
@@ -4652,6 +4739,18 @@ def render_early_setups(results: list[dict]) -> None:
         return
 
     st.warning(tr("setup_page_disclaimer"))
+    quality_rows = [r.get("setup_data_quality") or {} for r in scored]
+    if any(quality_rows):
+        n_q = len(quality_rows)
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric(tr("setup_quality_coverage"),
+                  f"{sum(float(q.get('coverage_pct', 0)) for q in quality_rows) / n_q:.0f}%")
+        q2.metric(tr("setup_quality_volume"),
+                  f"{100 * sum(bool(q.get('volume_available')) for q in quality_rows) / n_q:.0f}%")
+        q3.metric(tr("setup_quality_benchmark"),
+                  f"{100 * sum(bool(q.get('benchmark_available')) for q in quality_rows) / n_q:.0f}%")
+        q4.metric(tr("setup_quality_full_year"),
+                  f"{100 * sum(bool(q.get('price_history_full_year')) for q in quality_rows) / n_q:.0f}%")
 
     # --- filters ----------------------------------------------------------
     states = [s for s in SETUP_STATES if any(r.get("setup_state") == s for r in scored)]
@@ -4697,13 +4796,28 @@ def render_early_setups(results: list[dict]) -> None:
         tr("setup_c_rel_strength"): _c(r, "rel_strength"),
         tr("setup_col_trigger"): safe_float(r.get("setup_trigger")),
         tr("setup_col_invalidation"): safe_float(r.get("setup_invalidation")),
+        tr("setup_col_to_trigger"): safe_float(
+            (r.get("setup_metrics") or {}).get("distance_to_trigger_pct")),
+        tr("setup_col_to_invalidation"): safe_float(
+            (r.get("setup_metrics") or {}).get("distance_to_invalidation_pct")),
+        tr("setup_col_risk_range"): safe_float(
+            (r.get("setup_metrics") or {}).get("risk_range_pct")),
+        tr("setup_col_quality"): safe_float(
+            (r.get("setup_data_quality") or {}).get("coverage_pct")),
+        tr("setup_col_change"): (tr("setup_change_new") if r.get("setup_is_new")
+                                 else tr("setup_change_changed") if r.get("setup_state_changed")
+                                 else "—"),
     } for r in rows])
     _num = {tr("setup_col_bucket"): "{:.1f}", tr("col_overall_score"): "{:.1f}",
             tr("col_momentum_1m"): "{:+.1f}%"}
     _num.update({tr(f"setup_c_{k}"): "{:.0f}" for k in
                  ("macd", "compression", "accumulation", "rel_strength")})
     _num.update({tr("setup_col_trigger"): "{:,.2f}",
-                 tr("setup_col_invalidation"): "{:,.2f}"})
+                 tr("setup_col_invalidation"): "{:,.2f}",
+                 tr("setup_col_to_trigger"): "{:+.1f}%",
+                 tr("setup_col_to_invalidation"): "{:.1f}%",
+                 tr("setup_col_risk_range"): "{:.1f}%",
+                 tr("setup_col_quality"): "{:.0f}%"})
     st.dataframe(df.style.format(_num, na_rep="—"), width="stretch", hide_index=True)
     st.caption(tr("setup_page_note"))
 

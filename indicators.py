@@ -289,6 +289,10 @@ def trade_levels(price: float, sma20: float, sma50: float, atr: float,
 # ---------------------------------------------------------------------------
 SETUP_STATES = ("SETUP FAILED", "NO SETUP", "EARLY WATCH", "SETUP STRENGTHENING",
                 "CONFIRMED", "EXTENDED")
+# Stamped onto every stored score so the Model Lab can tell which model version
+# produced a row — without it, changing the detector silently mixes incomparable
+# observations into the same buckets.
+EARLY_SETUP_MODEL_VERSION = "early-setup-v3-quality-metrics"
 
 # Component weights. Deliberately spread: no single component can carry a setup,
 # which is what stops a merely-oversold name from scoring well on one axis.
@@ -375,19 +379,22 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
 
     comp["slope"] = clamp(50.0 + _slope_pct(sma20) * 1500.0 + _slope_pct(sma50) * 1000.0)
 
+    # Align stock and benchmark on their SHARED sessions. Comparing iloc[-6] to
+    # iloc[-6] positionally is wrong whenever the two calendars differ — a Japanese
+    # holiday, a half day, or a benchmark that simply stopped updating silently
+    # shifted the 5-session window against itself.
+    aligned = pd.DataFrame()
+    benchmark_endpoint_current = False
     if bench_close is not None:
-        # Match stock and benchmark on common dates. Positional tail comparison
-        # can mix different sessions around regional market holidays.
-        aligned = pd.concat(
-            [c.rename("stock"), bench_close.dropna().rename("bench")],
-            axis=1, join="inner",
-        ).dropna()
-        if len(aligned) > 6:
-            r5 = float(aligned["stock"].iloc[-1]) / float(aligned["stock"].iloc[-6]) - 1.0
-            br5 = float(aligned["bench"].iloc[-1]) / float(aligned["bench"].iloc[-6]) - 1.0
-            comp["rel_strength"] = clamp(50.0 + (r5 - br5) * 1000.0)
-        else:
-            comp["rel_strength"] = 50.0
+        aligned = pd.concat([c.rename("stock"), bench_close.dropna().rename("bench")],
+                            axis=1, join="inner").dropna()
+        benchmark_endpoint_current = bool(not aligned.empty
+                                          and aligned.index[-1] == c.index[-1])
+    benchmark_available = len(aligned) > 6 and benchmark_endpoint_current
+    if benchmark_available:
+        r5 = float(aligned["stock"].iloc[-1]) / float(aligned["stock"].iloc[-6]) - 1.0
+        br5 = float(aligned["bench"].iloc[-1]) / float(aligned["bench"].iloc[-6]) - 1.0
+        comp["rel_strength"] = clamp(50.0 + (r5 - br5) * 1000.0)
     else:
         comp["rel_strength"] = 50.0
 
@@ -400,9 +407,10 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
     else:
         comp["compression"] = 50.0
 
-    if volume is not None:
-        v = volume.dropna()
-        if len(v) >= 21 and len(c) >= 21:
+    v = volume.dropna() if volume is not None else pd.Series(dtype=float)
+    volume_available = len(v) >= 21 and bool((v.tail(20) > 0).all())
+    if volume_available:
+        if len(c) >= 21:
             ch = c.pct_change().tail(20)
             vv = v.tail(20).reindex(ch.index).fillna(0.0)
             up_v, dn_v = float(vv[ch > 0].sum()), float(vv[ch < 0].sum())
@@ -428,25 +436,16 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
 
     score = sum(_SETUP_WEIGHTS[k] * comp[k] for k in _SETUP_WEIGHTS)
 
-    # ---- structural levels, confirmation & state ------------------------
-    # Exclude the current bar so trigger/invalidation are levels that were
-    # knowable before today's close. A breakout bar can then cross the trigger
-    # instead of moving the trigger upward with itself.
-    level_window = c.iloc[-21:-1]
-    trigger = float(level_window.max())
-    invalidation = float(level_window.min())
-
+    # ---- confirmation & state -------------------------------------------
     vol_expanding = False
     if volume is not None:
         v = volume.dropna()
         if len(v) >= 20:
             recent, basev = float(v.tail(5).mean()), float(v.tail(20).mean())
             vol_expanding = basev > 0 and recent > basev * 1.10
-
-    price_breakout = last > trigger
-    technical_breakout = (len(h) > 0 and float(h.iloc[-1]) > 0 and last > s20v
-                          and _slope_pct(sma20) > 0)
-    confirmed = price_breakout and technical_breakout and vol_expanding
+    breakout = (len(h) > 0 and float(h.iloc[-1]) > 0 and last > s20v
+                and _slope_pct(sma20) > 0)
+    confirmed = breakout and vol_expanding
 
     if knife:
         state, score = "SETUP FAILED", min(score, 35.0)
@@ -461,10 +460,48 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
     else:
         state = "NO SETUP"
 
+    # Actionable levels, from the same 20-session window as the rest of the read:
+    #   trigger      — the recent high; clearing it is what confirms the coil
+    #   invalidation — the recent low; losing it says the setup is void
+    # Both are plain historical extremes of data already in hand: no look-ahead,
+    # no forecast, and they move with the window like every other component.
+    # Completed bars only (exclude the current one). With the current bar included,
+    # trigger >= last by construction, so "distance to trigger" could never be
+    # negative and the level could never actually be cleared — the current close
+    # must be able to cross its trigger, not redefine it.
+    window = c.iloc[-21:-1]
+    trigger = float(window.max())
+    invalidation = float(window.min())
+    distance_to_trigger_pct = (trigger / last - 1.0) * 100.0
+    distance_to_invalidation_pct = ((last / invalidation - 1.0) * 100.0
+                                    if invalidation > 0 else float("nan"))
+    risk_range_pct = ((trigger / invalidation - 1.0) * 100.0
+                      if invalidation > 0 else float("nan"))
+    # Which inputs were genuinely present. A neutral 50 from a MISSING input and a
+    # neutral 50 from a balanced one are indistinguishable in the score, so record
+    # the difference rather than letting absent data masquerade as evidence.
+    data_quality = {
+        "price_history_available": True,
+        "price_history_full_year": len(c) >= 200,
+        "price_observations": int(len(c)),
+        "volume_available": bool(volume_available),
+        "benchmark_available": bool(benchmark_available),
+        "benchmark_endpoint_current": bool(benchmark_endpoint_current),
+        "common_benchmark_sessions": int(len(aligned)),
+        "revision_available": bool(revision_score is not None
+                                   and not np.isnan(float(revision_score))),
+    }
+    available_core = 4 + int(volume_available) + int(benchmark_available)
+    data_quality["core_inputs_available"] = available_core
+    data_quality["core_inputs_total"] = 6
+    data_quality["coverage_pct"] = available_core / 6.0 * 100.0
+
     return {"score": float(score), "state": state, "components": comp,
             "trigger": trigger, "invalidation": invalidation,
+            "distance_to_trigger_pct": float(distance_to_trigger_pct),
+            "distance_to_invalidation_pct": float(distance_to_invalidation_pct),
+            "risk_range_pct": float(risk_range_pct),
+            "data_quality": data_quality,
+            "model_version": EARLY_SETUP_MODEL_VERSION,
             "ret_1m_pct": float(ret_1m * 100.0) if not np.isnan(ret_1m) else float("nan"),
-            "price_breakout": bool(price_breakout),
-            "technical_breakout": bool(technical_breakout),
-            "volume_confirmed": bool(vol_expanding),
             "confirmed": bool(confirmed), "extended": bool(extended), "knife": bool(knife)}

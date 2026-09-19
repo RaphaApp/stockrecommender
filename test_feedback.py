@@ -5,6 +5,7 @@ point DB_PATH at a temp file. Nothing here touches Yahoo, Reddit, GDELT, SEC or
 Stooq — histories are synthetic DataFrames and every fetch entry point is monkey-
 patched. Run: pytest -q test_feedback.py
 """
+import json
 import os
 import sys
 import types
@@ -365,3 +366,54 @@ def test_post_scan_tasks_are_isolated(app, monkeypatch):
                         lambda r: (_ for _ in ()).throw(RuntimeError("obs boom")))
     app._run_post_scan_tasks([{"ticker": "AAA"}], {})
     assert order == ["mock", "setup"], "an observation failure must not hide the earlier work"
+
+
+def test_setup_metadata_persists(db):
+    """The new quality/metric columns must survive a write-read round trip."""
+    app = db
+    row = _obs(app, "META")
+    row.update({
+        "setup_score": 63.0, "setup_state": "SETUP STRENGTHENING",
+        "setup_components": {"macd": 70.0},
+        "setup_data_quality": {"volume_available": True, "coverage_pct": 83.3},
+        "setup_metrics": {"distance_to_trigger_pct": 1.2, "risk_range_pct": 8.5},
+        "setup_model_version": "early-setup-v3-quality-metrics",
+        "setup_is_new": True, "setup_state_changed": False,
+        "setup_previous_state": "NO SETUP",
+    })
+    assert app.record_observations([row]) == 1
+    with app.get_conn() as conn:
+        got = conn.execute(
+            "SELECT setup_quality, setup_metrics, setup_model_version, setup_is_new, "
+            "setup_state_changed, setup_previous_state FROM observations WHERE ticker=?",
+            ("META",)).fetchone()
+    assert json.loads(got[0])["volume_available"] is True
+    assert json.loads(got[1])["distance_to_trigger_pct"] == pytest.approx(1.2)
+    assert got[2] == "early-setup-v3-quality-metrics"
+    assert got[3] == 1 and got[4] == 0 and got[5] == "NO SETUP"
+
+
+def test_same_day_rescan_does_not_clear_the_new_flag(db, monkeypatch):
+    """The prior-state lookup must ignore TODAY's rows: otherwise a second scan on
+    the same day compares a name against its own earlier run and a genuinely NEW
+    setup stops being reported as new."""
+    app = db
+    idx = pd.bdate_range("2026-01-05", periods=220)
+    close = pd.Series([100.0 * (1.002 ** i) for i in range(220)], index=idx)
+    vol = pd.Series([1e6] * 220, index=idx)
+    full = pd.DataFrame({"Close": close, "Volume": vol})
+    monkeypatch.setattr(app, "get_histories", lambda t, period="1y": {})
+
+    def _mk():
+        return [{"ticker": "NEWBIE", "region": "USA", "price": 150.0, "composite": 70.0,
+                 "recommendation": "HOLD", "ret_1m": 1.0, "history": full[["Close"]],
+                 "momentum": 70, "value": 50, "technical": 60, "hype_score": 40,
+                 "quality": 65, "theme": 55}]
+
+    first = _mk()
+    app.attach_early_setups(first, histories={"NEWBIE": full})
+    app.record_observations(first)
+    second = _mk()
+    app.attach_early_setups(second, histories={"NEWBIE": full})
+    assert second[0]["setup_previous_state"] is None, \
+        "today's own row must not count as the previous state"

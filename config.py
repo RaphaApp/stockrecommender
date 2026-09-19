@@ -8,7 +8,7 @@ focused on logic. No app dependencies; safe to import anywhere.
 # Bumped whenever app.py starts depending on new keys in this file. app.py compares
 # against its own expected value and warns if the two files were deployed out of
 # step — which otherwise shows up as raw keys like "board_no_csv" on screen.
-CONFIG_SCHEMA_VERSION = 14
+CONFIG_SCHEMA_VERSION = 15
 
 
 
@@ -594,6 +594,18 @@ TRANSLATIONS = {
         "setup_page_min": "Minimum setup score",
         "setup_col_trigger": "Trigger",
         "setup_col_invalidation": "Invalidation",
+        "setup_col_to_trigger": "To trigger",
+        "setup_col_to_invalidation": "To invalidation",
+        "setup_col_risk_range": "Risk range",
+        "setup_col_quality": "Data coverage",
+        "setup_col_change": "Change",
+        "setup_change_new": "NEW",
+        "setup_change_changed": "STATE CHANGED",
+        "setup_quality_coverage": "Avg data coverage",
+        "setup_quality_volume": "Volume available",
+        "setup_quality_benchmark": "Benchmark available",
+        "setup_quality_full_year": "Full-year history",
+        "setup_lab_coverage": "Input coverage across {n} scored observations: {avg}% average, volume present on {vol}%, benchmark on {bench}%, full-year history on {year}%. Buckets built mostly on incomplete inputs measure a weaker detector than the one described above.",
         "setup_page_empty_filter": "No names in the selected states.",
         "setup_page_note": "Sorted by setup score. EXTENDED and SETUP FAILED are rejections, shown only if you select them: EXTENDED means the move has already happened, SETUP FAILED means the trend broke.",
         "setup_page_components": "Component breakdown",
@@ -1023,6 +1035,18 @@ TRANSLATIONS = {
         "setup_page_min": "最低セットアップスコア",
         "setup_col_trigger": "トリガー",
         "setup_col_invalidation": "否定水準",
+        "setup_col_to_trigger": "トリガーまで",
+        "setup_col_to_invalidation": "無効化まで",
+        "setup_col_risk_range": "リスク幅",
+        "setup_col_quality": "データ充足率",
+        "setup_col_change": "変化",
+        "setup_change_new": "新規",
+        "setup_change_changed": "状態変化",
+        "setup_quality_coverage": "平均データ充足率",
+        "setup_quality_volume": "出来高あり",
+        "setup_quality_benchmark": "ベンチマークあり",
+        "setup_quality_full_year": "1年履歴あり",
+        "setup_lab_coverage": "スコア付き観測{n}件の入力充足状況：平均{avg}%、出来高あり{vol}%、ベンチマークあり{bench}%、1年履歴あり{year}%。入力が欠けた観測が多い帯は、上記より弱い検出器を測っていることになります。",
         "setup_page_empty_filter": "選択した状態に該当する銘柄はありません。",
         "setup_page_note": "セットアップスコア順。EXTENDED と SETUP FAILED は除外判定で、選択時のみ表示されます（EXTENDED＝既に上昇済み、SETUP FAILED＝トレンド崩壊）。",
         "setup_page_components": "構成要素の内訳",

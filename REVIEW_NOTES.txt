@@ -1,0 +1,22 @@
+Alpha Quant Engine corrected package, config schema v15
+
+Independent correction added during review:
+- CONFIRMED now requires the current close to exceed the prior completed-bar
+  trigger, in addition to positive technical breakout conditions and expanding
+  volume. Previously the trigger was displayed correctly but was not used by
+  the confirmation state, so CONFIRMED could occur below resistance.
+- Diagnostic booleans added to early_setup output: price_breakout,
+  technical_breakout, volume_confirmed.
+- Regression tests added for below-trigger non-confirmation and a current bar
+  crossing a pre-existing trigger.
+
+Validation:
+- py_compile app.py config.py indicators.py: PASS
+- pytest -q test_feedback.py test_early_setup.py: 39 passed
+- AST parse of all five files: PASS
+- English/Japanese translation parity: 428 / 428
+- config v15 and app expected v15
+- save_weights references remain 4
+
+Deploy app.py, config.py and indicators.py together. Test files are for source
+control and CI, not required by Streamlit at runtime.

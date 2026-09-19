@@ -187,7 +187,56 @@ def test_trigger_and_invalidation_are_window_extremes():
     forecast, no look-ahead, and trigger must sit above invalidation."""
     c, v = _uptrend_then(180, 1.002, [1 - 0.004 * i for i in range(10)])
     out = early_setup(c, v)
-    prior = c.iloc[-21:-1]
+    prior = c.iloc[-21:-1]           # completed bars only
     assert out["trigger"] == pytest.approx(float(prior.max()))
     assert out["invalidation"] == pytest.approx(float(prior.min()))
     assert out["trigger"] > out["invalidation"]
+
+
+def test_quality_flags_and_metrics():
+    c, v = _uptrend_then(220, 1.001, [1.0] * 6)
+    bench = pd.Series(np.linspace(100, 110, len(c)), index=c.index)
+    out = early_setup(c, v, bench_close=bench)
+    q = out["data_quality"]
+    assert q["price_history_available"] is True
+    assert q["price_history_full_year"] is True
+    assert q["volume_available"] is True
+    assert q["benchmark_available"] is True
+    assert q["common_benchmark_sessions"] == len(c)
+    assert 0 <= q["coverage_pct"] <= 100
+    assert out["model_version"]
+    assert out["distance_to_trigger_pct"] == pytest.approx(
+        (out["trigger"] / float(c.iloc[-1]) - 1.0) * 100.0)
+    assert out["distance_to_invalidation_pct"] >= 0
+    assert out["risk_range_pct"] >= 0
+
+
+def test_missing_inputs_are_flagged_not_disguised_as_evidence():
+    """A neutral 50 from a MISSING input and a neutral 50 from a balanced one are
+    indistinguishable in the score — the flags are what tells them apart."""
+    c, _ = _uptrend_then(180, 1.001, [1.0] * 6)
+    out = early_setup(c, volume=None, bench_close=None)
+    q = out["data_quality"]
+    assert q["volume_available"] is False and q["benchmark_available"] is False
+    assert out["components"]["accumulation"] == 50.0
+    assert out["components"]["rel_strength"] == 50.0
+    assert q["coverage_pct"] < 100.0
+
+
+def test_stale_benchmark_is_not_treated_as_available():
+    """A benchmark that stopped updating must not silently score relative strength
+    off a mismatched window — it is flagged unavailable instead."""
+    c, v = _uptrend_then(200, 1.002, [1.0] * 6)
+    stale = pd.Series([100.0] * (len(c) - 30), index=c.index[:-30])   # ends 30 bars early
+    out = early_setup(c, v, bench_close=stale)
+    assert out["data_quality"]["benchmark_endpoint_current"] is False
+    assert out["data_quality"]["benchmark_available"] is False
+    assert out["components"]["rel_strength"] == 50.0
+
+
+def test_zero_volume_bars_do_not_count_as_volume_data():
+    c, _ = _uptrend_then(200, 1.002, [1.0] * 6)
+    zeros = pd.Series([0.0] * len(c), index=c.index)
+    out = early_setup(c, zeros)
+    assert out["data_quality"]["volume_available"] is False
+    assert out["components"]["accumulation"] == 50.0
