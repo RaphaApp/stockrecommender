@@ -11,12 +11,17 @@ import pandas as pd
 
 
 def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
+    """RSI with explicit up-only, down-only and flat-series handling."""
+    delta = close.astype(float).diff()
     gain, loss = delta.clip(lower=0), -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1 / period, min_periods=period).mean()
     avg_loss = loss.ewm(alpha=1 / period, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+    ready = avg_gain.notna() & avg_loss.notna()
+    rsi = rsi.mask(ready & (avg_loss == 0) & (avg_gain > 0), 100.0)
+    rsi = rsi.mask(ready & (avg_gain == 0) & (avg_loss > 0), 0.0)
+    return rsi.mask(ready & (avg_gain == 0) & (avg_loss == 0), 50.0)
 
 def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     ema_fast = close.ewm(span=fast, adjust=False).mean()
@@ -408,16 +413,17 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
         comp["compression"] = 50.0
 
     v = volume.dropna() if volume is not None else pd.Series(dtype=float)
-    volume_available = len(v) >= 21 and bool((v.tail(20) > 0).all())
+    pv = (pd.concat([c.rename("close"), v.rename("volume")], axis=1,
+                    join="inner").dropna() if not v.empty else pd.DataFrame())
+    volume_endpoint_current = bool(not pv.empty and pv.index[-1] == c.index[-1])
+    volume_available = (len(pv) >= 21 and volume_endpoint_current
+                        and bool((pv["volume"].tail(20) > 0).all()))
     if volume_available:
-        if len(c) >= 21:
-            ch = c.pct_change().tail(20)
-            vv = v.tail(20).reindex(ch.index).fillna(0.0)
-            up_v, dn_v = float(vv[ch > 0].sum()), float(vv[ch < 0].sum())
-            ratio = (up_v / dn_v) if dn_v > 0 else (2.0 if up_v > 0 else 1.0)
-            comp["accumulation"] = clamp(50.0 + (ratio - 1.0) * 50.0)
-        else:
-            comp["accumulation"] = 50.0
+        ch = pv["close"].pct_change().tail(20)
+        vv = pv["volume"].reindex(ch.index)
+        up_v, dn_v = float(vv[ch > 0].sum()), float(vv[ch < 0].sum())
+        ratio = (up_v / dn_v) if dn_v > 0 else (2.0 if up_v > 0 else 1.0)
+        comp["accumulation"] = clamp(50.0 + (ratio - 1.0) * 50.0)
     else:
         comp["accumulation"] = 50.0
 
@@ -436,16 +442,31 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
 
     score = sum(_SETUP_WEIGHTS[k] * comp[k] for k in _SETUP_WEIGHTS)
 
+    # Completed bars only (exclude the current one). With the current bar included,
+    # trigger >= last by construction, so "distance to trigger" could never be
+    # negative and the level could never actually be cleared — the current close
+    # must be able to cross its trigger, not redefine it.
+    window = c.iloc[-21:-1]
+    trigger = float(window.max())
+    invalidation = float(window.min())
+
     # ---- confirmation & state -------------------------------------------
     vol_expanding = False
-    if volume is not None:
-        v = volume.dropna()
-        if len(v) >= 20:
-            recent, basev = float(v.tail(5).mean()), float(v.tail(20).mean())
-            vol_expanding = basev > 0 and recent > basev * 1.10
-    breakout = (len(h) > 0 and float(h.iloc[-1]) > 0 and last > s20v
-                and _slope_pct(sma20) > 0)
-    confirmed = breakout and vol_expanding
+    if volume_available:
+        recent = float(pv["volume"].tail(5).mean())
+        basev = float(pv["volume"].tail(20).mean())
+        vol_expanding = basev > 0 and recent > basev * 1.10
+    # Three independent conditions, reported separately so a near-miss is legible:
+    #   technical_breakout — MACD positive, price above a rising SMA20
+    #   price_breakout     — the close actually clears the prior completed-bar high
+    #   volume_confirmed   — participation is expanding
+    # The price test is what was missing: without it CONFIRMED could fire while the
+    # name still sat BELOW its own displayed resistance, which is not a breakout.
+    technical_breakout = (len(h) > 0 and float(h.iloc[-1]) > 0 and last > s20v
+                          and _slope_pct(sma20) > 0)
+    price_breakout = last > trigger
+    volume_confirmed = bool(vol_expanding)
+    confirmed = technical_breakout and price_breakout and volume_confirmed
 
     if knife:
         state, score = "SETUP FAILED", min(score, 35.0)
@@ -465,13 +486,6 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
     #   invalidation — the recent low; losing it says the setup is void
     # Both are plain historical extremes of data already in hand: no look-ahead,
     # no forecast, and they move with the window like every other component.
-    # Completed bars only (exclude the current one). With the current bar included,
-    # trigger >= last by construction, so "distance to trigger" could never be
-    # negative and the level could never actually be cleared — the current close
-    # must be able to cross its trigger, not redefine it.
-    window = c.iloc[-21:-1]
-    trigger = float(window.max())
-    invalidation = float(window.min())
     distance_to_trigger_pct = (trigger / last - 1.0) * 100.0
     distance_to_invalidation_pct = ((last / invalidation - 1.0) * 100.0
                                     if invalidation > 0 else float("nan"))
@@ -485,6 +499,8 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
         "price_history_full_year": len(c) >= 200,
         "price_observations": int(len(c)),
         "volume_available": bool(volume_available),
+        "volume_endpoint_current": bool(volume_endpoint_current),
+        "common_price_volume_sessions": int(len(pv)),
         "benchmark_available": bool(benchmark_available),
         "benchmark_endpoint_current": bool(benchmark_endpoint_current),
         "common_benchmark_sessions": int(len(aligned)),
@@ -504,4 +520,7 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
             "data_quality": data_quality,
             "model_version": EARLY_SETUP_MODEL_VERSION,
             "ret_1m_pct": float(ret_1m * 100.0) if not np.isnan(ret_1m) else float("nan"),
-            "confirmed": bool(confirmed), "extended": bool(extended), "knife": bool(knife)}
+            "confirmed": bool(confirmed), "extended": bool(extended), "knife": bool(knife),
+            "technical_breakout": bool(technical_breakout),
+            "price_breakout": bool(price_breakout),
+            "volume_confirmed": bool(volume_confirmed)}

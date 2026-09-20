@@ -470,7 +470,7 @@ try:
     from config import CONFIG_SCHEMA_VERSION
 except ImportError:
     CONFIG_SCHEMA_VERSION = 0
-EXPECTED_CONFIG_SCHEMA = 15
+EXPECTED_CONFIG_SCHEMA = 16
 
 try:
     from config import INSTRUMENT_JA
@@ -4279,7 +4279,14 @@ def render_engine_audit(update_prices: bool = True) -> None:
 
     if update_prices:
         unpriced = sorted({t for t in uniq if pd.isna(prices.get(t, float("nan")))})
-        if unpriced:
+        if unpriced and len(unpriced) == len(uniq):
+            # EVERY ticker came back empty. Previously this rendered as a quiet
+            # caption listing all of them, so the blank Current Price / Return
+            # columns looked like a bug in the table rather than a failed fetch.
+            # The result is cached for 5 minutes, so a single throttled request
+            # keeps the columns blank until it expires or Force Data Refresh runs.
+            st.warning(tr("prices_all_unavailable", n=len(uniq)))
+        elif unpriced:
             st.caption(tr("prices_unavailable", tickers=", ".join(unpriced)))
     else:
         st.caption(tr("prices_skipped"))

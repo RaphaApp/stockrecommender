@@ -8,7 +8,7 @@ focused on logic. No app dependencies; safe to import anywhere.
 # Bumped whenever app.py starts depending on new keys in this file. app.py compares
 # against its own expected value and warns if the two files were deployed out of
 # step — which otherwise shows up as raw keys like "board_no_csv" on screen.
-CONFIG_SCHEMA_VERSION = 15
+CONFIG_SCHEMA_VERSION = 16
 
 
 
@@ -112,8 +112,10 @@ DEEP_US_TICKERS = [
     "LMT", "GE", "MMM", "EMR", "ETN", "ITW", "GD", "NOC", "CSX", "NSC",
     "FDX", "WM", "PH", "ROP", "CARR", "OTIS", "JCI", "CMI", "PCAR", "TXT",
     "LHX", "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY",
-    "WMB", "KMI", "HAL", "DVN", "BKR", "FANG",   # HES removed: Chevron acquisition completed 2024 "LIN", "APD", "SHW",
-    "FCX", "ECL", "NEM", "DOW", "NUE", "CTVA", "NEE", "DUK", "SO", "D",
+    "WMB", "KMI", "HAL", "DVN", "BKR", "FANG",
+    # HES removed after the Chevron acquisition. Keep materials names active.
+    "LIN", "APD", "SHW", "FCX", "ECL", "NEM", "DOW", "NUE", "CTVA",
+    "NEE", "DUK", "SO", "D",
     "AEP", "EXC", "SRE", "XEL", "ED", "PEG", "PLD", "AMT", "EQIX", "CCI",
     "PSA", "O", "SPG", "WELL", "DLR", "ENPH", "FSLR",
 ]
@@ -519,6 +521,7 @@ TRANSLATIONS = {
         "no_region_selected": "Select at least one region to scan.",
         "prices_skipped": "Live price update is off — current prices and returns are left blank. Tick 'Update Historical Portfolio Prices' to refresh.",
         "prices_unavailable": "No current price came back this run for: {tickers}. This is usually Yahoo rate-limiting the request (common on shared/Cloud IPs), not bad data — wait a moment and toggle the update again.",
+        "prices_all_unavailable": "⚠️ Current prices unavailable for all {n} holdings, so Current Price and Return % are blank. This is a data-source failure (usually Yahoo rate-limiting), not missing portfolio records — the picks themselves are stored. The result is cached for 5 minutes: use 🔄 Force Data Refresh in the sidebar, or retry shortly.",
         "sell_privacy_note": "Your portfolio list stays in this session only — it is never saved to the database.",
         "sell_paste_label": "Paste tickers (comma, space, or newline separated)",
         "sell_pick_label": "…or search and pick (ticker / English / 日本語)",
@@ -960,6 +963,7 @@ TRANSLATIONS = {
         "no_region_selected": "スキャンする地域を1つ以上選択してください。",
         "prices_skipped": "ライブ株価の更新はオフです。現在株価とリターンは空欄です。「履歴ポートフォリオの株価を更新」をオンにすると更新されます。",
         "prices_unavailable": "今回の更新で現在株価を取得できませんでした：{tickers}。これは通常、データ不良ではなくYahoo側のレート制限（共有IPやクラウドで発生しやすい）です。少し待ってから更新を再実行してください。",
+        "prices_all_unavailable": "⚠️ 保有{n}銘柄すべての現在値を取得できなかったため、「現在値」と「リターン%」は空欄です。これはデータソース側の問題（多くはYahooのレート制限）であり、記録された推奨銘柄自体は保存されています。結果は5分間キャッシュされるため、サイドバーの🔄データ強制更新を実行するか、少し待って再試行してください。",
         "sell_privacy_note": "ポートフォリオのリストはこのセッション内にのみ保持され、データベースには保存されません。",
         "sell_paste_label": "ティッカーを貼り付け（カンマ・スペース・改行区切り）",
         "sell_pick_label": "…または検索して選択（ティッカー／英語名／日本語名）",

@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from indicators import early_setup, SETUP_STATES
+from indicators import compute_rsi, early_setup, SETUP_STATES
 
 
 def _frame(closes, vols=None):
@@ -240,3 +240,53 @@ def test_zero_volume_bars_do_not_count_as_volume_data():
     out = early_setup(c, zeros)
     assert out["data_quality"]["volume_available"] is False
     assert out["components"]["accumulation"] == 50.0
+
+
+# ------------------------------- confirmation must clear the trigger
+def test_no_confirmation_while_below_the_trigger():
+    """Strong internals are not a breakout. If the close still sits below the prior
+    completed-bar high, CONFIRMED must not fire — previously it could, leaving the
+    displayed resistance contradicted by the state."""
+    # rising into resistance on expanding volume, but stopping just short of it
+    base = [1 + 0.004 * i for i in range(12)]            # sets a recent high
+    fade = [base[-1] * (1 - 0.004 * (i + 1)) for i in range(4)]   # pulls back under it
+    tail_vols = [1e6] * 12 + [3.5e6] * 4
+    c, v = _uptrend_then(180, 1.002, base + fade, tail_vols)
+    out = early_setup(c, v)
+    assert out is not None
+    assert float(c.iloc[-1]) < out["trigger"], "fixture must end below the trigger"
+    assert out["price_breakout"] is False
+    assert out["confirmed"] is False
+    assert out["state"] != "CONFIRMED"
+
+
+def test_confirmation_when_the_current_bar_crosses_a_pre_existing_trigger():
+    """The mirror case: the same setup, but the final bar clears the prior high on
+    expanding volume — all three conditions true, so confirmation is available."""
+    base = [1 + 0.004 * i for i in range(12)]
+    cross = [base[-1] * 1.03]                            # final bar jumps the level
+    tail_vols = [1e6] * 12 + [4.0e6]
+    c, v = _uptrend_then(180, 1.002, base + cross, tail_vols)
+    out = early_setup(c, v)
+    assert out is not None
+    assert float(c.iloc[-1]) > out["trigger"], "fixture must end above the trigger"
+    assert out["price_breakout"] is True
+    assert out["volume_confirmed"] is True
+    # EXTENDED is a legitimate outcome for a sharp jump; what must NOT happen is a
+    # confirmation that ignores price.
+    assert out["state"] in ("CONFIRMED", "EXTENDED", "SETUP STRENGTHENING")
+
+
+def test_rsi_edge_series_are_defined():
+    idx = pd.bdate_range("2026-01-05", periods=40)
+    assert compute_rsi(pd.Series(np.arange(1.0, 41.0), index=idx)).iloc[-1] == pytest.approx(100.0)
+    assert compute_rsi(pd.Series(np.arange(40.0, 0.0, -1.0), index=idx)).iloc[-1] == pytest.approx(0.0)
+    assert compute_rsi(pd.Series(100.0, index=idx)).iloc[-1] == pytest.approx(50.0)
+
+def test_stale_volume_endpoint_is_not_evidence():
+    c, v = _uptrend_then(200, 1.002, [1.0] * 6)
+    out = early_setup(c, v.iloc[:-3])
+    assert out["data_quality"]["volume_endpoint_current"] is False
+    assert out["data_quality"]["volume_available"] is False
+    assert out["components"]["accumulation"] == 50.0
+    assert out["volume_confirmed"] is False
