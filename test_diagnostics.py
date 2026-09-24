@@ -166,11 +166,12 @@ def test_candidates_persist_and_feed_the_ic_report(db):
             for i in range(20):
                 c.execute(
                     "INSERT INTO observations (scan_id, obs_date, ticker, benchmark, composite,"
-                    " rank_pct, factors, candidates, x20) VALUES (?,?,?,?,?,?,?,?,?)",
+                    " rank_pct, factors, candidates, x20, model_version)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
                     ("s", day, f"T{i}", "BM", 60.0, 50.0,
                      json.dumps({"momentum": float(x[i]), "value": float(rng.normal())}),
                      json.dumps({"mom_long_skip1m": float(-x[i]), "rel_ret_1m": float(rng.normal())}),
-                     float(x[i] + rng.normal(0, 0.3))))
+                     float(x[i] + rng.normal(0, 0.3)), app.PRODUCTION_MODEL_VERSION))
     table, n_dates = app.factor_ic_report(20)
     t = table.set_index("signal")
     assert n_dates == 12
@@ -223,3 +224,112 @@ def test_candidate_task_runs_before_observation_write(app, monkeypatch):
     monkeypatch.setattr(app, "record_observations", lambda r: order.append("obs"))
     app._run_post_scan_tasks([{"ticker": "AAA"}], {})
     assert order == ["mock", "setup", "cand", "obs"]
+
+
+# ================================================== relative momentum (v2 model)
+from indicators import momentum_score, relative_return, MOMENTUM_REL_SESSIONS
+
+
+def _trend(step, n=120):
+    return _close([100.0 * (step ** i) for i in range(n)])
+
+
+def test_relative_return_is_stock_minus_benchmark():
+    s, b = _trend(1.002), _trend(1.001)
+    expected = ((1.002 ** MOMENTUM_REL_SESSIONS) - (1.001 ** MOMENTUM_REL_SESSIONS)) * 100.0
+    assert relative_return(s, b) == pytest.approx(expected)
+
+
+def test_relative_return_rejects_stale_or_missing_benchmark():
+    s = _trend(1.002)
+    assert np.isnan(relative_return(s, None))
+    assert np.isnan(relative_return(s, s.iloc[:-3])), "benchmark ending early is unusable"
+
+
+def test_same_stock_scores_higher_when_it_beats_its_market():
+    """The point of the change: identical price action, different market context."""
+    s = _trend(1.002)
+    p, sma = float(s.iloc[-1]), float(s.rolling(50).mean().iloc[-1])
+    beating = momentum_score(p, sma, 0.5, relative_return(s, _trend(0.999)))
+    lagging = momentum_score(p, sma, 0.5, relative_return(s, _trend(1.004)))
+    assert beating > lagging + 15
+
+
+def test_broad_rally_no_longer_lifts_every_name():
+    """Two names rising exactly with the market must score neutral on the relative part
+    — under the old absolute formula both got the full return bonus."""
+    mkt = _trend(1.003)
+    stock = _trend(1.003)
+    assert relative_return(stock, mkt) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_missing_benchmark_is_neutral_not_invented():
+    s = _trend(1.002)
+    p, sma = float(s.iloc[-1]), float(s.rolling(50).mean().iloc[-1])
+    with_zero = momentum_score(p, sma, 0.5, 0.0)
+    without = momentum_score(p, sma, 0.5, float("nan"))
+    assert without == pytest.approx(with_zero), "no benchmark must equal a neutral 0"
+
+
+def test_momentum_scale_is_preserved():
+    """Range stays 0..100 around 50 with a total swing of +/-50, so the factor's scale,
+    the learned weights and the BUY/SELL thresholds keep their meaning."""
+    assert momentum_score(120.0, 100.0, 1.0, 50.0) == pytest.approx(100.0)   # all max
+    assert momentum_score(80.0, 100.0, -1.0, -50.0) == pytest.approx(0.0)    # all min
+    assert momentum_score(100.0, 100.0, 1.0, 0.0) == pytest.approx(60.0)     # neutral + MACD
+
+
+def test_trend_part_stays_absolute():
+    """Pure relative momentum would reward a stock falling slower than a crash. A name
+    below its own trend with a negative MACD must stay low even if it outperforms."""
+    falling_slowly_in_a_crash = momentum_score(85.0, 100.0, -1.0, +20.0)
+    assert falling_slowly_in_a_crash <= 50.0
+
+
+def test_analyze_ticker_uses_the_benchmark(app, monkeypatch):
+    """Integration: same stock history, strong vs weak benchmark -> different momentum;
+    the rest of the composite's inputs are unaffected."""
+    idx = pd.bdate_range("2026-01-05", periods=200)
+    hist = pd.DataFrame({"Close": [100.0 * (1.002 ** i) for i in range(200)],
+                         "Volume": [1e6] * 200}, index=idx)
+    monkeypatch.setattr(app, "fetch_fundamentals", lambda t: {
+        "pe": 15.0, "div_yield": 1.0, "market_cap": 1e10, "roe": 0.15, "short_pct": 0.02,
+        "payout": 0.3, "name": t, "sector": "", "industry": ""})
+    weak = pd.Series([100.0 * (0.999 ** i) for i in range(200)], index=idx)
+    strong = pd.Series([100.0 * (1.005 ** i) for i in range(200)], index=idx)
+    a = app.analyze_ticker("AAA", "USA", 0.0, hist=hist, bench_close=weak)
+    b = app.analyze_ticker("AAA", "USA", 0.0, hist=hist, bench_close=strong)
+    assert a["momentum"] > b["momentum"]
+    assert a["momentum_basis"] == "relative" and a["rel_ret_3m"] > 0 > b["rel_ret_3m"]
+    for k in ("value", "quality", "technical"):
+        assert a[k] == pytest.approx(b[k]), f"{k} must not depend on the benchmark"
+
+
+def test_analyze_ticker_flags_a_missing_benchmark(app, monkeypatch):
+    idx = pd.bdate_range("2026-01-05", periods=200)
+    hist = pd.DataFrame({"Close": [100.0 * (1.002 ** i) for i in range(200)]}, index=idx)
+    monkeypatch.setattr(app, "fetch_fundamentals", lambda t: {
+        "pe": 15.0, "div_yield": 1.0, "market_cap": 1e10, "roe": 0.15, "short_pct": 0.02,
+        "payout": 0.3, "name": t, "sector": "", "industry": ""})
+    monkeypatch.setattr(app, "_benchmark_close", lambda t: None)
+    out = app.analyze_ticker("AAA", "USA", 0.0, hist=hist)
+    assert out["momentum_basis"] == "no_benchmark" and np.isnan(out["rel_ret_3m"])
+
+
+def test_observations_are_stamped_and_lab_excludes_old_model(db):
+    app = db
+    app.record_observations([_row("NEW", 70.0)])
+    with app.get_conn() as c:
+        assert c.execute("SELECT model_version FROM observations").fetchone()[0] == \
+            app.PRODUCTION_MODEL_VERSION
+        # an old-model row with a matured outcome must not enter the buckets
+        c.execute("INSERT INTO observations (scan_id, obs_date, ticker, composite, rank_pct,"
+                  " factors, x20, model_version) VALUES (?,?,?,?,?,?,?,?)",
+                  ("o", "2026-01-05", "OLD", 95.0, 50.0, "{}", 9.9, None))
+    assert app.observation_buckets(20).empty, "v1 rows must not be pooled with v2"
+
+
+def test_candidate_keeps_the_old_basis_measurable():
+    c = _close([100.0 * (1.003 ** i) for i in range(230)])
+    out = candidate_signals(c)
+    assert out["abs_ret_1m"] == pytest.approx((1.003 ** 21 - 1.0) * 100.0)

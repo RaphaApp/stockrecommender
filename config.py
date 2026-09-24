@@ -8,7 +8,7 @@ focused on logic. No app dependencies; safe to import anywhere.
 # Bumped whenever app.py starts depending on new keys in this file. app.py compares
 # against its own expected value and warns if the two files were deployed out of
 # step — which otherwise shows up as raw keys like "board_no_csv" on screen.
-CONFIG_SCHEMA_VERSION = 18
+CONFIG_SCHEMA_VERSION = 19
 
 
 
@@ -660,6 +660,12 @@ TRANSLATIONS = {
         "ic_cand_mom_long": "Long momentum (skip last month)",
         "ic_cand_rel_1m": "1M return vs benchmark",
         "ic_note": "Rough guide: a mean IC of +0.03 to +0.05 that is positive on most dates is a useful signal; one that flips sign from date to date is noise; a consistently NEGATIVE IC means the factor points the wrong way. If a candidate beats the production factor it would replace, across horizons and over enough dates, that is the evidence for changing the model — not before. Descriptive, not a forecast.",
+        "evi_rel_3m": "3M return vs benchmark",
+        "evi_rel_3m_na": "— (benchmark unavailable; this part scored neutral)",
+        "evi_ret_1m_ctx": "1M return (context, not scored)",
+        "lab_prod_model": "Production model: `{version}` — momentum is market-relative (3-month return vs home benchmark). Only observations scored by this model are pooled below.",
+        "lab_prod_excluded": "{n} observation(s) scored by an earlier model (absolute 1-month momentum) are excluded from these tables. They remain stored; mixing the two definitions would measure neither.",
+        "ic_cand_abs_1m": "Raw 1M return (previous momentum basis)",
         "lab_horizon": "Horizon",
         "lab_days": "{d} trading days",
         "lab_empty": "No matured observations yet. The first 5-day results appear about a week after your first scan on this build; 20-day results about a month. Until then there is nothing honest to report.",
@@ -1127,6 +1133,12 @@ TRANSLATIONS = {
         "ic_cand_mom_long": "長期モメンタム（直近1か月除く）",
         "ic_cand_rel_1m": "1か月リターン（対ベンチマーク）",
         "ic_note": "目安：平均ICが+0.03〜+0.05で多くの日にプラスなら有用なシグナル、日によって符号が変わるならノイズ、一貫してマイナスなら逆方向を向いています。候補シグナルが置き換え対象の本番ファクターを、複数の期間かつ十分な日数で上回った時がモデル変更の根拠であり、それ以前ではありません。実績の記述であり予測ではありません。",
+        "evi_rel_3m": "3か月リターン（対ベンチマーク）",
+        "evi_rel_3m_na": "—（ベンチマーク取得不可のため中立で採点）",
+        "evi_ret_1m_ctx": "1か月リターン（参考、採点対象外）",
+        "lab_prod_model": "本番モデル：`{version}` — モメンタムは市場相対（本国ベンチマークに対する3か月リターン）です。以下の表はこのモデルで採点された観測のみを集計します。",
+        "lab_prod_excluded": "旧モデル（1か月の絶対モメンタム）で採点された観測{n}件はこれらの表から除外されています。データは保存されていますが、2つの定義を混ぜるとどちらも正しく測れません。",
+        "ic_cand_abs_1m": "1か月絶対リターン（旧モメンタム基準）",
         "lab_horizon": "期間",
         "lab_days": "{d}営業日",
         "lab_empty": "まだ評価可能な観測がありません。5日結果は初回スキャンから約1週間後、20日結果は約1か月後に表示されます。それまでは正直に報告できる内容がありません。",

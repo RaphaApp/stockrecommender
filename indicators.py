@@ -570,6 +570,61 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
 # ---------------------------------------------------------------------------
 # Factor diagnostics — measurement only, never feeds scoring
 # ---------------------------------------------------------------------------
+MOMENTUM_REL_SESSIONS = 63   # ~3 months: standard relative-strength horizon, and clear
+                             # of the 1-month window where returns tend to reverse
+
+
+def relative_return(close: pd.Series, bench_close: pd.Series | None,
+                    sessions: int = MOMENTUM_REL_SESSIONS) -> float:
+    """Stock return MINUS benchmark return over `sessions`, in percent.
+
+    Measured on the sessions both series share, and only if the benchmark's last bar
+    is the stock's last bar — the same alignment rules the Early Setup detector uses,
+    because comparing positions across two different trading calendars (a Japanese
+    holiday, a benchmark that stopped updating) silently misaligns the window.
+    NaN when unusable: a missing benchmark is reported as missing, never guessed.
+    """
+    if bench_close is None:
+        return float("nan")
+    c = close.dropna()
+    al = pd.concat([c.rename("s"), bench_close.dropna().rename("b")],
+                   axis=1, join="inner").dropna()
+    if len(al) <= sessions or al.index[-1] != c.index[-1]:
+        return float("nan")
+    s0, s1 = float(al["s"].iloc[-sessions - 1]), float(al["s"].iloc[-1])
+    b0, b1 = float(al["b"].iloc[-sessions - 1]), float(al["b"].iloc[-1])
+    if s0 <= 0 or b0 <= 0:
+        return float("nan")
+    return ((s1 / s0) - (b1 / b0)) * 100.0
+
+
+def momentum_score(price: float, sma50: float, macd_hist_last: float,
+                   rel_ret_pct: float) -> float:
+    """Production momentum factor, 0-100 (50 = neutral).
+
+      own trend      price vs its SMA50            +/-20
+      direction      MACD histogram sign           +/-10
+      vs the market  3-month return MINUS the      +/-20   (1 point per 1% of
+                     home benchmark's                        outperformance)
+
+    The market-relative part used to be a raw 1-month return worth only +/-13, so in a
+    broad rally every name scored well and leaders were not distinguished from the
+    tide. The trend part stays ABSOLUTE deliberately: pure relative momentum would
+    reward a stock merely falling more slowly than a crashing market. The blend asks
+    for both — trending up AND beating the benchmark. Total range is unchanged at
+    +/-50, so the factor's scale, the learned weights and the BUY/SELL thresholds keep
+    their meaning. A missing benchmark contributes 0 (neutral), not an invented value.
+    """
+    s = 50.0
+    if sma50 and sma50 > 0 and not np.isnan(sma50) and not np.isnan(price):
+        s += clamp((price / sma50 - 1.0) * 200.0, -20.0, 20.0)
+    s += 10.0 if (macd_hist_last is not None and not np.isnan(macd_hist_last)
+                  and macd_hist_last > 0) else -10.0
+    if rel_ret_pct is not None and not np.isnan(rel_ret_pct):
+        s += clamp(float(rel_ret_pct), -20.0, 20.0)
+    return clamp(s)
+
+
 def candidate_signals(close: pd.Series, bench_close: pd.Series | None = None) -> dict:
     """Alternative signals recorded ALONGSIDE the production factors, so the Model Lab
     can test whether they would forecast better before anyone changes the model.
@@ -586,20 +641,18 @@ def candidate_signals(close: pd.Series, bench_close: pd.Series | None = None) ->
     NaN when inputs don't support a value (never a guess). Uses only data up to the last
     bar, so there is no look-ahead. Pure function.
     """
-    out = {"mom_long_skip1m": float("nan"), "rel_ret_1m": float("nan")}
+    out = {"mom_long_skip1m": float("nan"), "rel_ret_1m": float("nan"),
+           "abs_ret_1m": float("nan")}
     c = close.dropna()
+    # The PREVIOUS production momentum basis (raw 1-month return), kept as a candidate
+    # so the Model Lab can compare old vs new on the same observations.
+    if len(c) >= 22 and float(c.iloc[-22]) > 0:
+        out["abs_ret_1m"] = (float(c.iloc[-1]) / float(c.iloc[-22]) - 1.0) * 100.0
     if len(c) >= 200:
         start, skip = float(c.iloc[0]), float(c.iloc[-22])
         if start > 0:
             out["mom_long_skip1m"] = (skip / start - 1.0) * 100.0
-    if bench_close is not None and len(c) >= 22:
-        al = pd.concat([c.rename("s"), bench_close.dropna().rename("b")],
-                       axis=1, join="inner").dropna()
-        if len(al) >= 22 and al.index[-1] == c.index[-1]:
-            s0, s1 = float(al["s"].iloc[-22]), float(al["s"].iloc[-1])
-            b0, b1 = float(al["b"].iloc[-22]), float(al["b"].iloc[-1])
-            if s0 > 0 and b0 > 0:
-                out["rel_ret_1m"] = ((s1 / s0) - (b1 / b0)) * 100.0
+    out["rel_ret_1m"] = relative_return(c, bench_close, sessions=21)
     return out
 
 

@@ -453,6 +453,13 @@ EVAL_HORIZON_DAYS = 14
 # excluded from accuracy. Values are fixed for backward compatibility with rows
 # already written by earlier builds.
 OUTCOME_LOSS, OUTCOME_WIN, OUTCOME_NEUTRAL = 0, 1, 2
+
+# Stamped on every observation. Bump whenever a production FACTOR changes meaning:
+# rows scored by a different factor definition are a different model and must not be
+# pooled with the current one in the Model Lab.
+#   v1 — momentum return term = raw 1-month return (+/-13)
+#   v2 — momentum return term = 3-month return vs home benchmark (+/-20), rebalanced
+PRODUCTION_MODEL_VERSION = "composite-v2-relative-momentum"
 DIRECTIONAL_CALLS = ("BUY", "SELL")
 
 BUY_THRESHOLD = 65.0
@@ -470,7 +477,7 @@ try:
     from config import CONFIG_SCHEMA_VERSION
 except ImportError:
     CONFIG_SCHEMA_VERSION = 0
-EXPECTED_CONFIG_SCHEMA = 18
+EXPECTED_CONFIG_SCHEMA = 19
 
 try:
     from config import INSTRUMENT_JA
@@ -491,6 +498,7 @@ from indicators import (
     forum_sentiment_score, forum_euphoria_sell_score, theme_strength_score,
     payout_penalty, compute_atr, trade_levels, early_setup, SETUP_STATES,
     EARLY_SETUP_MODEL_VERSION, candidate_signals, cross_sectional_ic,
+    relative_return, momentum_score as _momentum_score, MOMENTUM_REL_SESSIONS,
 )
 ALL_TICKERS = [ticker for region in TICKER_UNIVERSE.values() for ticker in region]
 
@@ -1133,7 +1141,8 @@ def init_db() -> None:
                        ("setup_is_new", "INTEGER DEFAULT 0"),
                        ("setup_state_changed", "INTEGER DEFAULT 0"),
                        ("setup_previous_state", "TEXT"),
-                       ("candidates", "TEXT")):
+                       ("candidates", "TEXT"),
+                       ("model_version", "TEXT")):
             _ensure_column(conn, "observations", _c, _t)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_scan ON observations(scan_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_ticker ON observations(ticker, obs_date)")
@@ -1738,9 +1747,21 @@ def fetch_jp_forum_rating(ticker: str) -> tuple[float, float] | None:
         return None
 
 
+def _benchmark_close(ticker: str) -> pd.Series | None:
+    """Home-benchmark closes for `ticker`, via the session history cache — so this is a
+    cache hit whenever run_engine already downloaded the benchmark in its bulk call."""
+    try:
+        bh = get_histories([benchmark_for(ticker)], period="1y").get(benchmark_for(ticker))
+        return bh["Close"] if bh is not None and "Close" in bh.columns else None
+    except Exception as e:
+        logger.warning("benchmark history unavailable for %s: %s", ticker, e)
+        return None
+
+
 def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
                    jp_forum: tuple | None = None,
-                   hist: pd.DataFrame | None = None) -> dict | None:
+                   hist: pd.DataFrame | None = None,
+                   bench_close: pd.Series | None = None) -> dict | None:
     # `hist` lets bulk callers (run_engine / run_deep_scan) hand in the frame from
     # ONE yf.download for the whole universe instead of paying a per-ticker request;
     # names the bulk call missed fall back to the per-ticker fetch (retry + Stooq).
@@ -1768,9 +1789,13 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
     hype = compute_hype(volume)
 
     # Scoring Engine Logic
-    mom = 50.0 + (clamp((price / sma50 - 1) * 200, -25, 25) if sma50 > 0 else 0)
-    mom += 12 if safe_float(hist_macd.iloc[-1]) > 0 else -12
-    momentum_score = clamp(mom + clamp(ret_1m if not math.isnan(ret_1m) else 0.0, -13, 13))
+    # Momentum is now MARKET-RELATIVE: the return term is the 3-month return minus the
+    # home benchmark's (see indicators.momentum_score for the full rationale).
+    if bench_close is None:
+        bench_close = _benchmark_close(ticker)
+    rel_ret_3m = relative_return(close, bench_close, sessions=MOMENTUM_REL_SESSIONS)
+    momentum_score = _momentum_score(price, sma50, safe_float(hist_macd.iloc[-1]), rel_ret_3m)
+    momentum_basis = "relative" if not math.isnan(rel_ret_3m) else "no_benchmark"
 
     pe = funds["pe"]
     value_score = 50.0 if math.isnan(pe) or pe <= 0 else clamp(100 - (pe - 10) * 2.0)
@@ -1817,6 +1842,7 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
         "ticker": ticker, "region": region, "name": funds["name"], "price": price,
         "sma20": sma20, "sma50": sma50, "rsi": rsi, "macd_hist": safe_float(hist_macd.iloc[-1]),
         "bb_pct": pct_b, "ret_1m": ret_1m, "pe": pe, "div_yield": funds["div_yield"],
+        "rel_ret_3m": rel_ret_3m, "momentum_basis": momentum_basis,
         "payout": funds["payout"], "atr": atr,
         "entry_lo": (levels["entry_lo"] if levels else float("nan")),
         "entry_hi": (levels["entry_hi"] if levels else float("nan")),
@@ -2369,6 +2395,7 @@ def record_observations(results: list[dict]) -> int:
             1 if r.get("setup_state_changed") else 0,
             str(r.get("setup_previous_state") or ""),
             json.dumps(r.get("candidates") or {}),
+            PRODUCTION_MODEL_VERSION,
         ))
     try:
         with get_conn() as conn:
@@ -2383,8 +2410,8 @@ def record_observations(results: list[dict]) -> int:
                 "price, composite, recommendation, rank_pct, factors, "
                 "setup_score, setup_state, setup_components, ret_1m, setup_quality, "
                 "setup_metrics, setup_model_version, setup_is_new, "
-                "setup_state_changed, setup_previous_state, candidates) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                "setup_state_changed, setup_previous_state, candidates, model_version) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     except Exception as e:
         logger.warning("observation write skipped: %s", e)
         return 0
@@ -2536,7 +2563,8 @@ def factor_ic_report(horizon: int = 20) -> tuple[pd.DataFrame, int]:
         with get_conn() as conn:
             df = pd.read_sql_query(
                 f"SELECT obs_date, factors, candidates, {col} AS target FROM observations "
-                f"WHERE {col} IS NOT NULL", conn)
+                f"WHERE {col} IS NOT NULL AND model_version = ?", conn,
+                params=(PRODUCTION_MODEL_VERSION,))
     except Exception as e:
         logger.warning("IC read skipped: %s", e)
         return pd.DataFrame(), 0
@@ -2589,7 +2617,8 @@ def observation_buckets(horizon: int = 20) -> pd.DataFrame:
         with get_conn() as conn:
             df = pd.read_sql_query(
                 f"SELECT composite, {col} AS excess FROM observations "
-                f"WHERE {col} IS NOT NULL", conn)
+                f"WHERE {col} IS NOT NULL AND model_version = ?", conn,
+                params=(PRODUCTION_MODEL_VERSION,))
     except Exception as e:
         logger.warning("bucket read skipped: %s", e)
         return pd.DataFrame()
@@ -3094,7 +3123,11 @@ def run_engine(limit_per_region: int | None = None,
     # walk-forward period, so get_histories serves ALL of them from one download;
     # analyze_ticker only reads tail slices, so the longer frame changes nothing.
     all_symbols = [t for ticks in universe.values() for t in ticks]
-    bulk = get_histories(all_symbols, period="1y")
+    # Benchmarks ride in the same single download (a handful of index symbols), so
+    # relative momentum costs no extra request.
+    _benches = sorted({benchmark_for(t) for t in all_symbols})
+    bulk = get_histories(all_symbols + [b for b in _benches if b not in all_symbols],
+                         period="1y")
     # Scan-local map of the FULL OHLCV frames actually used. Seeded from the bulk
     # download and extended below with any per-ticker recovery, so Early Setup sees
     # volume for recovered names too. Deliberately local: never persisted, never put
@@ -3129,8 +3162,11 @@ def run_engine(limit_per_region: int | None = None,
                         frame = None
                 if frame is not None:
                     scan_histories[t] = frame
+                _bf = bulk.get(benchmark_for(t))
                 analysis = analyze_ticker(t, region, hype_counts.get(t, 0),
-                                          jp_forum=jp_rating, hist=frame)
+                                          jp_forum=jp_rating, hist=frame,
+                                          bench_close=(_bf["Close"] if _bf is not None
+                                                       and "Close" in _bf.columns else None))
                 if analysis is None:
                     failed.append(f"{t} (no data)")
                 else:
@@ -3499,6 +3535,14 @@ def _pick_breakdown(r: dict, weights: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _rel3m_disp(r: dict) -> str:
+    """3-month return vs benchmark, or an explicit reason when it couldn't be measured."""
+    v = safe_float(r.get("rel_ret_3m"))
+    if math.isnan(v):
+        return tr("evi_rel_3m_na")
+    return f"{v:+.1f}%"
+
+
 def _payout_disp(p: float) -> str:
     """Payout ratio display: '65%', '112% ⚠' above 100%, '—' when unknown."""
     if math.isnan(p) or p <= 0:
@@ -3521,9 +3565,12 @@ def _evidence_rows(r: dict) -> list:
     ret1m = _f(r.get("ret_1m"))
     jp_bull, jp_bear = _f(r.get("jp_bull")), _f(r.get("jp_bear"))
     rows = [
-        (fm, tr("evi_ret_1m"),  "—" if math.isnan(ret1m) else f"{ret1m:+.1f}%"),
+        # The market-relative return is what now drives momentum, so it leads; the raw
+        # 1-month return stays as context but no longer feeds the factor.
+        (fm, tr("evi_rel_3m"),   _rel3m_disp(r)),
         (fm, tr("evi_vs_sma50"), vs50),
         (fm, tr("evi_macd"),     macd_s),
+        (fm, tr("evi_ret_1m_ctx"), "—" if math.isnan(ret1m) else f"{ret1m:+.1f}%"),
         (fv, tr("evi_pe"),       "—" if (math.isnan(pe) or pe <= 0) else f"{pe:,.1f}"),
         (fv, tr("evi_div"),      "—" if math.isnan(div) else f"{div:.2f}%"),       # div_yield already in %
         (fv, tr("evi_payout"),   _payout_disp(_f(r.get("payout")))),
@@ -4387,6 +4434,18 @@ def render_engine_audit(update_prices: bool = True) -> None:
         except Exception:
             _tot, _mat = 0, 0
         st.caption(tr("lab_intro", total=_tot, matured=_mat))
+        # Rows scored by an earlier factor definition are kept but not pooled: mixing
+        # absolute-momentum and relative-momentum rows would measure neither model.
+        try:
+            with get_conn() as _c:
+                _old = _c.execute(
+                    "SELECT COUNT(*) FROM observations WHERE model_version IS NULL "
+                    "OR model_version <> ?", (PRODUCTION_MODEL_VERSION,)).fetchone()[0]
+        except Exception:
+            _old = 0
+        st.caption(tr("lab_prod_model", version=PRODUCTION_MODEL_VERSION))
+        if _old:
+            st.caption(tr("lab_prod_excluded", n=_old))
         _h = st.radio(tr("lab_horizon"), list(OBS_HORIZONS), horizontal=True,
                       format_func=lambda d: tr("lab_days", d=d), key="lab_h")
         _b = observation_buckets(int(_h))
@@ -4415,8 +4474,9 @@ def render_engine_audit(update_prices: bool = True) -> None:
                     "technical": tr("factor_technical"), "hype": tr("factor_hype"),
                     "quality": tr("factor_quality"), "theme": tr("factor_theme"),
                     "mom_long_skip1m": tr("ic_cand_mom_long"),
-                    "rel_ret_1m": tr("ic_cand_rel_1m")}
-            _cand = {"mom_long_skip1m", "rel_ret_1m"}
+                    "rel_ret_1m": tr("ic_cand_rel_1m"),
+                    "abs_ret_1m": tr("ic_cand_abs_1m")}
+            _cand = {"mom_long_skip1m", "rel_ret_1m", "abs_ret_1m"}
             _ic = _ic.assign(kind=_ic["signal"].map(
                 lambda x: tr("ic_kind_candidate") if x in _cand else tr("ic_kind_production")))
             _ic["signal"] = _ic["signal"].map(lambda x: _lab.get(x, x))
@@ -4754,7 +4814,7 @@ ride along with your daily scans.
 weights** (see "How the engine learns" below)."""),
         ("📊 The six KPI factors",
          """Every stock gets a 0–100 score per factor; the composite is the weighted average.
-- **Momentum** — price vs. its 50-day average, MACD direction, and the 1-month return.
+- **Momentum** — price vs. its 50-day average, MACD direction, and the **3-month return relative to the home benchmark** (S&P 500, Nikkei 225, etc.). A stock only scores highly if it is trending up *and* beating its market — so a broad rally no longer lifts everything.
 - **Value** — trailing P/E mapped to a score (cheaper = higher), plus a dividend-yield bonus.
 - **Technical** — RSI positioning and Bollinger %B; rewards healthy, mid-band setups over
 overbought/oversold extremes.
@@ -4814,7 +4874,7 @@ licensed financial advisor before trading."""),
 5. エンジンは自らのピックを記録し、2週間後に成績を判定して**ファクターの重みを自動調整**します（下記参照）。"""),
         ("📊 6つのKPIファクター",
          """各銘柄はファクターごとに0–100点、コンポジットはその加重平均です。
-- **モメンタム** — 50日移動平均との乖離、MACDの向き、1ヶ月リターン。
+- **モメンタム** — 50日移動平均との乖離、MACDの向き、そして**本国ベンチマーク（S&P500、日経225など）に対する3か月相対リターン**。上昇トレンドにあり、かつ市場を上回っている銘柄だけが高評価となるため、相場全体の上昇ですべての銘柄が高得点になることはありません。
 - **バリュー** — 実績PER（割安ほど高得点）＋配当利回りボーナス。
 - **テクニカル** — RSIの位置とボリンジャー%B。過熱・売られすぎより健全な中間帯を評価。
 - **ハイプ** — 30日ベースライン比の出来高ブレイクアウトに、Reddit・GDELTニュース・
