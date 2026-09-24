@@ -470,7 +470,7 @@ try:
     from config import CONFIG_SCHEMA_VERSION
 except ImportError:
     CONFIG_SCHEMA_VERSION = 0
-EXPECTED_CONFIG_SCHEMA = 16
+EXPECTED_CONFIG_SCHEMA = 18
 
 try:
     from config import INSTRUMENT_JA
@@ -490,7 +490,7 @@ from indicators import (
     compute_rsi, compute_macd, compute_bollinger, compute_hype, clamp, screen_metrics,
     forum_sentiment_score, forum_euphoria_sell_score, theme_strength_score,
     payout_penalty, compute_atr, trade_levels, early_setup, SETUP_STATES,
-    EARLY_SETUP_MODEL_VERSION,
+    EARLY_SETUP_MODEL_VERSION, candidate_signals, cross_sectional_ic,
 )
 ALL_TICKERS = [ticker for region in TICKER_UNIVERSE.values() for ticker in region]
 
@@ -1132,7 +1132,8 @@ def init_db() -> None:
                        ("setup_model_version", "TEXT"),
                        ("setup_is_new", "INTEGER DEFAULT 0"),
                        ("setup_state_changed", "INTEGER DEFAULT 0"),
-                       ("setup_previous_state", "TEXT")):
+                       ("setup_previous_state", "TEXT"),
+                       ("candidates", "TEXT")):
             _ensure_column(conn, "observations", _c, _t)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_scan ON observations(scan_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_ticker ON observations(ticker, obs_date)")
@@ -2367,6 +2368,7 @@ def record_observations(results: list[dict]) -> int:
             1 if r.get("setup_is_new") else 0,
             1 if r.get("setup_state_changed") else 0,
             str(r.get("setup_previous_state") or ""),
+            json.dumps(r.get("candidates") or {}),
         ))
     try:
         with get_conn() as conn:
@@ -2381,8 +2383,8 @@ def record_observations(results: list[dict]) -> int:
                 "price, composite, recommendation, rank_pct, factors, "
                 "setup_score, setup_state, setup_components, ret_1m, setup_quality, "
                 "setup_metrics, setup_model_version, setup_is_new, "
-                "setup_state_changed, setup_previous_state) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                "setup_state_changed, setup_previous_state, candidates) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     except Exception as e:
         logger.warning("observation write skipped: %s", e)
         return 0
@@ -2460,7 +2462,8 @@ def evaluate_observations(limit_tickers: int = 120) -> int:
 
 
 def setup_buckets(horizon: int = 20, modest_only: bool = False,
-                  modest_band: float = 5.0) -> pd.DataFrame:
+                  modest_band: float = 5.0,
+                  model_version: str = EARLY_SETUP_MODEL_VERSION) -> pd.DataFrame:
     """Realised forward excess return by EARLY SETUP bucket.
 
     `modest_only` restricts to names whose prior 1-month return was within
@@ -2474,7 +2477,8 @@ def setup_buckets(horizon: int = 20, modest_only: bool = False,
         with get_conn() as conn:
             df = pd.read_sql_query(
                 f"SELECT setup_score, setup_state, composite, ret_1m, {col} AS excess "
-                f"FROM observations WHERE {col} IS NOT NULL AND setup_score IS NOT NULL", conn)
+                f"FROM observations WHERE {col} IS NOT NULL AND setup_score IS NOT NULL "
+                "AND setup_model_version = ?", conn, params=(model_version,))
     except Exception as e:
         logger.warning("setup bucket read skipped: %s", e)
         return pd.DataFrame()
@@ -2493,7 +2497,8 @@ def setup_buckets(horizon: int = 20, modest_only: bool = False,
     return out[out["count"] > 0]
 
 
-def setup_state_performance(horizon: int = 20) -> pd.DataFrame:
+def setup_state_performance(horizon: int = 20,
+                            model_version: str = EARLY_SETUP_MODEL_VERSION) -> pd.DataFrame:
     """Forward excess return grouped by setup STATE — the check that the state
     ladder is ordered sensibly (SETUP FAILED should not out-earn CONFIRMED)."""
     col = f"x{horizon}"
@@ -2502,7 +2507,8 @@ def setup_state_performance(horizon: int = 20) -> pd.DataFrame:
             df = pd.read_sql_query(
                 f"SELECT setup_state, {col} AS excess FROM observations "
                 f"WHERE {col} IS NOT NULL AND setup_state IS NOT NULL "
-                f"AND setup_state <> ''", conn)
+                f"AND setup_state <> '' AND setup_model_version = ?",
+                conn, params=(model_version,))
     except Exception as e:
         logger.warning("setup state read skipped: %s", e)
         return pd.DataFrame()
@@ -2513,6 +2519,64 @@ def setup_state_performance(horizon: int = 20) -> pd.DataFrame:
     order = {s: i for i, s in enumerate(SETUP_STATES)}
     out["_o"] = out["setup_state"].map(lambda s: order.get(s, 99))
     return out.sort_values("_o").drop(columns="_o")
+
+
+IC_MIN_DATES = 10    # scan dates with matured outcomes before an IC is shown as readable
+
+
+def factor_ic_report(horizon: int = 20) -> tuple[pd.DataFrame, int]:
+    """Cross-sectional Information Coefficient for each production factor and each
+    candidate signal against realised excess return. Returns (table, n_dates).
+
+    This is the missing piece for any honest model change: the composite-bucket view
+    says whether the blend works, this says WHICH ingredient works. Read-only.
+    """
+    col = f"x{horizon}"
+    try:
+        with get_conn() as conn:
+            df = pd.read_sql_query(
+                f"SELECT obs_date, factors, candidates, {col} AS target FROM observations "
+                f"WHERE {col} IS NOT NULL", conn)
+    except Exception as e:
+        logger.warning("IC read skipped: %s", e)
+        return pd.DataFrame(), 0
+    if df.empty:
+        return pd.DataFrame(), 0
+    def _load(txt):
+        try:
+            return json.loads(txt or "{}")
+        except Exception:
+            return {}
+    fac = pd.DataFrame([_load(t) for t in df["factors"]], index=df.index)
+    cand = pd.DataFrame([_load(t) for t in df["candidates"]], index=df.index)
+    wide = pd.concat([df[["obs_date", "target"]], fac, cand], axis=1)
+    signals = [c for c in list(fac.columns) + list(cand.columns) if c in wide.columns]
+    table = cross_sectional_ic(wide, signals, "target")
+    return table, int(wide["obs_date"].nunique())
+
+
+def previous_composites(tickers: list) -> dict:
+    """{ticker: (composite, obs_date)} from the most recent observation BEFORE today.
+
+    Today's own rows are excluded, so rescanning the same day compares against the
+    previous session's view rather than against itself.
+    """
+    if not tickers:
+        return {}
+    try:
+        marks = ",".join("?" for _ in tickers)
+        with get_conn() as conn:
+            rows = conn.execute(
+                f"SELECT ticker, composite, obs_date FROM observations WHERE ticker IN ({marks}) "
+                "AND obs_date < ? AND composite IS NOT NULL ORDER BY obs_date DESC, id DESC",
+                (*tickers, date.today().isoformat())).fetchall()
+    except Exception as e:
+        logger.warning("previous composite lookup skipped: %s", e)
+        return {}
+    out: dict = {}
+    for t, comp, d in rows:
+        out.setdefault(t, (safe_float(comp), d))
+    return out
 
 
 def observation_buckets(horizon: int = 20) -> pd.DataFrame:
@@ -2930,6 +2994,40 @@ def seed_demo_history() -> None:
         tot = sum(w.values())
         save_weights({f: w[f] / tot for f in FACTORS}, note="Demo backfill loop simulation")
 
+def attach_candidate_signals(results: list[dict], histories: dict | None = None) -> int:
+    """Record alternative signals next to the production factors (measurement only).
+
+    Nothing here changes a score, a call or a weight. It exists so the Model Lab can
+    compare, on your own data, whether e.g. long-horizon momentum forecasts better
+    than the 1-month return the production momentum factor currently uses — evidence
+    to base a later model change on, instead of changing the model on theory.
+    """
+    if not results:
+        return 0
+    histories = histories or {}
+    benches = sorted({benchmark_for(r["ticker"]) for r in results if r.get("ticker")})
+    try:
+        bhist = get_histories(benches, period="1y")   # cached: same call early setup makes
+    except Exception as e:
+        logger.warning("benchmark history for candidate signals unavailable: %s", e)
+        bhist = {}
+    n = 0
+    for r in results:
+        hist = histories.get(r.get("ticker"))
+        if hist is None:
+            hist = r.get("history")
+        if hist is None or getattr(hist, "empty", True) or "Close" not in hist.columns:
+            continue
+        bh = bhist.get(benchmark_for(r["ticker"]))
+        try:
+            r["candidates"] = candidate_signals(
+                hist["Close"], bh["Close"] if bh is not None and "Close" in bh.columns else None)
+            n += 1
+        except Exception as e:
+            logger.warning("candidate signals failed for %s: %s", r.get("ticker"), e)
+    return n
+
+
 def _run_post_scan_tasks(results: list[dict], scan_histories: dict) -> None:
     """Three unrelated post-scan jobs, independently guarded.
 
@@ -2947,6 +3045,10 @@ def _run_post_scan_tasks(results: list[dict], scan_histories: dict) -> None:
         attach_early_setups(results, histories=scan_histories)
     except Exception as e:
         logger.warning("early setup attachment failed: %s", e)
+    try:
+        attach_candidate_signals(results, histories=scan_histories)
+    except Exception as e:
+        logger.warning("candidate signal attachment failed: %s", e)
     try:
         record_observations(results)
     except Exception as e:
@@ -3085,19 +3187,81 @@ def render_daily_top_3(results: list[dict]) -> None:
     if not results:
         st.info(tr("need_scan_sidebar"))
         return
+    # One read for the whole page: the previous scan's composite per name, so every
+    # card and the movers table can say what CHANGED — a score of 72 means more
+    # when you know it was 61 last time.
+    prev = previous_composites([r["ticker"] for r in results if r.get("ticker")])
     top_3 = results[:3]
     c1, c2, c3 = st.columns(3)
     for i, col in enumerate([c1, c2, c3]):
         if i < len(top_3):
             r = top_3[i]
-            col.markdown(metric_card(f"{r['ticker']} · {region_name(r['region'])}", f"{r['composite']:.1f}/100 {tr('score_suffix')}", f"{tr('price_label')}: {fmt_money(r['price'])}", positive=r['composite'] >= BUY_THRESHOLD), unsafe_allow_html=True)
+            comp = safe_float(r.get("composite"))
+            p = prev.get(r["ticker"])
+            if p and not math.isnan(p[0]) and not math.isnan(comp):
+                delta = f"{comp - p[0]:+.1f} {tr('delta_vs_last')}"
+                positive = comp >= p[0]
+            else:
+                delta = f"{tr('price_label')}: {fmt_money(r['price'])}"
+                positive = comp >= BUY_THRESHOLD
+            col.markdown(metric_card(f"{r['ticker']} · {region_name(r['region'])}",
+                                     f"{comp:.1f}/100 {tr('score_suffix')}",
+                                     delta, positive=positive), unsafe_allow_html=True)
             div_txt = f"{r['div_yield']:.2f}%" if not math.isnan(r['div_yield']) else "—"
             col.markdown(
                 f"**{tr('company_profile')}:** {r['name']} <br>"
+                f"**{tr('price_label')}:** {fmt_money(r['price'])} <br>"
                 f"**{tr('trend_return_1m')}:** {fmt_pct(r['ret_1m'])} <br>"
                 f"**{tr('pe_ratio')}:** {fmt_num(r['pe'], 1)} &nbsp;·&nbsp; **{tr('dividend_yield')}:** {div_txt}",
                 unsafe_allow_html=True,
             )
+
+    # --- What changed since the last scan ----------------------------------
+    moves = []
+    for r in results:
+        p = prev.get(r.get("ticker"))
+        comp = safe_float(r.get("composite"))
+        if p and not math.isnan(p[0]) and not math.isnan(comp):
+            moves.append({"r": r, "delta": comp - p[0], "was": p[0], "since": p[1],
+                          "call_changed": False})
+    if not moves:
+        st.caption(tr("movers_none"))
+        return
+    st.markdown(f"#### {tr('movers_header')}")
+    st.caption(tr("movers_intro", since=max(m["since"] for m in moves)))
+    moves.sort(key=lambda m: m["delta"], reverse=True)
+    risers = [m for m in moves if m["delta"] > 0][:5]
+    fallers = [m for m in reversed(moves) if m["delta"] < 0][:5]
+
+    def _table(items):
+        return pd.DataFrame([{
+            tr("col_ticker"): m["r"]["ticker"],
+            tr("col_company"): m["r"].get("name", m["r"]["ticker"]),
+            tr("col_region"): region_name(m["r"].get("region", "")),
+            tr("movers_col_was"): m["was"],
+            tr("col_overall_score"): safe_float(m["r"].get("composite")),
+            tr("movers_col_change"): m["delta"],
+            tr("why_call"): str(m["r"].get("recommendation", "—")),
+        } for m in items])
+    fmt = {tr("movers_col_was"): "{:.1f}", tr("col_overall_score"): "{:.1f}",
+           tr("movers_col_change"): "{:+.1f}"}
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        st.markdown(f"**{tr('movers_up')}**")
+        if risers:
+            st.dataframe(_table(risers).style.format(fmt, na_rep="—"),
+                         width="stretch", hide_index=True)
+        else:
+            st.caption("—")
+    with mc2:
+        st.markdown(f"**{tr('movers_down')}**")
+        if fallers:
+            st.dataframe(_table(fallers).style.format(fmt, na_rep="—"),
+                         width="stretch", hide_index=True)
+        else:
+            st.caption("—")
+    st.caption(tr("movers_note"))
+
 
 # --- US Conviction tab (US-only; SEC EDGAR fundamentals) -------------------------
 # Deliberately isolated: it blends each US name's existing scan composite with SEC
@@ -4238,9 +4402,53 @@ def render_engine_audit(update_prices: bool = True) -> None:
                          width="stretch", hide_index=True)
             st.caption(tr("lab_note"))
 
+        # --- Which factor actually forecasts? (measurement only) ----------
+        st.markdown(f"**{tr('ic_header')}**")
+        st.caption(tr("ic_intro"))
+        _ic, _ndates = factor_ic_report(int(_h))
+        if _ic.empty or _ndates == 0:
+            st.info(tr("ic_empty"))
+        else:
+            if _ndates < IC_MIN_DATES:
+                st.warning(tr("ic_thin", n=_ndates, need=IC_MIN_DATES))
+            _lab = {"momentum": tr("factor_momentum"), "value": tr("factor_value"),
+                    "technical": tr("factor_technical"), "hype": tr("factor_hype"),
+                    "quality": tr("factor_quality"), "theme": tr("factor_theme"),
+                    "mom_long_skip1m": tr("ic_cand_mom_long"),
+                    "rel_ret_1m": tr("ic_cand_rel_1m")}
+            _cand = {"mom_long_skip1m", "rel_ret_1m"}
+            _ic = _ic.assign(kind=_ic["signal"].map(
+                lambda x: tr("ic_kind_candidate") if x in _cand else tr("ic_kind_production")))
+            _ic["signal"] = _ic["signal"].map(lambda x: _lab.get(x, x))
+            _ic = _ic.sort_values("mean_ic", ascending=False, na_position="last")
+            st.dataframe(_ic.rename(columns={
+                "signal": tr("ic_col_signal"), "kind": tr("ic_col_kind"),
+                "mean_ic": tr("ic_col_ic"), "n_dates": tr("ic_col_dates"),
+                "pct_positive": tr("ic_col_stable"), "n_obs": tr("lab_col_n")})
+                [[tr("ic_col_signal"), tr("ic_col_kind"), tr("ic_col_ic"),
+                  tr("ic_col_stable"), tr("ic_col_dates"), tr("lab_col_n")]]
+                .style.format({tr("ic_col_ic"): "{:+.3f}", tr("ic_col_stable"): "{:.0f}%"},
+                              na_rep="—"),
+                width="stretch", hide_index=True)
+            st.caption(tr("ic_note"))
+
         # --- Early Setup comparison (measurement only) --------------------
         st.markdown(f"**{tr('setup_lab_header')}**")
         st.caption(tr("setup_lab_intro"))
+        st.caption(tr("setup_lab_model", version=EARLY_SETUP_MODEL_VERSION))
+        # Version filtering hides rows scored by an older detector — correct, since
+        # mixing them would compare different models in one bucket, but it must be
+        # visible or the lab silently empties itself after every version bump.
+        try:
+            with get_conn() as _c:
+                _other = _c.execute(
+                    "SELECT COUNT(*) FROM observations WHERE setup_score IS NOT NULL "
+                    "AND (setup_model_version IS NULL OR setup_model_version <> ?)",
+                    (EARLY_SETUP_MODEL_VERSION,)).fetchone()[0]
+        except Exception:
+            _other = 0
+        if _other:
+            st.caption(tr("setup_lab_excluded", n=_other))
         _cov = setup_coverage()
         if _cov["total"]:
             st.caption(tr("setup_lab_coverage", n=_cov["total"],

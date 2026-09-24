@@ -8,7 +8,7 @@ focused on logic. No app dependencies; safe to import anywhere.
 # Bumped whenever app.py starts depending on new keys in this file. app.py compares
 # against its own expected value and warns if the two files were deployed out of
 # step — which otherwise shows up as raw keys like "board_no_csv" on screen.
-CONFIG_SCHEMA_VERSION = 16
+CONFIG_SCHEMA_VERSION = 18
 
 
 
@@ -113,9 +113,11 @@ DEEP_US_TICKERS = [
     "FDX", "WM", "PH", "ROP", "CARR", "OTIS", "JCI", "CMI", "PCAR", "TXT",
     "LHX", "XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "VLO", "OXY",
     "WMB", "KMI", "HAL", "DVN", "BKR", "FANG",
-    # HES removed after the Chevron acquisition. Keep materials names active.
-    "LIN", "APD", "SHW", "FCX", "ECL", "NEM", "DOW", "NUE", "CTVA",
-    "NEE", "DUK", "SO", "D",
+    # HES removed from the curated universe (Chevron acquisition completed 2024).
+    # Keep tickers on their own lines: an inline comment after a ticker silently
+    # swallowed LIN/APD/SHW here, dropping three names for several releases.
+    "LIN", "APD", "SHW",
+    "FCX", "ECL", "NEM", "DOW", "NUE", "CTVA", "NEE", "DUK", "SO", "D",
     "AEP", "EXC", "SRE", "XEL", "ED", "PEG", "PLD", "AMT", "EQIX", "CCI",
     "PSA", "O", "SPG", "WELL", "DLR", "ENPH", "FSLR",
 ]
@@ -201,7 +203,7 @@ EU_DEEP_TICKERS = [
     "EQNR.OL", "DNB.OL", "NHY.OL", "NOKIA.HE", "NESTE.HE", "SAMPO.HE",
 ]
 
-# Region -> deep universe. Europe intentionally omitted (per request).
+# Region -> deep universe. All four supported markets are included.
 DEEP_UNIVERSES = {"USA": DEEP_US_TICKERS, "Japan": JP_DEEP_TICKERS,
                   "China": CN_DEEP_TICKERS, "Europe": EU_DEEP_TICKERS}
 
@@ -633,6 +635,31 @@ TRANSLATIONS = {
         "setup_lab_note": "Realised results, not predictions. The signal is only worth trusting if higher buckets out-earn lower ones AND the edge survives the ±5% filter — otherwise it is re-measuring momentum the composite already has. Until then this stays informational.",
         "lab_header": "🔬 Model Lab — does the score predict anything?",
         "lab_intro": "{total} observations logged, {matured} matured to 20 days. Every scored name is recorded each scan with its factor snapshot, then measured against its own benchmark at 5/20/60 trading days. This runs alongside the existing engine and changes no scores.",
+        "setup_lab_model": "Active detector: `{version}`. Only observations scored by this exact version are included — a different version is a different model, and blending them into one bucket would compare incomparable things.",
+        "setup_lab_excluded": "{n} older observation(s) are excluded because they were scored by a previous detector version. They remain in the database and are not lost; they simply cannot be pooled with the current model's results.",
+        "delta_vs_last": "vs last scan",
+        "movers_header": "What changed since the last scan",
+        "movers_intro": "Composite change per name against its most recent earlier scan (latest comparison date: {since}). A big move usually means new information — price, fundamentals or sentiment — worth a look in Deep Dive.",
+        "movers_none": "Score changes will appear here from your second scan onward — the first scan has nothing to compare against.",
+        "movers_up": "▲ Biggest risers",
+        "movers_down": "▼ Biggest fallers",
+        "movers_col_was": "Was",
+        "movers_col_change": "Change",
+        "movers_note": "Changes compare against each name's own previous observation, so names scanned on different days are each measured against their own last reading.",
+        "ic_header": "Which factor actually forecasts?",
+        "ic_intro": "Information Coefficient (IC): the rank correlation between each signal and the realised excess return, computed among names scanned on the SAME day and then averaged. Same-day ranking keeps a market-wide rally from making every signal look predictive. Candidate signals are recorded alongside the production factors to test alternatives before changing the model.",
+        "ic_empty": "No matured observations yet — the IC table fills in as forward returns mature (first 5-day results about a week after your first scan on this build).",
+        "ic_thin": "⚠️ Only {n} scan date(s) with matured outcomes — at least {need} are needed before these ICs mean anything. Read them as noise for now.",
+        "ic_col_signal": "Signal",
+        "ic_col_kind": "Type",
+        "ic_col_ic": "Mean IC",
+        "ic_col_stable": "Positive on",
+        "ic_col_dates": "Dates",
+        "ic_kind_production": "production",
+        "ic_kind_candidate": "candidate",
+        "ic_cand_mom_long": "Long momentum (skip last month)",
+        "ic_cand_rel_1m": "1M return vs benchmark",
+        "ic_note": "Rough guide: a mean IC of +0.03 to +0.05 that is positive on most dates is a useful signal; one that flips sign from date to date is noise; a consistently NEGATIVE IC means the factor points the wrong way. If a candidate beats the production factor it would replace, across horizons and over enough dates, that is the evidence for changing the model — not before. Descriptive, not a forecast.",
         "lab_horizon": "Horizon",
         "lab_days": "{d} trading days",
         "lab_empty": "No matured observations yet. The first 5-day results appear about a week after your first scan on this build; 20-day results about a month. Until then there is nothing honest to report.",
@@ -1075,6 +1102,31 @@ TRANSLATIONS = {
         "setup_lab_note": "予測ではなく実測値です。上位帯が下位帯を上回り、かつ±5%フィルタ後も優位性が残る場合にのみ信頼に値します。そうでなければ総合スコアが既に捉えているモメンタムを再計測しているだけです。それまでは参考情報にとどめます。",
         "lab_header": "🔬 モデルラボ — スコアに予測力はあるか？",
         "lab_intro": "観測{total}件を記録、うち20日経過は{matured}件。スキャンごとに全銘柄をファクター値とともに記録し、5/20/60営業日後にベンチマーク対比で測定します。既存エンジンと並行して動作し、スコアには一切影響しません。",
+        "setup_lab_model": "有効な検出器：`{version}`。このバージョンで採点された観測のみを集計します（バージョンが違えば別モデルであり、同じ帯に混ぜると比較にならないため）。",
+        "setup_lab_excluded": "旧バージョンで採点された観測{n}件は集計から除外されています。データベースには残っており失われてはいませんが、現行モデルの結果とは合算できません。",
+        "delta_vs_last": "前回比",
+        "movers_header": "前回スキャンからの変化",
+        "movers_intro": "各銘柄の総合スコアを直近の前回スキャンと比較しています（最新の比較日：{since}）。大きな変化は株価・ファンダメンタル・センチメントに新しい情報があったことを示すことが多く、詳細分析で確認する価値があります。",
+        "movers_none": "スコアの変化は2回目のスキャンから表示されます（初回は比較対象がありません）。",
+        "movers_up": "▲ 上昇幅上位",
+        "movers_down": "▼ 下落幅上位",
+        "movers_col_was": "前回",
+        "movers_col_change": "変化",
+        "movers_note": "比較は各銘柄自身の前回観測に対して行うため、スキャン日が異なる銘柄もそれぞれの前回値と比べています。",
+        "ic_header": "どのファクターに予測力があるか？",
+        "ic_intro": "情報係数（IC）：各シグナルと実現超過収益の順位相関を、同じ日にスキャンした銘柄の中で計算し平均したものです。同日内で比較することで、市場全体の上昇によってすべてのシグナルが有効に見える現象を防ぎます。候補シグナルは本番ファクターと並べて記録し、モデル変更前に代替案を検証します。",
+        "ic_empty": "評価済みの観測がまだありません。将来リターンが確定するにつれて表が埋まります（本ビルドでの初回スキャンから約1週間後に5日結果）。",
+        "ic_thin": "⚠️ 評価済みのスキャン日は{n}日のみです。ICに意味を持たせるには最低{need}日が必要です。現時点ではノイズとして扱ってください。",
+        "ic_col_signal": "シグナル",
+        "ic_col_kind": "種別",
+        "ic_col_ic": "平均IC",
+        "ic_col_stable": "プラスの日",
+        "ic_col_dates": "日数",
+        "ic_kind_production": "本番",
+        "ic_kind_candidate": "候補",
+        "ic_cand_mom_long": "長期モメンタム（直近1か月除く）",
+        "ic_cand_rel_1m": "1か月リターン（対ベンチマーク）",
+        "ic_note": "目安：平均ICが+0.03〜+0.05で多くの日にプラスなら有用なシグナル、日によって符号が変わるならノイズ、一貫してマイナスなら逆方向を向いています。候補シグナルが置き換え対象の本番ファクターを、複数の期間かつ十分な日数で上回った時がモデル変更の根拠であり、それ以前ではありません。実績の記述であり予測ではありません。",
         "lab_horizon": "期間",
         "lab_days": "{d}営業日",
         "lab_empty": "まだ評価可能な観測がありません。5日結果は初回スキャンから約1週間後、20日結果は約1か月後に表示されます。それまでは正直に報告できる内容がありません。",

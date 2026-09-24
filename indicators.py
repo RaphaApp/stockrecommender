@@ -52,6 +52,35 @@ def compute_hype(volume: pd.Series) -> dict:
 
 def clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float: return max(lo, min(hi, v))
 
+def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line, signal_line, macd_line - signal_line
+
+def compute_bollinger(close: pd.Series, window: int = 20, num_std: float = 2.0):
+    mid = close.rolling(window).mean()
+    std = close.rolling(window).std()
+    upper, lower = mid + num_std * std, mid - num_std * std
+    pct_b = (close - lower) / (upper - lower).replace(0, np.nan)
+    return mid, upper, lower, pct_b
+
+def compute_hype(volume: pd.Series) -> dict:
+    result = {"score": 0.0, "breakout_days": 0, "avg_ratio": float("nan"), "sustained": False}
+    vol = volume.dropna()
+    if len(vol) < 33: return result
+    baseline = float(vol.iloc[-33:-3].mean())
+    if baseline <= 0: return result
+    ratios = vol.iloc[-3:] / baseline
+    breakout_days = int((ratios > 1.5).sum())
+    avg_ratio = float(ratios.mean())
+    raw = (breakout_days / 3) * 60 + min(max(avg_ratio - 1.0, 0.0), 2.0) / 2.0 * 40
+    result.update(score=float(min(raw, 100.0)), breakout_days=breakout_days, avg_ratio=avg_ratio, sustained=breakout_days == 3)
+    return result
+
+def clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float: return max(lo, min(hi, v))
+
 
 def screen_metrics(close: pd.Series, volume: pd.Series | None = None) -> dict | None:
     """Stage-1 deep-scan screen from the bulk price/volume history alone (no extra
@@ -297,13 +326,24 @@ SETUP_STATES = ("SETUP FAILED", "NO SETUP", "EARLY WATCH", "SETUP STRENGTHENING"
 # Stamped onto every stored score so the Model Lab can tell which model version
 # produced a row — without it, changing the detector silently mixes incomparable
 # observations into the same buckets.
-EARLY_SETUP_MODEL_VERSION = "early-setup-v3-quality-metrics"
+EARLY_SETUP_MODEL_VERSION = "early-setup-v4-trigger-gated-confirmation"
 
 # Component weights. Deliberately spread: no single component can carry a setup,
 # which is what stops a merely-oversold name from scoring well on one axis.
 _SETUP_WEIGHTS = {"macd": 0.20, "slope": 0.18, "rel_strength": 0.15,
                   "compression": 0.15, "accumulation": 0.14, "pullback": 0.13,
                   "revisions": 0.05}
+
+
+def setup_confirmation(technical_breakout: bool, price_breakout: bool,
+                       volume_confirmed: bool) -> bool:
+    """True only when technical, price and volume confirmation all agree.
+
+    Extracted so the rule is testable as a truth table rather than only through a
+    synthetic price series, and so the reported booleans and the reported
+    `confirmed` flag cannot drift apart.
+    """
+    return bool(technical_breakout and price_breakout and volume_confirmed)
 
 
 def _slope_pct(s: pd.Series, k: int = 5) -> float:
@@ -452,10 +492,11 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
 
     # ---- confirmation & state -------------------------------------------
     vol_expanding = False
-    if volume_available:
-        recent = float(pv["volume"].tail(5).mean())
-        basev = float(pv["volume"].tail(20).mean())
-        vol_expanding = basev > 0 and recent > basev * 1.10
+    if volume is not None:
+        v = volume.dropna()
+        if len(v) >= 20:
+            recent, basev = float(v.tail(5).mean()), float(v.tail(20).mean())
+            vol_expanding = basev > 0 and recent > basev * 1.10
     # Three independent conditions, reported separately so a near-miss is legible:
     #   technical_breakout — MACD positive, price above a rising SMA20
     #   price_breakout     — the close actually clears the prior completed-bar high
@@ -466,7 +507,7 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
                           and _slope_pct(sma20) > 0)
     price_breakout = last > trigger
     volume_confirmed = bool(vol_expanding)
-    confirmed = technical_breakout and price_breakout and volume_confirmed
+    confirmed = setup_confirmation(technical_breakout, price_breakout, volume_confirmed)
 
     if knife:
         state, score = "SETUP FAILED", min(score, 35.0)
@@ -524,3 +565,87 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
             "technical_breakout": bool(technical_breakout),
             "price_breakout": bool(price_breakout),
             "volume_confirmed": bool(volume_confirmed)}
+
+
+# ---------------------------------------------------------------------------
+# Factor diagnostics — measurement only, never feeds scoring
+# ---------------------------------------------------------------------------
+def candidate_signals(close: pd.Series, bench_close: pd.Series | None = None) -> dict:
+    """Alternative signals recorded ALONGSIDE the production factors, so the Model Lab
+    can test whether they would forecast better before anyone changes the model.
+
+      mom_long_skip1m — return from ~a year ago up to ONE MONTH ago. The last month is
+                        deliberately skipped: 1-month returns tend to reverse, while the
+                        momentum that persists is the longer-horizon kind. Production
+                        momentum currently leans on the 1-month return; this is the
+                        textbook alternative.
+      rel_ret_1m      — 1-month return MINUS the home benchmark's, on shared sessions
+                        with a current endpoint. Production momentum is absolute, so in a
+                        broad rally everything scores well; this isolates outperformance.
+
+    NaN when inputs don't support a value (never a guess). Uses only data up to the last
+    bar, so there is no look-ahead. Pure function.
+    """
+    out = {"mom_long_skip1m": float("nan"), "rel_ret_1m": float("nan")}
+    c = close.dropna()
+    if len(c) >= 200:
+        start, skip = float(c.iloc[0]), float(c.iloc[-22])
+        if start > 0:
+            out["mom_long_skip1m"] = (skip / start - 1.0) * 100.0
+    if bench_close is not None and len(c) >= 22:
+        al = pd.concat([c.rename("s"), bench_close.dropna().rename("b")],
+                       axis=1, join="inner").dropna()
+        if len(al) >= 22 and al.index[-1] == c.index[-1]:
+            s0, s1 = float(al["s"].iloc[-22]), float(al["s"].iloc[-1])
+            b0, b1 = float(al["b"].iloc[-22]), float(al["b"].iloc[-1])
+            if s0 > 0 and b0 > 0:
+                out["rel_ret_1m"] = ((s1 / s0) - (b1 / b0)) * 100.0
+    return out
+
+
+def _rank_corr(x: pd.Series, y: pd.Series) -> float:
+    """Spearman correlation computed as Pearson on ranks (no scipy dependency)."""
+    m = pd.concat([x, y], axis=1).dropna()
+    if len(m) < 3:
+        return float("nan")
+    rx, ry = m.iloc[:, 0].rank(), m.iloc[:, 1].rank()
+    if rx.std() == 0 or ry.std() == 0:
+        return float("nan")
+    return float(np.corrcoef(rx, ry)[0, 1])
+
+
+def cross_sectional_ic(df: pd.DataFrame, signals: list, target: str,
+                       date_col: str = "obs_date", min_names: int = 8) -> pd.DataFrame:
+    """Information Coefficient per signal: the rank correlation between a signal and the
+    forward excess return, computed WITHIN each scan date and then averaged.
+
+    Why within-date: pooling all dates mixes market regimes — in a month when everything
+    rallied, every signal looks predictive. Ranking names against their same-day peers
+    asks the right question: on a given day, did the higher-scored names outperform the
+    lower-scored ones?
+
+    Returns one row per signal: mean_ic, n_dates, pct_positive (share of dates with
+    IC > 0 — stability), n_obs. Dates with fewer than `min_names` usable names are
+    skipped rather than allowed to produce noisy extreme correlations.
+    As a rough guide, a mean IC of 0.03–0.05 that is positive on most dates is a useful
+    signal in practice; anything that flips sign date to date is noise.
+    """
+    rows = []
+    for sig in signals:
+        if sig not in df.columns:
+            continue
+        ics, n_obs = [], 0
+        for _, g in df.groupby(date_col):
+            g2 = g[[sig, target]].dropna()
+            if len(g2) < min_names:
+                continue
+            ic = _rank_corr(g2[sig], g2[target])
+            if not np.isnan(ic):
+                ics.append(ic)
+                n_obs += len(g2)
+        rows.append({"signal": sig,
+                     "mean_ic": float(np.mean(ics)) if ics else float("nan"),
+                     "n_dates": len(ics),
+                     "pct_positive": (100.0 * sum(i > 0 for i in ics) / len(ics)) if ics else float("nan"),
+                     "n_obs": n_obs})
+    return pd.DataFrame(rows, columns=["signal", "mean_ic", "n_dates", "pct_positive", "n_obs"])
