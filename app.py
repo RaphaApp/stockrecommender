@@ -448,6 +448,15 @@ DEFAULT_WEIGHTS = {
 LEARNING_RATE = 0.04
 MIN_WEIGHT = 0.05
 EVAL_HORIZON_DAYS = 14
+
+# Legacy walk-forward learner: FROZEN into shadow mode. It still evaluates matured
+# picks and records the weights it WOULD set (shadow_weights table), but it no longer
+# writes production weights. Reasons: it learns from 6 hand-selected picks with a
+# binary 14-calendar-day outcome — the weakest evidence in the app — and momentum
+# changed meaning in model v2, so it would now be averaging two definitions. The
+# Model Lab (every name, continuous excess returns, 5/20/60 sessions) is the place
+# to decide weights. Set True to restore the old behaviour; nothing else changes.
+ENABLE_LEGACY_WEIGHT_LEARNING = False
 # Outcome sentinels for the recommendations table. NEUTRAL marks a call with no
 # directional claim (HOLD): it is stored so the row isn't re-evaluated forever, but
 # excluded from accuracy. Values are fixed for backward compatibility with rows
@@ -474,10 +483,14 @@ from config import (
 # Japanese names for the instrument picker; empty dict on an older config.py (the
 # picker then shows English names only).
 try:
+    from config import BENCHMARK_TYPES
+except ImportError:            # older config.py: methodology simply reported "unknown"
+    BENCHMARK_TYPES = {}
+try:
     from config import CONFIG_SCHEMA_VERSION
 except ImportError:
     CONFIG_SCHEMA_VERSION = 0
-EXPECTED_CONFIG_SCHEMA = 19
+EXPECTED_CONFIG_SCHEMA = 20
 
 try:
     from config import INSTRUMENT_JA
@@ -499,6 +512,7 @@ from indicators import (
     payout_penalty, compute_atr, trade_levels, early_setup, SETUP_STATES,
     EARLY_SETUP_MODEL_VERSION, candidate_signals, cross_sectional_ic,
     relative_return, momentum_score as _momentum_score, MOMENTUM_REL_SESSIONS,
+    bar_date, forward_excess, expectations_from_frames,
 )
 ALL_TICKERS = [ticker for region in TICKER_UNIVERSE.values() for ticker in region]
 
@@ -1142,7 +1156,10 @@ def init_db() -> None:
                        ("setup_state_changed", "INTEGER DEFAULT 0"),
                        ("setup_previous_state", "TEXT"),
                        ("candidates", "TEXT"),
-                       ("model_version", "TEXT")):
+                       ("model_version", "TEXT"), ("weights_snapshot", "TEXT"),
+                       ("benchmark_type", "TEXT"), ("sector", "TEXT"),
+                       ("industry", "TEXT"), ("market_cap", "REAL"),
+                       ("scan_type", "TEXT"), ("expectations", "TEXT")):
             _ensure_column(conn, "observations", _c, _t)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_scan ON observations(scan_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_obs_ticker ON observations(ticker, obs_date)")
@@ -1191,6 +1208,15 @@ def init_db() -> None:
         _ensure_column(conn, "mock_portfolio", "evaluated", "INTEGER DEFAULT 0")
         # Company name stored alongside the ticker for a friendlier audit table.
         _ensure_column(conn, "mock_portfolio", "name", "TEXT")
+        # As-of date of each pick (its last price bar); timestamp stays for audit.
+        _ensure_column(conn, "mock_portfolio", "price_date", "TEXT")
+        # Shadow log for the frozen legacy optimiser: what it WOULD have set.
+        conn.execute(_ddl("""
+            CREATE TABLE IF NOT EXISTS shadow_weights (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL, n_picks INTEGER,
+                proposed TEXT, active TEXT, note TEXT
+            )"""))
         # Indexes for the hot queries: per-day replace in save_recommendation,
         # the pending-outcome sweep, and the walk-forward's evaluated=0 select.
         # CREATE INDEX IF NOT EXISTS is valid on both sqlite and Postgres.
@@ -1244,7 +1270,10 @@ def save_recommendation(rec: dict) -> None:
     binding the hype *dict* into a REAL column raised on every ticker and sent
     them all to the "failed" list. We map both robustly here.
     """
-    today = date.today().isoformat()
+    # rec_date is the AS-OF date of the score (last price bar), not the scan date: the
+    # legacy evaluator counts its horizon from here, so a Friday close must not be
+    # labelled Sunday. Falls back to today for callers that predate price_date.
+    today = rec.get("price_date") or date.today().isoformat()
 
     # Accept either the analysis dict (key "price") or a pre-built record.
     price_val = safe_float(rec.get("price_at_rec", rec.get("price")))
@@ -1843,6 +1872,9 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
         "sma20": sma20, "sma50": sma50, "rsi": rsi, "macd_hist": safe_float(hist_macd.iloc[-1]),
         "bb_pct": pct_b, "ret_1m": ret_1m, "pe": pe, "div_yield": funds["div_yield"],
         "rel_ret_3m": rel_ret_3m, "momentum_basis": momentum_basis,
+        # The as-of date of every number above: the date of the last price bar.
+        # Distinct from the scan timestamp — a weekend scan scores Friday.
+        "price_date": bar_date(hist.index),
         "payout": funds["payout"], "atr": atr,
         "entry_lo": (levels["entry_lo"] if levels else float("nan")),
         "entry_hi": (levels["entry_hi"] if levels else float("nan")),
@@ -2317,12 +2349,19 @@ def attach_early_setups(results: list[dict],
             marks = ",".join("?" for _ in tickers)
             with get_conn() as conn:
                 prior = conn.execute(
-                    f"SELECT ticker, setup_state FROM observations WHERE ticker IN ({marks}) "
-                    "AND setup_state IS NOT NULL AND setup_state <> '' "
-                    "AND obs_date < ? ORDER BY obs_date DESC, id DESC",
-                    (*tickers, date.today().isoformat())).fetchall()
-            for row in prior:
-                previous.setdefault(row[0], row[1])
+                    f"SELECT ticker, setup_state, obs_date FROM observations "
+                    f"WHERE ticker IN ({marks}) AND setup_state IS NOT NULL "
+                    "AND setup_state <> '' ORDER BY obs_date DESC, id DESC",
+                    tuple(tickers)).fetchall()
+            # "Previous" = the latest observation strictly BEFORE this result's own
+            # price date. Observations are dated by price bar, so excluding only
+            # today's calendar date let a rescan of the SAME bar (every weekend scan,
+            # every European-morning US scan) compare against itself and clear NEW.
+            asof = {r["ticker"]: (r.get("price_date") or date.today().isoformat())
+                    for r in results if r.get("ticker")}
+            for t, state, d in prior:
+                if t not in previous and str(d) < asof.get(t, ""):
+                    previous[t] = state
     except Exception as e:
         logger.warning("prior setup-state lookup skipped: %s", e)
 
@@ -2337,8 +2376,13 @@ def attach_early_setups(results: list[dict],
             continue
         bh = bhist.get(benchmark_for(r["ticker"]))
         try:
+            # revisions was a dead input — never passed, so it sat at a constant 50.
+            # US names now feed it the expectations score; elsewhere it stays neutral
+            # and data_quality["revision_available"] says so.
+            _rev = safe_float((r.get("expectations") or {}).get("expectations_score"))
             out = early_setup(hist["Close"],
                               hist["Volume"] if "Volume" in hist.columns else None,
+                              revision_score=None if math.isnan(_rev) else _rev,
                               bench_close=(bh["Close"] if bh is not None
                                            and "Close" in getattr(bh, "columns", []) else None))
         except Exception as e:
@@ -2367,7 +2411,7 @@ def attach_early_setups(results: list[dict],
     return n
 
 
-def record_observations(results: list[dict]) -> int:
+def record_observations(results: list[dict], scan_type: str = "unknown") -> int:
     """Log EVERY scored name from this scan with its factor snapshot. One row per
     stock per scan (~100/scan; a daily habit is ~25k rows/year, trivial for SQLite
     or Postgres). Deduped per ticker per calendar day so reruns don't inflate it."""
@@ -2376,12 +2420,20 @@ def record_observations(results: list[dict]) -> int:
     ranked = sorted(results, key=lambda r: safe_float(r.get("composite"), float("-inf")),
                     reverse=True)
     n = len(ranked)
-    scan_id = datetime.now().isoformat(timespec="seconds")
-    today = date.today().isoformat()
+    scan_id = datetime.now().isoformat(timespec="seconds")   # scan timestamp (audit)
+    today = date.today().isoformat()                          # fallback only
+    # The exact weights that produced these composites. Weights move over time, so
+    # without this a stored composite could not be reproduced later.
+    try:
+        weights_json = json.dumps({k: round(float(v), 6)
+                                   for k, v in get_latest_weights().items()})
+    except Exception:
+        weights_json = "{}"
     rows = []
     for i, r in enumerate(ranked):
         rows.append((
-            scan_id, today, r["ticker"], r.get("region", ""), benchmark_for(r["ticker"]),
+            scan_id, (r.get("price_date") or today), r["ticker"], r.get("region", ""),
+            benchmark_for(r["ticker"]),
             safe_float(r.get("price")), safe_float(r.get("composite")),
             str(r.get("recommendation", "")), round((n - i) / n * 100.0, 2),
             json.dumps({f: safe_float(r.get("hype_score" if f == "hype" else f))
@@ -2396,6 +2448,10 @@ def record_observations(results: list[dict]) -> int:
             str(r.get("setup_previous_state") or ""),
             json.dumps(r.get("candidates") or {}),
             PRODUCTION_MODEL_VERSION,
+            weights_json, BENCHMARK_TYPES.get(benchmark_for(r["ticker"]), "unknown"),
+            str(r.get("sector") or ""), str(r.get("industry") or ""),
+            safe_float(r.get("market_cap")), scan_type,
+            json.dumps(r.get("expectations") or {}),
         ))
     try:
         with get_conn() as conn:
@@ -2403,15 +2459,17 @@ def record_observations(results: list[dict]) -> int:
             # to erase observations from an earlier regional scan on the same date.
             conn.executemany(
                 "DELETE FROM observations WHERE obs_date = ? AND ticker = ?",
-                [(today, r[2]) for r in rows],
+                [(row[1], row[2]) for row in rows],
             )
             conn.executemany(
                 "INSERT INTO observations (scan_id, obs_date, ticker, region, benchmark, "
                 "price, composite, recommendation, rank_pct, factors, "
                 "setup_score, setup_state, setup_components, ret_1m, setup_quality, "
                 "setup_metrics, setup_model_version, setup_is_new, "
-                "setup_state_changed, setup_previous_state, candidates, model_version) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                "setup_state_changed, setup_previous_state, candidates, model_version, "
+                "weights_snapshot, benchmark_type, sector, industry, market_cap, scan_type, "
+                "expectations) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     except Exception as e:
         logger.warning("observation write skipped: %s", e)
         return 0
@@ -2465,18 +2523,15 @@ def evaluate_observations(limit_tickers: int = 120) -> int:
                     key = f"x{horizon}"
                     if r.get(key) is not None:
                         continue
-                    p0, p1 = _close_after_sessions(h, r["obs_date"], horizon)
-                    if math.isnan(p0) or math.isnan(p1) or p0 <= 0:
-                        continue          # not matured (or no data) -> leave NULL
-                    stock = p1 / p0 - 1.0
-                    b0, b1 = _close_after_sessions(bh, r["obs_date"], horizon)
-                    if math.isnan(b0) or math.isnan(b1) or b0 <= 0:
-                        # This ledger promises benchmark-relative outcomes. Leaving the
-                        # field NULL is more honest than silently substituting 0%.
-                        continue
-                    bench = b1 / b0 - 1.0
-                    vals[f"r{horizon}"] = stock * 100.0
-                    vals[key] = (stock - bench) * 100.0
+                    # Both legs on the SAME market sessions, entry never moved forward
+                    # (see indicators.forward_excess). Missing/stale benchmark -> NULL.
+                    sr, _br, xr = forward_excess(
+                        h["Close"], bh["Close"] if bh is not None and "Close" in bh.columns
+                        else None, r["obs_date"], horizon)
+                    if math.isnan(xr):
+                        continue          # not matured, or no usable benchmark -> NULL
+                    vals[f"r{horizon}"] = sr
+                    vals[key] = xr
                     changed = True
                 if changed:
                     sets = ", ".join(f"{k} = ?" for k in vals) + ", last_eval = ?"
@@ -2551,6 +2606,78 @@ def setup_state_performance(horizon: int = 20,
 IC_MIN_DATES = 10    # scan dates with matured outcomes before an IC is shown as readable
 
 
+def composite_summary(horizon: int = 20) -> dict | None:
+    """Headline evidence for the composite at one horizon (current model only).
+
+      ic                 — mean within-date rank IC of the composite
+      top_q / bottom_q   — mean excess return of the top and bottom score QUINTILE
+      spread             — top minus bottom: the number that matters most; a
+                           composite adds value only if this is reliably positive
+      top_positive_rate  — share of top-quintile names that beat their benchmark
+    Quintiles, not deciles: a young ledger cannot fill ten buckets. None until 50
+    matured observations exist, because below that the spread is noise.
+    """
+    col = f"x{horizon}"
+    try:
+        with get_conn() as conn:
+            df = pd.read_sql_query(
+                f"SELECT obs_date, composite, {col} AS excess FROM observations "
+                f"WHERE {col} IS NOT NULL AND composite IS NOT NULL AND model_version = ?",
+                conn, params=(PRODUCTION_MODEL_VERSION,))
+    except Exception as e:
+        logger.warning("composite summary read skipped: %s", e)
+        return None
+    df = df.dropna()
+    if len(df) < 50:
+        return {"n": int(len(df))}
+    ic_tab = cross_sectional_ic(df, ["composite"], "excess")
+    q = pd.qcut(df["composite"].rank(method="first"), 5, labels=False)
+    top, bot = df.loc[q == 4, "excess"], df.loc[q == 0, "excess"]
+    return {"n": int(len(df)),
+            "ic": float(ic_tab["mean_ic"].iloc[0]) if not ic_tab.empty else float("nan"),
+            "ic_dates": int(ic_tab["n_dates"].iloc[0]) if not ic_tab.empty else 0,
+            "top_q": float(top.mean()), "bottom_q": float(bot.mean()),
+            "spread": float(top.mean() - bot.mean()),
+            "top_positive_rate": float((top > 0).mean() * 100.0),
+            "median": float(df["excess"].median())}
+
+
+def region_breakdown(horizon: int = 20) -> pd.DataFrame:
+    """Realised excess return per region (current model). Worth seeing separately
+    because benchmark methodology differs by region, so a region's number is only
+    comparable with itself over time, not with the others."""
+    col = f"x{horizon}"
+    try:
+        with get_conn() as conn:
+            df = pd.read_sql_query(
+                f"SELECT region, {col} AS excess FROM observations "
+                f"WHERE {col} IS NOT NULL AND model_version = ?", conn,
+                params=(PRODUCTION_MODEL_VERSION,))
+    except Exception as e:
+        logger.warning("region breakdown read skipped: %s", e)
+        return pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame()
+    return (df.groupby("region")["excess"]
+              .agg(["count", "mean", "median"]).reset_index()
+              .sort_values("count", ascending=False))
+
+
+def benchmark_mix() -> dict:
+    """{benchmark_type: count} over current-model observations — used to flag that
+    excess returns against price indices and against a total-return ETF are not
+    strictly comparable."""
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT benchmark_type, COUNT(*) FROM observations WHERE model_version = ? "
+                "GROUP BY benchmark_type", (PRODUCTION_MODEL_VERSION,)).fetchall()
+        return {str(k or "unknown"): int(v) for k, v in rows}
+    except Exception as e:
+        logger.warning("benchmark mix read skipped: %s", e)
+        return {}
+
+
 def factor_ic_report(horizon: int = 20) -> tuple[pd.DataFrame, int]:
     """Cross-sectional Information Coefficient for each production factor and each
     candidate signal against realised excess return. Returns (table, n_dates).
@@ -2583,27 +2710,33 @@ def factor_ic_report(horizon: int = 20) -> tuple[pd.DataFrame, int]:
     return table, int(wide["obs_date"].nunique())
 
 
-def previous_composites(tickers: list) -> dict:
-    """{ticker: (composite, obs_date)} from the most recent observation BEFORE today.
+def previous_composites(tickers: list, asof: dict | None = None) -> dict:
+    """{ticker: (composite, obs_date)} from the latest observation strictly BEFORE
+    each ticker's own as-of (price) date.
 
-    Today's own rows are excluded, so rescanning the same day compares against the
-    previous session's view rather than against itself.
+    `asof` maps ticker -> the price date of the CURRENT result. Observations are dated
+    by price bar, so comparing against "before today" would, on any scan whose last
+    bar predates today (weekends; US names scanned before the US open), pick up this
+    very scan's own row and report a change of zero for every name.
     """
     if not tickers:
         return {}
+    asof = asof or {}
     try:
         marks = ",".join("?" for _ in tickers)
         with get_conn() as conn:
             rows = conn.execute(
                 f"SELECT ticker, composite, obs_date FROM observations WHERE ticker IN ({marks}) "
-                "AND obs_date < ? AND composite IS NOT NULL ORDER BY obs_date DESC, id DESC",
-                (*tickers, date.today().isoformat())).fetchall()
+                "AND composite IS NOT NULL ORDER BY obs_date DESC, id DESC",
+                tuple(tickers)).fetchall()
     except Exception as e:
         logger.warning("previous composite lookup skipped: %s", e)
         return {}
+    today = date.today().isoformat()
     out: dict = {}
     for t, comp, d in rows:
-        out.setdefault(t, (safe_float(comp), d))
+        if t not in out and str(d) < (asof.get(t) or today):
+            out[t] = (safe_float(comp), d)
     return out
 
 
@@ -2670,12 +2803,14 @@ def save_mock_portfolio(results: list[dict]) -> None:
                 "composite": round(_val(r, "composite", 0.0), 2),
             })
             conn.execute(
-                "DELETE FROM mock_portfolio WHERE date(timestamp)=? AND ticker=? AND reason=?",
-                (today, r["ticker"], reason),
+                "DELETE FROM mock_portfolio WHERE ticker=? AND reason=? AND "
+                "(price_date=? OR (price_date IS NULL AND date(timestamp)=?))",
+                (r["ticker"], reason, r.get("price_date") or today, today),
             )
             conn.execute(
-                "INSERT INTO mock_portfolio (timestamp, ticker, recommendation_price, reason, kpi_snapshot, evaluated, name) VALUES (?,?,?,?,?,0,?)",
-                (ts, r["ticker"], _val(r, "price"), reason, snapshot, str(r.get("name") or r["ticker"])),
+                "INSERT INTO mock_portfolio (timestamp, ticker, recommendation_price, reason, kpi_snapshot, evaluated, name, price_date) VALUES (?,?,?,?,?,0,?,?)",
+                (ts, r["ticker"], _val(r, "price"), reason, snapshot,
+                 str(r.get("name") or r["ticker"]), r.get("price_date") or today),
             )
         conn.commit()
 
@@ -2989,7 +3124,22 @@ def walk_forward_update() -> int:
     new = {f: max(MIN_WEIGHT, weights[f] + LEARNING_RATE * grad[f] / n) for f in FACTORS}
     total = sum(new.values())
     new = {f: new[f] / total for f in FACTORS}
-    save_weights(new, note=f"Walk-forward update on {n} matured mock-portfolio pick(s)")
+    if ENABLE_LEGACY_WEIGHT_LEARNING:
+        save_weights(new, note=f"Walk-forward update on {n} matured mock-portfolio pick(s)")
+    else:
+        # Shadow mode: record the proposal next to the weights actually in force, so
+        # the two can be compared later without the legacy loop moving production.
+        try:
+            with get_conn() as conn:
+                conn.execute(
+                    "INSERT INTO shadow_weights (created_at, n_picks, proposed, active, note) "
+                    "VALUES (?,?,?,?,?)",
+                    (datetime.now().isoformat(timespec="seconds"), int(n),
+                     json.dumps({k: round(v, 6) for k, v in new.items()}),
+                     json.dumps({k: round(float(v), 6) for k, v in weights.items()}),
+                     "legacy walk-forward (shadow)"))
+        except Exception as e:
+            logger.warning("shadow weight log skipped: %s", e)
 
     with get_conn() as conn:
         conn.executemany("UPDATE mock_portfolio SET evaluated=1 WHERE id=?", [(i,) for i in evaluated_ids])
@@ -3023,6 +3173,54 @@ def seed_demo_history() -> None:
         tot = sum(w.values())
         save_weights({f: w[f] / tot for f in FACTORS}, note="Demo backfill loop simulation")
 
+ENABLE_EXPECTATIONS = True   # US analyst-expectation measurement; set False to skip
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_expectations(ticker: str) -> dict:
+    """Analyst-expectation scores for one US ticker, cached a day (estimates move
+    slowly). The four estimate views share a SINGLE earnings-trend fetch cached on
+    the Ticker object; earnings history is a second request. Two per name per day.
+
+    Raises on a network failure so st.cache_data does not freeze the failure for 24h;
+    a name with genuinely no analyst coverage returns a valid all-NaN result instead.
+    """
+    tk = _ticker(ticker)
+    frames = {}
+    for key, meth in (("eps_revisions", "get_eps_revisions"), ("eps_trend", "get_eps_trend"),
+                      ("earnings_estimate", "get_earnings_estimate"),
+                      ("revenue_estimate", "get_revenue_estimate"),
+                      # separate request (earningsHistory module) — the one extra call
+                      ("earnings_history", "get_earnings_history")):
+        fn = getattr(tk, meth, None)
+        if fn is None:
+            continue                      # older yfinance: that view is unavailable
+        frames[key] = fn()
+    return expectations_from_frames(**frames)
+
+
+def attach_expectations(results: list[dict]) -> int:
+    """MEASUREMENT ONLY: record analyst expectations next to US results.
+
+    Nothing here changes a composite, a call or a weight. The scores flow into the
+    Model Lab's factor table as candidates, so whether expectations actually forecast
+    excess returns is decided on evidence before they get any production weight.
+    """
+    if not ENABLE_EXPECTATIONS or not results:
+        return 0
+    n = 0
+    for r in results:
+        t = str(r.get("ticker") or "")
+        if not t or "." in t or t.startswith("^"):
+            continue                      # US listings only: coverage elsewhere is thin
+        try:
+            r["expectations"] = fetch_expectations(t)
+            n += 1
+        except Exception as e:
+            logger.warning("expectations unavailable for %s: %s", t, e)
+    return n
+
+
 def attach_candidate_signals(results: list[dict], histories: dict | None = None) -> int:
     """Record alternative signals next to the production factors (measurement only).
 
@@ -3049,15 +3247,22 @@ def attach_candidate_signals(results: list[dict], histories: dict | None = None)
             continue
         bh = bhist.get(benchmark_for(r["ticker"]))
         try:
-            r["candidates"] = candidate_signals(
+            cands = candidate_signals(
                 hist["Close"], bh["Close"] if bh is not None and "Close" in bh.columns else None)
+            exp = r.get("expectations") or {}
+            for k in ("expectations_score", "eps_revision_score", "eps_trend_score",
+                      "forward_growth_score", "earnings_surprise_score"):
+                if k in exp:
+                    cands[k] = exp[k]
+            r["candidates"] = cands
             n += 1
         except Exception as e:
             logger.warning("candidate signals failed for %s: %s", r.get("ticker"), e)
     return n
 
 
-def _run_post_scan_tasks(results: list[dict], scan_histories: dict) -> None:
+def _run_post_scan_tasks(results: list[dict], scan_histories: dict,
+                         scan_type: str = "unknown") -> None:
     """Three unrelated post-scan jobs, independently guarded.
 
     Ordering is load-bearing: attach_early_setups() must precede
@@ -3071,6 +3276,10 @@ def _run_post_scan_tasks(results: list[dict], scan_histories: dict) -> None:
     except Exception as e:
         logger.warning("mock portfolio save failed: %s", e)
     try:
+        attach_expectations(results)          # before setups & candidates: both read it
+    except Exception as e:
+        logger.warning("expectations attachment failed: %s", e)
+    try:
         attach_early_setups(results, histories=scan_histories)
     except Exception as e:
         logger.warning("early setup attachment failed: %s", e)
@@ -3079,7 +3288,7 @@ def _run_post_scan_tasks(results: list[dict], scan_histories: dict) -> None:
     except Exception as e:
         logger.warning("candidate signal attachment failed: %s", e)
     try:
-        record_observations(results)
+        record_observations(results, scan_type=scan_type)
     except Exception as e:
         logger.warning("observation recording failed: %s", e)
 
@@ -3209,7 +3418,8 @@ def run_engine(limit_per_region: int | None = None,
     # loop, persist the scan snapshot (survives refresh/new session), and stamp the
     # scan time for the freshness chip. All wrapped/fail-safe so bookkeeping can
     # never sink an otherwise-successful scan.
-    _run_post_scan_tasks(results, scan_histories)
+    _run_post_scan_tasks(results, scan_histories,
+                         scan_type="quick" if limit_per_region else "full")
     save_scan_snapshot(results, is_quick=limit_per_region is not None)
     st.session_state["scan_ts"] = time.time()
     st.session_state["restored_scan"] = False
@@ -3226,7 +3436,9 @@ def render_daily_top_3(results: list[dict]) -> None:
     # One read for the whole page: the previous scan's composite per name, so every
     # card and the movers table can say what CHANGED — a score of 72 means more
     # when you know it was 61 last time.
-    prev = previous_composites([r["ticker"] for r in results if r.get("ticker")])
+    prev = previous_composites([r["ticker"] for r in results if r.get("ticker")],
+                               asof={r["ticker"]: r.get("price_date")
+                                     for r in results if r.get("ticker")})
     top_3 = results[:3]
     c1, c2, c3 = st.columns(3)
     for i, col in enumerate([c1, c2, c3]):
@@ -4309,6 +4521,23 @@ def render_engine_audit(update_prices: bool = True) -> None:
                   .groupby("week")["outcome"].mean().mul(100).round(1))
         st.bar_chart(wr.rename(tr("winrate_col")))
 
+    # Say plainly that the learner is frozen — otherwise flat weights read as a bug.
+    if not ENABLE_LEGACY_WEIGHT_LEARNING:
+        st.info(tr("legacy_frozen"))
+        try:
+            with get_conn() as _c:
+                _sh = _c.execute("SELECT created_at, n_picks, proposed FROM shadow_weights "
+                                 "ORDER BY id DESC LIMIT 1").fetchone()
+        except Exception:
+            _sh = None
+        if _sh:
+            try:
+                _prop = json.loads(_sh[2] or "{}")
+                _txt = ", ".join(f"{tr('factor_' + k)} {v:.0%}" for k, v in _prop.items())
+                st.caption(tr("legacy_shadow_last", when=str(_sh[0])[:10], n=_sh[1], w=_txt))
+            except Exception:
+                pass
+
     wh = get_weight_history()
     if len(wh) >= 2:
         st.markdown(f"#### {tr('kpi_weight_evolution')}")
@@ -4448,6 +4677,30 @@ def render_engine_audit(update_prices: bool = True) -> None:
             st.caption(tr("lab_prod_excluded", n=_old))
         _h = st.radio(tr("lab_horizon"), list(OBS_HORIZONS), horizontal=True,
                       format_func=lambda d: tr("lab_days", d=d), key="lab_h")
+        # Headline evidence first: does the top of the ranking beat the bottom?
+        _sm = composite_summary(int(_h))
+        if _sm and "spread" in _sm:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric(tr("lab_m_spread"), f"{_sm['spread']:+.2f}%")
+            m2.metric(tr("lab_m_top"), f"{_sm['top_q']:+.2f}%")
+            m3.metric(tr("lab_m_bottom"), f"{_sm['bottom_q']:+.2f}%")
+            m4.metric(tr("lab_m_ic"), "—" if math.isnan(_sm["ic"]) else f"{_sm['ic']:+.3f}")
+            st.caption(tr("lab_m_note", n=_sm["n"], pos=f"{_sm['top_positive_rate']:.0f}",
+                          dates=_sm["ic_dates"]))
+        elif _sm:
+            st.caption(tr("lab_m_thin", n=_sm["n"]))
+        _mix = benchmark_mix()
+        if len([k for k in _mix if k != "unknown"]) > 1:
+            st.caption(tr("lab_bench_mix"))
+        _rg = region_breakdown(int(_h))
+        if not _rg.empty:
+            st.dataframe(_rg.rename(columns={
+                "region": tr("col_region"), "count": tr("lab_col_n"),
+                "mean": tr("lab_col_mean"), "median": tr("lab_col_median")})
+                .assign(**{tr("col_region"): lambda d: d[tr("col_region")].map(region_name)})
+                .style.format({tr("lab_col_mean"): "{:+.2f}%",
+                               tr("lab_col_median"): "{:+.2f}%"}, na_rep="—"),
+                width="stretch", hide_index=True)
         _b = observation_buckets(int(_h))
         if _b.empty:
             st.info(tr("lab_empty"))
@@ -4475,8 +4728,15 @@ def render_engine_audit(update_prices: bool = True) -> None:
                     "quality": tr("factor_quality"), "theme": tr("factor_theme"),
                     "mom_long_skip1m": tr("ic_cand_mom_long"),
                     "rel_ret_1m": tr("ic_cand_rel_1m"),
-                    "abs_ret_1m": tr("ic_cand_abs_1m")}
-            _cand = {"mom_long_skip1m", "rel_ret_1m", "abs_ret_1m"}
+                    "abs_ret_1m": tr("ic_cand_abs_1m"),
+                    "expectations_score": tr("ic_cand_expect"),
+                    "eps_revision_score": tr("ic_cand_eps_rev"),
+                    "eps_trend_score": tr("ic_cand_eps_trend"),
+                    "forward_growth_score": tr("ic_cand_fwd_growth"),
+                    "earnings_surprise_score": tr("ic_cand_surprise")}
+            _cand = {"mom_long_skip1m", "rel_ret_1m", "abs_ret_1m", "expectations_score",
+                     "eps_revision_score", "eps_trend_score", "forward_growth_score",
+                     "earnings_surprise_score"}
             _ic = _ic.assign(kind=_ic["signal"].map(
                 lambda x: tr("ic_kind_candidate") if x in _cand else tr("ic_kind_production")))
             _ic["signal"] = _ic["signal"].map(lambda x: _lab.get(x, x))

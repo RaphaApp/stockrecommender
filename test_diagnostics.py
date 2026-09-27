@@ -221,9 +221,11 @@ def test_candidate_task_runs_before_observation_write(app, monkeypatch):
     monkeypatch.setattr(app, "save_mock_portfolio", lambda r: order.append("mock"))
     monkeypatch.setattr(app, "attach_early_setups", lambda r, histories=None: order.append("setup"))
     monkeypatch.setattr(app, "attach_candidate_signals", lambda r, histories=None: order.append("cand"))
-    monkeypatch.setattr(app, "record_observations", lambda r: order.append("obs"))
+    monkeypatch.setattr(app, "attach_expectations", lambda r: order.append("exp"))
+    monkeypatch.setattr(app, "record_observations", lambda r, **k: order.append("obs"))
     app._run_post_scan_tasks([{"ticker": "AAA"}], {})
-    assert order == ["mock", "setup", "cand", "obs"]
+    # expectations must precede BOTH consumers (Early Setup revisions, candidates)
+    assert order == ["mock", "exp", "setup", "cand", "obs"]
 
 
 # ================================================== relative momentum (v2 model)

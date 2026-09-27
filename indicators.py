@@ -326,7 +326,7 @@ SETUP_STATES = ("SETUP FAILED", "NO SETUP", "EARLY WATCH", "SETUP STRENGTHENING"
 # Stamped onto every stored score so the Model Lab can tell which model version
 # produced a row — without it, changing the detector silently mixes incomparable
 # observations into the same buckets.
-EARLY_SETUP_MODEL_VERSION = "early-setup-v4-trigger-gated-confirmation"
+EARLY_SETUP_MODEL_VERSION = "early-setup-v5-uncontaminated-volume-baseline"
 
 # Component weights. Deliberately spread: no single component can carry a setup,
 # which is what stops a merely-oversold name from scoring well on one axis.
@@ -495,7 +495,12 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
     if volume is not None:
         v = volume.dropna()
         if len(v) >= 20:
-            recent, basev = float(v.tail(5).mean()), float(v.tail(20).mean())
+            # Recent 5 sessions vs the PRECEDING 20. The previous baseline (last 20)
+            # contained the same 5 sessions it was being compared with, which damps
+            # exactly the expansion this test is meant to detect.
+            recent = float(v.iloc[-5:].mean())
+            _base = v.iloc[-25:-5]
+            basev = float(_base.mean()) if len(_base) >= 15 else 0.0
             vol_expanding = basev > 0 and recent > basev * 1.10
     # Three independent conditions, reported separately so a near-miss is legible:
     #   technical_breakout — MACD positive, price above a rising SMA20
@@ -572,6 +577,59 @@ def early_setup(close: pd.Series, volume: pd.Series | None = None,
 # ---------------------------------------------------------------------------
 MOMENTUM_REL_SESSIONS = 63   # ~3 months: standard relative-strength horizon, and clear
                              # of the 1-month window where returns tend to reverse
+
+
+def bar_date(index) -> str | None:
+    """ISO date of the LAST bar in a price index — the as-of date of a score.
+
+    A scan run on a Saturday scores Friday's close; labelling that observation with
+    the scan date made the forward-return clock start from the wrong day."""
+    if index is None or len(index) == 0:
+        return None
+    ts = pd.Timestamp(pd.to_datetime(index[-1]))
+    if ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+    return ts.date().isoformat()
+
+
+def forward_excess(stock_close: pd.Series, bench_close: pd.Series | None, asof,
+                   sessions: int, max_gap_days: int = 5) -> tuple:
+    """(stock_return, bench_return, excess) in percent over `sessions` COMMON sessions.
+
+    Stock and benchmark are inner-joined first, so both legs use the identical market
+    dates — resolving each on its own calendar let a Tokyo holiday or a Hong Kong
+    typhoon day compare different sessions.
+
+    Entry = the last common session ON OR BEFORE `asof`. It is never moved FORWARD:
+    a Sunday-dated observation scored Friday's close, so its entry is Friday, not
+    Monday (which the old first-bar-on-or-after rule used — a price the scan never
+    saw). `max_gap_days` refuses an entry that falls too far back, e.g. when a
+    benchmark has stopped updating. NaN for every leg when immature or unusable.
+    """
+    nan3 = (float("nan"), float("nan"), float("nan"))
+    if stock_close is None or bench_close is None or asof is None:
+        return nan3
+    s, b = stock_close.dropna(), bench_close.dropna()
+    j = pd.concat([s.rename("s"), b.rename("b")], axis=1, join="inner").dropna()
+    if j.empty:
+        return nan3
+    idx = pd.to_datetime(j.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    idx = idx.normalize()
+    target = pd.Timestamp(asof).normalize()
+    pos = int(idx.searchsorted(target, side="right")) - 1     # last session <= asof
+    if pos < 0 or (target - idx[pos]).days > max_gap_days:
+        return nan3
+    end = pos + sessions
+    if end >= len(j):
+        return nan3                                            # not matured yet
+    s0, s1 = float(j["s"].iloc[pos]), float(j["s"].iloc[end])
+    b0, b1 = float(j["b"].iloc[pos]), float(j["b"].iloc[end])
+    if s0 <= 0 or b0 <= 0:
+        return nan3
+    sr, br = (s1 / s0 - 1.0) * 100.0, (b1 / b0 - 1.0) * 100.0
+    return (sr, br, sr - br)
 
 
 def relative_return(close: pd.Series, bench_close: pd.Series | None,
@@ -702,3 +760,107 @@ def cross_sectional_ic(df: pd.DataFrame, signals: list, target: str,
                      "pct_positive": (100.0 * sum(i > 0 for i in ics) / len(ics)) if ics else float("nan"),
                      "n_obs": n_obs})
     return pd.DataFrame(rows, columns=["signal", "mean_ic", "n_dates", "pct_positive", "n_obs"])
+
+
+# ---------------------------------------------------------------------------
+# Forward expectations — measurement only until the Model Lab shows it predicts
+# ---------------------------------------------------------------------------
+EXPECTATIONS_PERIODS = ("0y", "+1y", "0q")   # current fiscal year first
+
+
+def _pick(row: pd.Series, *names) -> float:
+    """Case-insensitive field lookup — Yahoo's key casing is inconsistent
+    (e.g. 'downLast7Days' next to 'upLast7days')."""
+    low = {str(k).lower(): v for k, v in row.items()}
+    for n in names:
+        v = low.get(n.lower())
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        if not np.isnan(v):
+            return v
+    return float("nan")
+
+
+def _period_row(df) -> pd.Series | None:
+    if df is None or getattr(df, "empty", True):
+        return None
+    for p in EXPECTATIONS_PERIODS:
+        if p in df.index:
+            return df.loc[p]
+    return df.iloc[0]
+
+
+def expectations_from_frames(eps_revisions=None, eps_trend=None,
+                             earnings_estimate=None, revenue_estimate=None,
+                             earnings_history=None) -> dict:
+    """Turn analyst-expectation tables into 0-100 scores (50 = neutral).
+
+    CHANGE in expectations, not their level, is the forward-looking part: the
+    market already prices a known estimate; what moves prices is estimates being
+    raised or cut. Each sub-score is deliberately conservative:
+
+      eps_revision_score — NET share of analysts revising up vs down in 30 days,
+                           normalised by the number revising, so 3 of 3 analysts
+                           counts like 30 of 30 rather than scaling with coverage
+      eps_trend_score    — % change in the consensus EPS estimate vs 30 days ago
+                           (a 2% raise scores +10)
+      forward_growth_score / revenue_growth_score — expected growth rates
+      earnings_surprise_score — how far the latest reported EPS beat or missed
+                           its estimate. Computed from actual vs estimate rather
+                           than Yahoo's surprisePercent field, whose units vary.
+                           Prices tend to keep drifting after surprises, which
+                           makes this one of the better-documented signals.
+
+    Missing parts are NaN and excluded; expectations_score averages what exists
+    and `expectations_parts` says how many, so thin coverage is visible rather than
+    hidden. Pure function.
+    """
+    out = {"eps_revision_score": float("nan"), "eps_trend_score": float("nan"),
+           "forward_growth_score": float("nan"), "revenue_growth_score": float("nan"),
+           "earnings_surprise_score": float("nan"),
+           "expectations_score": float("nan"), "expectations_parts": 0}
+
+    row = _period_row(eps_revisions)
+    if row is not None:
+        up, down = _pick(row, "upLast30days"), _pick(row, "downLast30days")
+        if not np.isnan(up) and not np.isnan(down) and (up + down) > 0:
+            out["eps_revision_score"] = clamp(50.0 + (up - down) / (up + down) * 40.0)
+
+    row = _period_row(eps_trend)
+    if row is not None:
+        cur, ago = _pick(row, "current"), _pick(row, "30daysAgo")
+        # skip sign flips and near-zero bases: a % change there is meaningless
+        if not np.isnan(cur) and not np.isnan(ago) and ago > 0 and cur > 0:
+            out["eps_trend_score"] = clamp(50.0 + (cur / ago - 1.0) * 500.0)
+
+    row = _period_row(earnings_estimate)
+    if row is not None:
+        g = _pick(row, "growth")
+        if not np.isnan(g):
+            out["forward_growth_score"] = clamp(50.0 + g * 100.0)
+
+    row = _period_row(revenue_estimate)
+    if row is not None:
+        g = _pick(row, "growth")
+        if not np.isnan(g):
+            out["revenue_growth_score"] = clamp(50.0 + g * 150.0)
+
+    if earnings_history is not None and not getattr(earnings_history, "empty", True):
+        eh = earnings_history.sort_index()
+        for _, row in eh.iloc[::-1].iterrows():               # most recent first
+            act, est = _pick(row, "epsActual"), _pick(row, "epsEstimate")
+            if not np.isnan(act) and not np.isnan(est) and abs(est) >= 0.01:
+                out["earnings_surprise_score"] = clamp(
+                    50.0 + (act - est) / abs(est) * 200.0)   # a 5% beat scores +10
+                break
+
+    parts = [out[k] for k in ("eps_revision_score", "eps_trend_score",
+                              "forward_growth_score", "revenue_growth_score",
+                              "earnings_surprise_score")
+             if not np.isnan(out[k])]
+    out["expectations_parts"] = len(parts)
+    if parts:
+        out["expectations_score"] = float(np.mean(parts))
+    return out

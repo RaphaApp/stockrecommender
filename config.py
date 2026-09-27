@@ -8,7 +8,7 @@ focused on logic. No app dependencies; safe to import anywhere.
 # Bumped whenever app.py starts depending on new keys in this file. app.py compares
 # against its own expected value and warns if the two files were deployed out of
 # step — which otherwise shows up as raw keys like "board_no_csv" on screen.
-CONFIG_SCHEMA_VERSION = 19
+CONFIG_SCHEMA_VERSION = 20
 
 
 
@@ -364,6 +364,22 @@ INSTRUMENT_JA = {
     "2318.HK": "中国平安保険", "0939.HK": "中国建設銀行", "1299.HK": "AIAグループ",
 }
 
+# How each benchmark's return is measured. Stocks are downloaded auto-adjusted, so
+# their returns INCLUDE dividends. SPY is an ETF whose adjusted series includes
+# dividends too — a like-for-like comparison. So does the DAX (^GDAXI), which is a
+# PERFORMANCE index: dividends reinvested. The other regional benchmarks are PRICE
+# indices without dividends, so excess returns against them are overstated by
+# roughly that market's dividend yield (~2%/yr, ~0.15% over 20 sessions). Recorded
+# per observation so the Model Lab can say so rather than pool them silently.
+# Swapping to USD-listed country ETFs would fix the dividends but add currency
+# swings, which would be a far larger distortion — so this is flagged, not "fixed".
+BENCHMARK_TYPES = {
+    "SPY": "etf_total_return",
+    "^N225": "price_index", "^HSI": "price_index", "^FCHI": "price_index",
+    "^GDAXI": "performance_index", "000300.SS": "price_index", "^STI": "price_index",
+    "^JKSE": "price_index", "^FTSE": "price_index",
+}
+
 BENCHMARKS = {
     "":   "SPY",        # US / NYSE / NASDAQ (no suffix)  -> S&P 500 ETF
     "T":  "^N225",      # Tokyo                           -> Nikkei 225
@@ -666,6 +682,20 @@ TRANSLATIONS = {
         "lab_prod_model": "Production model: `{version}` — momentum is market-relative (3-month return vs home benchmark). Only observations scored by this model are pooled below.",
         "lab_prod_excluded": "{n} observation(s) scored by an earlier model (absolute 1-month momentum) are excluded from these tables. They remain stored; mixing the two definitions would measure neither.",
         "ic_cand_abs_1m": "Raw 1M return (previous momentum basis)",
+        "lab_m_spread": "Top − bottom quintile",
+        "lab_m_top": "Top quintile",
+        "lab_m_bottom": "Bottom quintile",
+        "lab_m_ic": "Composite IC",
+        "lab_m_note": "{n} matured observations. The spread is the headline: the composite adds value only if the top fifth of its ranking reliably beats the bottom fifth. {pos}% of top-quintile names beat their benchmark. IC computed within each of {dates} scan date(s). Realised results, not a forecast.",
+        "lab_m_thin": "{n} matured observation(s) so far — headline statistics appear from 50 onward; below that a top-vs-bottom spread is noise.",
+        "lab_bench_mix": "⚠️ Benchmark methodology is mixed: US names are measured against SPY (an ETF whose adjusted series includes dividends) and German names against the DAX (a performance index, also dividend-inclusive); the other markets use price indices without dividends. Excess returns in those markets are overstated by roughly their dividend yield (~0.15% per 20 sessions), so compare regions with care — the region table below shows each separately.",
+        "ic_cand_surprise": "Latest earnings surprise (US)",
+        "ic_cand_expect": "Analyst expectations (US)",
+        "ic_cand_eps_rev": "EPS revisions, 30d (US)",
+        "ic_cand_eps_trend": "EPS estimate trend (US)",
+        "ic_cand_fwd_growth": "Forward EPS growth (US)",
+        "legacy_frozen": "The legacy weight learner is frozen (shadow mode): factor weights stay fixed while the Model Lab gathers evidence across every scanned name. The old loop still runs and records what it would have changed, shown below. Re-enable with ENABLE_LEGACY_WEIGHT_LEARNING in app.py.",
+        "legacy_shadow_last": "Latest shadow proposal ({when}, {n} matured pick(s)): {w}",
         "lab_horizon": "Horizon",
         "lab_days": "{d} trading days",
         "lab_empty": "No matured observations yet. The first 5-day results appear about a week after your first scan on this build; 20-day results about a month. Until then there is nothing honest to report.",
@@ -1139,6 +1169,20 @@ TRANSLATIONS = {
         "lab_prod_model": "本番モデル：`{version}` — モメンタムは市場相対（本国ベンチマークに対する3か月リターン）です。以下の表はこのモデルで採点された観測のみを集計します。",
         "lab_prod_excluded": "旧モデル（1か月の絶対モメンタム）で採点された観測{n}件はこれらの表から除外されています。データは保存されていますが、2つの定義を混ぜるとどちらも正しく測れません。",
         "ic_cand_abs_1m": "1か月絶対リターン（旧モメンタム基準）",
+        "lab_m_spread": "上位−下位五分位",
+        "lab_m_top": "上位五分位",
+        "lab_m_bottom": "下位五分位",
+        "lab_m_ic": "総合スコアIC",
+        "lab_m_note": "評価済み観測{n}件。最重要指標はスプレッドです：総合スコアの上位5分の1が下位5分の1を安定して上回る場合にのみ価値があります。上位五分位のうち{pos}%がベンチマークを上回りました。ICは{dates}回のスキャン日ごとに計算。予測ではなく実績です。",
+        "lab_m_thin": "評価済み観測は現在{n}件です。主要統計は50件から表示されます（それ未満では上位・下位の差はノイズです）。",
+        "lab_bench_mix": "⚠️ ベンチマークの算出方法が混在しています：米国銘柄は配当込みのETF（SPY）、ドイツ銘柄はDAX（配当再投資のパフォーマンス指数）と比較し、その他の市場は配当を含まない価格指数を使っています。そのため後者の市場の超過収益は配当利回り分（20営業日で約0.15%）ほど過大になります。地域間の比較には注意してください（下の地域別の表を参照）。",
+        "ic_cand_surprise": "直近の決算サプライズ（米国）",
+        "ic_cand_expect": "アナリスト予想（米国）",
+        "ic_cand_eps_rev": "EPS修正（30日、米国）",
+        "ic_cand_eps_trend": "EPS予想の推移（米国）",
+        "ic_cand_fwd_growth": "予想EPS成長率（米国）",
+        "legacy_frozen": "旧来の重み学習は凍結中（シャドーモード）です。モデルラボが全銘柄の実績を蓄積する間、ファクター重みは固定されます。旧ループは引き続き動作し、変更していたはずの内容を記録します（下記）。再開するには app.py の ENABLE_LEGACY_WEIGHT_LEARNING を変更してください。",
+        "legacy_shadow_last": "直近のシャドー提案（{when}、評価済み{n}件）：{w}",
         "lab_horizon": "期間",
         "lab_days": "{d}営業日",
         "lab_empty": "まだ評価可能な観測がありません。5日結果は初回スキャンから約1週間後、20日結果は約1か月後に表示されます。それまでは正直に報告できる内容がありません。",

@@ -348,7 +348,9 @@ def test_post_scan_tasks_are_isolated(app, monkeypatch):
                         lambda r: (_ for _ in ()).throw(RuntimeError("mock boom")))
     monkeypatch.setattr(app, "attach_early_setups",
                         lambda r, histories=None: order.append("setup"))
-    monkeypatch.setattr(app, "record_observations", lambda r: order.append("obs"))
+    monkeypatch.setattr(app, "record_observations", lambda r, **k: order.append("obs"))
+    monkeypatch.setattr(app, "attach_expectations", lambda r: None)
+    monkeypatch.setattr(app, "attach_candidate_signals", lambda r, histories=None: None)
     app._run_post_scan_tasks([{"ticker": "AAA"}], {})
     assert order == ["setup", "obs"], "a mock-portfolio failure must not skip the others"
 
@@ -363,7 +365,7 @@ def test_post_scan_tasks_are_isolated(app, monkeypatch):
     monkeypatch.setattr(app, "attach_early_setups",
                         lambda r, histories=None: order.append("setup"))
     monkeypatch.setattr(app, "record_observations",
-                        lambda r: (_ for _ in ()).throw(RuntimeError("obs boom")))
+                        lambda r, **k: (_ for _ in ()).throw(RuntimeError("obs boom")))
     app._run_post_scan_tasks([{"ticker": "AAA"}], {})
     assert order == ["mock", "setup"], "an observation failure must not hide the earlier work"
 
