@@ -8,9 +8,25 @@ focused on logic. No app dependencies; safe to import anywhere.
 # Bumped whenever app.py starts depending on new keys in this file. app.py compares
 # against its own expected value and warns if the two files were deployed out of
 # step — which otherwise shows up as raw keys like "board_no_csv" on screen.
-CONFIG_SCHEMA_VERSION = 20
+CONFIG_SCHEMA_VERSION = 21
 
 
+
+# Search/match terms for NEWS sentiment (GDELT), where they must differ from the
+# display name in COMPANY_NAMES. The news scan matches the whole phrase in article
+# titles, so two failure modes are fixed here:
+#   * phrases that never appear verbatim ("RTX Raytheon", "SLB Schlumberger") —
+#     those names scored zero news buzz on every scan;
+#   * ordinary words that collide with headlines ("Visa" matches immigration
+#     stories, "Recruit" matches hiring news, "Canon" matches film franchises).
+# Under-counting a name is harmless now that hype is measured against the name's
+# own normal level; false positives from unrelated headlines are not.
+NEWS_QUERY_NAMES = {
+    "RTX": "Raytheon", "SLB": "Schlumberger",
+    "V": "Visa Inc", "6098.T": "Recruit Holdings", "7751.T": "Canon Inc",
+    "META": "Meta Platforms", "AI.PA": "Air Liquide", "SU.PA": "Schneider Electric",
+    "1299.HK": "AIA Group", "0939.HK": "China Construction Bank",
+}
 
 # Expanded global universe. Trim any list to speed up scans (each symbol adds
 # a price fetch + a fundamentals call, so ~60 tickers takes a couple of minutes).
@@ -866,7 +882,7 @@ TRANSLATIONS = {
         "col_insider": "Insider",
         "col_transaction": "Transaction",
         "col_shares": "Shares",
-        "col_value": "Value",
+        "col_txn_value": "Value",
         # Audit
         "audit_header_text": "🧠 Machine Weight Analytics & Historical Integrity",
         "no_tracks": "No calculation tracks logged yet.",
@@ -880,6 +896,42 @@ TRANSLATIONS = {
         "rec_BUY": "BUY",
         "rec_HOLD": "HOLD",
         "rec_SELL": "SELL",
+        # --- v21: Top Selections redesign, regime, buzz, currency ---
+        "picks_lede": "The three highest-ranked names right now, one per theme so the podium isn't a single bet. Bars show each factor against the neutral line at 50.",
+        "picks_diversify": "One pick per theme",
+        "picks_diversify_help": "On: the best name from each theme/sector, so three semiconductor stocks can't take all three places. Off: the raw ranking.",
+        "picks_why": "Driven by {a} and {b}",
+        "picks_why_one": "Driven by {a}",
+        "picks_why_none": "No factor stands out — a broad but shallow score",
+        "picks_agree": "{s} of {n} factors support · {x} against",
+        "picks_plan": "Reference levels",
+        "picks_entry": "Entry zone",
+        "picks_target": "Target",
+        "picks_stop": "Stop",
+        "picks_rr": "Reward:risk",
+        "picks_no_levels": "No reference levels — high/low data missing for this name.",
+        "picks_runners": "Next in line",
+        "picks_runners_cap": "Ranks 4–12 by overall score. Select a row to open it in Chart Deep Dive.",
+        "flag_earnings": "Earnings in {d}d",
+        "flag_earnings_help": "Results inside the next two weeks: the price can gap past any stop.",
+        "flag_rsi_hot": "RSI {v} — stretched",
+        "flag_payout": "Payout {v} of earnings",
+        "flag_regime_off": "{m} below its 200-day average",
+        "flag_vol": "Volatile: {v}%/yr",
+        "flag_buzz": "Buzz {v}× normal",
+        "flag_none": "No risk flags",
+        "board_regime": "Trend",
+        "board_regime_hint": "Each home market vs its 200-day average. ▲ uptrend, ▼ downtrend, ● mixed. BUY calls in a ▼ market are flagged on their cards.",
+        "regime_risk_on": "uptrend", "regime_risk_off": "downtrend", "regime_neutral": "mixed",
+        "regime_unknown": "unknown",
+        "evi_buzz_ratio": "Buzz vs this name's normal",
+        "evi_buzz_val": "{m:g} today · normal {b:.1f} · {r:.1f}×",
+        "evi_buzz_basis_own": "own history",
+        "evi_buzz_basis_peers": "size-matched peers while history builds",
+        "hype_buzz_caption_v3": "Hype rewards buzz that is unusual for this company, not raw volume — a megacap that is always discussed earns nothing on an ordinary day.",
+        "growth_sort_note": "Ranked by momentum against the home market (3 months), not raw 1-month return — short-term winners tend to give some back.",
+        "col_rel_3m": "vs market (3M)",
+        "col_momentum_score": "Momentum",
     },
     "ja": {
         # サイドバー
@@ -1353,7 +1405,7 @@ TRANSLATIONS = {
         "col_insider": "インサイダー",
         "col_transaction": "取引",
         "col_shares": "株数",
-        "col_value": "金額",
+        "col_txn_value": "金額",
         # 監査
         "audit_header_text": "🧠 重み学習の分析と過去実績",
         "no_tracks": "まだ記録された計算履歴はありません。",
@@ -1367,5 +1419,41 @@ TRANSLATIONS = {
         "rec_BUY": "買い",
         "rec_HOLD": "中立",
         "rec_SELL": "売り",
+        # --- v21: トップ銘柄の刷新・相場環境・話題度・通貨 ---
+        "picks_lede": "現在スコア上位の3銘柄です。同じテーマに偏らないよう、テーマごとに1銘柄を選んでいます。バーは中立ライン（50）に対する各ファクターの強さです。",
+        "picks_diversify": "テーマごとに1銘柄",
+        "picks_diversify_help": "オン：テーマ／セクターごとに最上位の1銘柄を選び、半導体株3銘柄が上位を独占しないようにします。オフ：単純なスコア順。",
+        "picks_why": "主な要因：{a}・{b}",
+        "picks_why_one": "主な要因：{a}",
+        "picks_why_none": "突出したファクターはなく、全体的に平均的なスコアです",
+        "picks_agree": "{n}ファクター中 {s} が支持・{x} が反対",
+        "picks_plan": "参考価格",
+        "picks_entry": "エントリー帯",
+        "picks_target": "目標",
+        "picks_stop": "損切り",
+        "picks_rr": "損益比",
+        "picks_no_levels": "高値・安値データがないため、参考価格を表示できません。",
+        "picks_runners": "次点の銘柄",
+        "picks_runners_cap": "総合スコア4〜12位。行を選ぶとチャート詳細分析で開きます。",
+        "flag_earnings": "決算まで{d}日",
+        "flag_earnings_help": "2週間以内に決算発表があります。損切り水準を飛び越えて価格が動く可能性があります。",
+        "flag_rsi_hot": "RSI {v}（過熱）",
+        "flag_payout": "配当性向 {v}",
+        "flag_regime_off": "{m}が200日移動平均を下回っています",
+        "flag_vol": "高ボラティリティ：年率{v}%",
+        "flag_buzz": "話題度 平常の{v}倍",
+        "flag_none": "リスク要因なし",
+        "board_regime": "相場",
+        "board_regime_hint": "各市場の指数と200日移動平均の位置関係。▲上昇トレンド、▼下降トレンド、●混在。▼の市場での買い判定はカードに注意表示されます。",
+        "regime_risk_on": "上昇", "regime_risk_off": "下降", "regime_neutral": "混在",
+        "regime_unknown": "不明",
+        "evi_buzz_ratio": "この銘柄の平常時と比べた話題度",
+        "evi_buzz_val": "本日 {m:g} 件・平常 {b:.1f} 件・{r:.1f}倍",
+        "evi_buzz_basis_own": "自銘柄の履歴",
+        "evi_buzz_basis_peers": "同規模企業の水準（履歴を蓄積中）",
+        "hype_buzz_caption_v3": "話題度は言及の多さではなく、その企業にとって普段と比べた異常さを評価します。常に話題になる大型株は、平常日には加点されません。",
+        "growth_sort_note": "1か月の単純リターンではなく、指数に対する3か月の相対モメンタム順です。短期の上昇銘柄は反落しやすいためです。",
+        "col_rel_3m": "対指数（3か月）",
+        "col_momentum_score": "モメンタム",
     },
 }

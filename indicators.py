@@ -52,35 +52,6 @@ def compute_hype(volume: pd.Series) -> dict:
 
 def clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float: return max(lo, min(hi, v))
 
-def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line, macd_line - signal_line
-
-def compute_bollinger(close: pd.Series, window: int = 20, num_std: float = 2.0):
-    mid = close.rolling(window).mean()
-    std = close.rolling(window).std()
-    upper, lower = mid + num_std * std, mid - num_std * std
-    pct_b = (close - lower) / (upper - lower).replace(0, np.nan)
-    return mid, upper, lower, pct_b
-
-def compute_hype(volume: pd.Series) -> dict:
-    result = {"score": 0.0, "breakout_days": 0, "avg_ratio": float("nan"), "sustained": False}
-    vol = volume.dropna()
-    if len(vol) < 33: return result
-    baseline = float(vol.iloc[-33:-3].mean())
-    if baseline <= 0: return result
-    ratios = vol.iloc[-3:] / baseline
-    breakout_days = int((ratios > 1.5).sum())
-    avg_ratio = float(ratios.mean())
-    raw = (breakout_days / 3) * 60 + min(max(avg_ratio - 1.0, 0.0), 2.0) / 2.0 * 40
-    result.update(score=float(min(raw, 100.0)), breakout_days=breakout_days, avg_ratio=avg_ratio, sustained=breakout_days == 3)
-    return result
-
-def clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float: return max(lo, min(hi, v))
-
 
 def screen_metrics(close: pd.Series, volume: pd.Series | None = None) -> dict | None:
     """Stage-1 deep-scan screen from the bulk price/volume history alone (no extra
@@ -689,12 +660,11 @@ def candidate_signals(close: pd.Series, bench_close: pd.Series | None = None) ->
 
       mom_long_skip1m — return from ~a year ago up to ONE MONTH ago. The last month is
                         deliberately skipped: 1-month returns tend to reverse, while the
-                        momentum that persists is the longer-horizon kind. Production
-                        momentum currently leans on the 1-month return; this is the
-                        textbook alternative.
+                        momentum that persists is the longer-horizon kind — the textbook
+                        alternative to production's 3-month relative return.
       rel_ret_1m      — 1-month return MINUS the home benchmark's, on shared sessions
-                        with a current endpoint. Production momentum is absolute, so in a
-                        broad rally everything scores well; this isolates outperformance.
+                        with a current endpoint (a shorter-horizon relative-strength
+                        variant to compare against production's 63-session window).
 
     NaN when inputs don't support a value (never a guess). Uses only data up to the last
     bar, so there is no look-ahead. Pure function.
@@ -864,3 +834,203 @@ def expectations_from_frames(eps_revisions=None, eps_trend=None,
     if parts:
         out["expectations_score"] = float(np.mean(parts))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Recommendation-quality helpers (v3) — all pure, all unit-testable
+# ---------------------------------------------------------------------------
+# Abnormal-buzz hype. The legacy hype kicker added 10 points per raw mention
+# (capped at +35). Raw counts are dominated by how FAMOUS a company is, not by
+# whether something is happening: NVDA/TSLA are on r/wallstreetbets every single
+# day, so they banked a permanent +35 while a quiet mid-cap that suddenly got 6
+# mentions earned the same. What carries information is buzz relative to the name's
+# OWN normal level. The baseline is the ticker's median daily mentions over recent
+# scans (app layer); until enough history exists, expected_buzz_from_size stands in
+# (the buzz a company of that market cap typically gets), so a megacap is not
+# credited with a "spike" merely for being bigger than the median name.
+BUZZ_PRIOR = 2.0          # additive smoothing: 0 -> 1 mention is not a "100% spike"
+BUZZ_MIN_MENTIONS = 3.0   # below this, a ratio is noise — no bonus at all
+BUZZ_GAIN = 15.0          # points per 1x of excess over normal (2x normal -> +15)
+BUZZ_CAP = 35.0           # same ceiling as the legacy kicker, so the factor scale holds
+
+
+def buzz_ratio(mentions: float, baseline: float) -> float:
+    """Today's mentions relative to the name's normal level, prior-smoothed.
+
+    1.0 = an ordinary day. NaN only when mentions itself is unusable; a missing
+    baseline is treated as 0 (no prior buzz), which the prior keeps from exploding."""
+    m = float(mentions) if mentions is not None else float("nan")
+    if np.isnan(m) or m < 0:
+        return float("nan")
+    b = float(baseline) if baseline is not None else 0.0
+    if np.isnan(b) or b < 0:
+        b = 0.0
+    return (m + BUZZ_PRIOR) / (b + BUZZ_PRIOR)
+
+
+def abnormal_buzz_bonus(mentions: float, baseline: float) -> float:
+    """Hype points (0..BUZZ_CAP) for buzz ABOVE the name's normal level.
+
+        mentions < 3                  -> 0       (too thin to mean anything)
+        ratio <= 1                    -> 0       (ordinary or quieter than usual)
+        ratio  = 2 (twice normal)     -> +15
+        ratio >= 3.33                 -> +35     (cap)
+
+    Never negative: unusually LOW buzz is not a sell signal (the sell scanner owns
+    bearishness), it just earns nothing."""
+    m = float(mentions) if mentions is not None else 0.0
+    if np.isnan(m) or m < BUZZ_MIN_MENTIONS:
+        return 0.0
+    r = buzz_ratio(m, baseline)
+    if np.isnan(r) or r <= 1.0:
+        return 0.0
+    return float(min(BUZZ_CAP, (r - 1.0) * BUZZ_GAIN))
+
+
+def market_regime(bench_close: pd.Series | None) -> dict:
+    """Trend regime of a home benchmark from its 50/200-session averages.
+
+        risk_on   price > SMA200 and SMA50 > SMA200   (healthy uptrend)
+        risk_off  price < SMA200 and SMA50 < SMA200   (established downtrend)
+        neutral   anything mixed (a recovery or a breakdown in progress)
+
+    Context, not a factor: a BUY in a risk-off tape historically has a worse base
+    rate, so the UI flags it. With <200 sessions the regime is 'unknown' rather
+    than computed off a shorter, different average."""
+    out = {"state": "unknown", "pct_vs_200": float("nan"), "golden": None}
+    if bench_close is None:
+        return out
+    c = pd.Series(bench_close).dropna().astype(float)
+    if len(c) < 200:
+        return out
+    last = float(c.iloc[-1])
+    sma50 = float(c.iloc[-50:].mean())
+    sma200 = float(c.iloc[-200:].mean())
+    if not (sma200 > 0):
+        return out
+    pct = (last / sma200 - 1.0) * 100.0
+    golden = sma50 > sma200
+    if last > sma200 and golden:
+        state = "risk_on"
+    elif last < sma200 and not golden:
+        state = "risk_off"
+    else:
+        state = "neutral"
+    out.update(state=state, pct_vs_200=float(pct), golden=bool(golden))
+    return out
+
+
+def realized_vol(close: pd.Series, sessions: int = 63) -> float:
+    """Annualised realised volatility (percent) over the last `sessions` daily
+    log returns. NaN with too little data."""
+    c = pd.Series(close).dropna().astype(float)
+    if len(c) < sessions + 1 or (c <= 0).any():
+        return float("nan")
+    rets = np.log(c.iloc[-sessions - 1:]).diff().dropna()
+    if len(rets) < 2:
+        return float("nan")
+    return float(rets.std(ddof=1) * np.sqrt(252) * 100.0)
+
+
+def reward_risk(price: float, target: float, stop: float) -> float:
+    """Reward-to-risk multiple for buying at `price`: (target - price) / (price - stop).
+
+    Uses the CURRENT price, not the entry zone, because that is what you get if you
+    act now. NaN when the geometry is unusable (target at/below price, stop at/above)."""
+    try:
+        p, t, s = float(price), float(target), float(stop)
+    except (TypeError, ValueError):
+        return float("nan")
+    if any(np.isnan(v) for v in (p, t, s)) or not (t > p > s):
+        return float("nan")
+    return (t - p) / (p - s)
+
+
+def factor_agreement(scores: dict, hi: float = 60.0, lo: float = 40.0) -> dict:
+    """How many factors actively support vs oppose a call.
+
+    The composite is an average, and an average of 95/90/20/20 looks like a calm
+    56 — the same number as six factors sitting at 56. Agreement exposes the
+    difference: broad support is a sturdier pick than one factor carrying the rest."""
+    vals = [float(v) for v in scores.values() if v is not None and not np.isnan(float(v))]
+    support = sum(v >= hi for v in vals)
+    against = sum(v <= lo for v in vals)
+    return {"support": int(support), "against": int(against), "n": len(vals)}
+
+
+def diversified_top(items: list, n: int = 3, bucket_key=None) -> list:
+    """Greedy top-n that takes at most one name per bucket (theme, else sector).
+
+    `items` must already be sorted best-first. A ranked list routinely fills the
+    podium with three semiconductor names that are really one bet; this keeps the
+    best name of each bucket and falls back to the plain ranking only if there are
+    not enough distinct buckets. Items with an empty bucket are always distinct."""
+    if bucket_key is None:
+        def bucket_key(it):
+            return (it.get("theme_match") or it.get("sector") or "") if isinstance(it, dict) else ""
+    picked, seen = [], set()
+    for it in items:
+        b = bucket_key(it)
+        if b and b in seen:
+            continue
+        picked.append(it)
+        if b:
+            seen.add(b)
+        if len(picked) >= n:
+            return picked
+    for it in items:                         # not enough buckets: top up in rank order
+        if len(picked) >= n:
+            break
+        if not any(it is p for p in picked):
+            picked.append(it)
+    return picked
+
+
+def finalize_hype(vol_score: float, buzz_bonus: float, forum_score: float | None = None,
+                  squeeze: bool = False) -> float:
+    """Assemble the hype factor from its parts — the exact order the app has always
+    used: volume score + buzz kicker (clamped), then a 50/50 blend with the
+    Japanese forum poll when one exists, then +30 for a short squeeze setup."""
+    s = float(vol_score)
+    b = float(buzz_bonus) if buzz_bonus is not None else 0.0
+    if not np.isnan(b) and b > 0:
+        s = clamp(s + b)
+    if forum_score is not None and not np.isnan(float(forum_score)):
+        s = clamp(0.5 * s + 0.5 * float(forum_score))
+    if squeeze:
+        s = clamp(s + 30.0)
+    return float(s)
+
+
+def expected_buzz_from_size(mentions: list, market_caps: list, min_points: int = 8) -> list:
+    """Cold-start baseline: the mentions a company of this SIZE typically gets today.
+
+    Before a name has its own buzz history, comparing it with the plain peer median
+    would hand every megacap a huge "spike" (they always out-talk the median). Buzz
+    scales with company size, so fit log(1 + mentions) on log(market cap) across the
+    scan and use the fitted value as each name's expected level. Slope is floored at
+    0 (bigger companies are never expected to be discussed LESS). Names without a
+    market cap get the cross-sectional median. Returns NaN for every name when there
+    are too few usable points to fit."""
+    m = np.array([float(x) if x is not None else np.nan for x in mentions], dtype=float)
+    c = np.array([float(x) if x is not None else np.nan for x in market_caps], dtype=float)
+    out = np.full(len(m), np.nan)
+    ok = ~np.isnan(m) & ~np.isnan(c) & (c > 0) & (m >= 0)
+    med = float(np.nanmedian(m)) if np.any(~np.isnan(m)) else np.nan
+    if ok.sum() < min_points:
+        return [float("nan")] * len(m)
+    x, y = np.log(c[ok]), np.log1p(m[ok])
+    if np.std(x) == 0:
+        slope, icpt = 0.0, float(np.mean(y))
+    else:
+        slope, icpt = np.polyfit(x, y, 1)
+        if slope < 0:
+            slope, icpt = 0.0, float(np.mean(y))
+    for i in range(len(m)):
+        if np.isnan(m[i]):
+            continue
+        if ok[i]:
+            out[i] = max(0.0, float(np.expm1(icpt + slope * np.log(c[i]))))
+        else:
+            out[i] = med
+    return [float(v) for v in out]

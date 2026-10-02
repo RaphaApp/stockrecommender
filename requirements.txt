@@ -2,11 +2,12 @@ streamlit>=1.40
 pandas
 numpy
 altair
+yfinance
+curl_cffi
 
-# Optional: Postgres/Supabase backend (DB_BACKEND="postgres").
-# Without it the app silently uses local SQLite.
-psycopg[binary]
+# Optional: six-factor radar in Chart Deep Dive (skipped cleanly if absent).
+plotly
 
-# Optional: PDF ingestion (Workstream 4). Without it, PDF uploads report a clear
-# message and image uploads still work.
-pymupdf
+# Optional: Postgres/Supabase backend (set DATABASE_URL). The app imports psycopg2,
+# so this is the driver it needs; without it the app uses local SQLite.
+psycopg2-binary

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import logging
 import math
@@ -370,6 +371,7 @@ DEFAULT_SOURCES = list(SENTIMENT_SOURCES.keys())
 # Human-readable summary of what the last hype scan actually used, for the UI.
 _LAST_HYPE_STATUS = ""
 _LAST_HYPE_FETCHED_AT = 0.0   # epoch seconds of the last ACTUAL (cache-miss) hype fetch
+_LAST_HYPE_LIVE: list = []    # source keys that returned real data on the last fetch
 
 def _fetch_hype_uncached(universe: dict, enabled: list) -> tuple:
     """Run every enabled source over the markets it covers; merge per-ticker counts.
@@ -383,7 +385,7 @@ def _fetch_hype_uncached(universe: dict, enabled: list) -> tuple:
         sub = [t for region, ticks in universe.items() if region in src["markets"] for t in ticks]
         if not sub:
             continue
-        names = {t: COMPANY_NAMES.get(t, t) for t in sub}
+        names = {t: NEWS_QUERY_NAMES.get(t) or COMPANY_NAMES.get(t, t) for t in sub}
         try:
             res = src["fn"](sub, names) or {}
         except Exception:
@@ -421,6 +423,13 @@ def fetch_hype_signals(universe: dict, enabled_sources: list | None = None) -> d
         elif key == "gdelt":
             status_parts.append(f"{tr('src_gdelt')}: {tr('hype_status_' + payload['gdelt'])}")
     _LAST_HYPE_STATUS = (tr("hype_sources_prefix") + " " + " · ".join(status_parts)) if status_parts else ""
+    # Which sources actually returned data this time. Buzz history is only written
+    # for live sources: a blocked feed reports zeros, and logging those would drag a
+    # name's "normal" level down and make the next ordinary day look like a spike.
+    global _LAST_HYPE_LIVE
+    _LAST_HYPE_LIVE = [k for k in payload["sources_ran"]
+                       if (k == "reddit" and payload["reddit"] != "offline")
+                       or (k == "gdelt" and payload["gdelt"] == "ok")]
     return payload["counts"]
 
 
@@ -468,7 +477,16 @@ OUTCOME_LOSS, OUTCOME_WIN, OUTCOME_NEUTRAL = 0, 1, 2
 # pooled with the current one in the Model Lab.
 #   v1 — momentum return term = raw 1-month return (+/-13)
 #   v2 — momentum return term = 3-month return vs home benchmark (+/-20), rebalanced
-PRODUCTION_MODEL_VERSION = "composite-v2-relative-momentum"
+#   v3 — hype buzz kicker = ABNORMAL buzz (mentions vs the name's own normal level)
+#        instead of +10 per raw mention. Raw counts measured fame, not news: the same
+#        handful of megacaps banked the full +35 on every scan. Set HYPE_BUZZ_MODE to
+#        "legacy" to restore v2 exactly (the version string follows, so the Model Lab
+#        never pools the two definitions).
+HYPE_BUZZ_MODE = "abnormal"          # "abnormal" (v3) | "legacy" (v2 behaviour)
+PRODUCTION_MODEL_VERSION = ("composite-v3-abnormal-buzz" if HYPE_BUZZ_MODE == "abnormal"
+                            else "composite-v2-relative-momentum")
+BUZZ_BASELINE_DAYS = 30              # look-back for a name's "normal" daily mentions
+BUZZ_MIN_HISTORY = 5                 # days of history before the own-baseline is trusted
 DIRECTIONAL_CALLS = ("BUY", "SELL")
 
 BUY_THRESHOLD = 65.0
@@ -476,7 +494,7 @@ SELL_THRESHOLD = 45.0
 
 from config import (
     TICKER_UNIVERSE, COMPANY_NAMES, THEMES, BENCHMARKS, TRANSLATIONS,
-    DEEP_FINALISTS, DEEP_US_TICKERS, JP_DEEP_TICKERS, CN_DEEP_TICKERS, DEEP_UNIVERSES,
+    DEEP_FINALISTS, DEEP_UNIVERSES,
 )
 # Deep-scan promotion settings (new). getattr-style fallback so an older config.py
 # without these blocks still runs — promotions just start empty with the 5/3/2 quota.
@@ -490,12 +508,16 @@ try:
     from config import CONFIG_SCHEMA_VERSION
 except ImportError:
     CONFIG_SCHEMA_VERSION = 0
-EXPECTED_CONFIG_SCHEMA = 20
+EXPECTED_CONFIG_SCHEMA = 21
 
 try:
     from config import INSTRUMENT_JA
 except ImportError:
     INSTRUMENT_JA = {}
+try:
+    from config import NEWS_QUERY_NAMES
+except ImportError:            # older config.py: news search uses display names
+    NEWS_QUERY_NAMES = {}
 try:
     from config import PROMOTED_TICKERS, PROMOTION_QUOTA
 except ImportError:
@@ -513,6 +535,8 @@ from indicators import (
     EARLY_SETUP_MODEL_VERSION, candidate_signals, cross_sectional_ic,
     relative_return, momentum_score as _momentum_score, MOMENTUM_REL_SESSIONS,
     bar_date, forward_excess, expectations_from_frames,
+    buzz_ratio, abnormal_buzz_bonus, market_regime, realized_vol, reward_risk,
+    factor_agreement, diversified_top, finalize_hype, expected_buzz_from_size,
 )
 ALL_TICKERS = [ticker for region in TICKER_UNIVERSE.values() for ticker in region]
 
@@ -803,6 +827,41 @@ def inject_css(accent: str = "#1B4D8F", card_bg: str = "#FFFFFF") -> None:
             font-weight: 500;
         }}
         [data-baseweb="tag"]:hover {{ background-color: var(--accent-deep) !important; }}
+        /* FIX: first letter of the first chip cut off ("eddit (finance subs)").
+           Cause, reproduced in a browser: the rules above remove baseweb's chip
+           max-width and force nowrap/overflow:visible, so a long label made the
+           chip WIDER than the value box (~165px chip in a ~130px box). That box is
+           overflow:hidden and the browser scrolls it to keep the caret in view, so
+           the chip's start slid under the box's left edge. Fix: a chip may never be
+           wider than its row, and a long label wraps inside the chip instead. */
+        [data-baseweb="select"] > div > div:first-child {{ min-width: 0; }}
+        [data-baseweb="select"] [data-baseweb="tag"] {{
+            max-width: 100% !important; min-width: 0; height: auto !important;
+            align-items: center;
+        }}
+        [data-baseweb="select"] [data-baseweb="tag"] > span:first-child {{
+            white-space: normal !important; overflow-wrap: anywhere; font-size: .82rem;
+            min-width: 0; line-height: 1.25; padding: 2px 0;
+        }}
+        [data-baseweb="select"] [data-baseweb="tag"] > span[role="presentation"] {{ flex: 0 0 auto; }}
+        /* Streamlit 1.5x+ rebuilt the multiselect on react-aria (no baseweb tags),
+           so the chip rules above stop matching after an upgrade. Same treatment
+           for the new markup: accent fill, white label, wrap instead of overflow. */
+        [data-testid="stMultiSelect"] [data-rac][role="group"] {{
+            background: #FFFFFF; border: 1px solid var(--rule); border-radius: 6px;
+        }}
+        [data-testid="stMultiSelectTagsContainer"] [data-tag] {{
+            background-color: var(--accent) !important; color: #FFFFFF !important;
+            border-radius: 3px !important; max-width: 100%; height: auto !important;
+        }}
+        [data-testid="stMultiSelectTagsContainer"] [data-tag] * {{
+            color: #FFFFFF !important; -webkit-text-fill-color: #FFFFFF !important;
+        }}
+        [data-testid="stMultiSelectTagsContainer"] [data-tag] > span:first-child {{
+            white-space: normal !important; overflow: visible !important;
+            text-overflow: clip !important; overflow-wrap: anywhere; line-height: 1.25;
+            font-size: .82rem;
+        }}
         /* Room for chips to wrap instead of clipping. */
         [data-testid="stMultiSelect"] [data-baseweb="select"] > div {{
             min-height: 2.5rem; height: auto !important; padding: 2px 4px !important;
@@ -824,7 +883,69 @@ def inject_css(accent: str = "#1B4D8F", card_bg: str = "#FFFFFF") -> None:
         [data-testid="stExpander"] details {{ border: 1px solid var(--rule); border-radius: 6px; background: var(--surface); }}
         div[data-baseweb="tab-list"] {{ gap: 2px; }}
 
+        /* ---- pick cards (Top Selections) ---------------------------------------
+           The diverging factor bars are the one new visual idea: every factor is
+           drawn from the model's own neutral point (50) outward, jade to the right,
+           rose to the left, so "what holds this pick up" reads before any number. */
+        .qc-pick {{ padding: 16px 16px 12px; }}
+        .qc-pick-head {{ display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }}
+        .qc-rank {{
+            font-family: var(--font-num); font-weight: 600; font-size: .8rem; color: var(--accent);
+            border: 1px solid var(--accent); border-radius: 3px; padding: 0 6px; margin-right: 8px;
+            font-variant-numeric: tabular-nums;
+        }}
+        .qc-pick-name {{ margin-top: 2px; line-height: 1.35; }}
+        .qc-dim {{ color: var(--muted); opacity: .85; }}
+        .qc-pick-row {{ display: flex; justify-content: space-between; align-items: flex-end; margin-top: 10px; }}
+        .qc-pick-score {{
+            font-family: var(--font-num); font-size: 2.1rem; font-weight: 600; line-height: 1;
+            letter-spacing: -0.03em; font-variant-numeric: tabular-nums; color: var(--ink);
+        }}
+        .qc-pick-score span {{ font-size: .8rem; color: var(--muted); font-weight: 500; margin-left: 2px; }}
+        .qc-pick-px {{ text-align: right; }}
+        .qc-why {{ font-size: .82rem; color: var(--ink-2); margin-top: 10px; }}
+        .qc-agree {{ font-family: var(--font-num); font-size: .72rem; color: var(--muted); margin-top: 2px; }}
+        .qc-fbars {{
+            display: grid; grid-template-columns: minmax(4.5rem, auto) 1fr 1.8rem;
+            gap: 5px 8px; align-items: center; margin: 12px 0 4px;
+        }}
+        .qc-fbar-l {{ font-size: .74rem; color: var(--muted); white-space: nowrap; }}
+        .qc-fbar-track {{ position: relative; height: 8px; background: var(--paper); border-radius: 2px; }}
+        .qc-fbar-track::after {{
+            content: ""; position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px;
+            background: var(--ink); opacity: .35;
+        }}
+        .qc-fbar-fill {{ position: absolute; top: 0; bottom: 0; border-radius: 2px; }}
+        .qc-fbar-fill.pos {{ background: var(--pos); }}
+        .qc-fbar-fill.neg {{ background: var(--neg); }}
+        .qc-fbar-fill.mid {{ background: #A7B0BD; }}
+        .qc-fbar-v {{
+            font-family: var(--font-num); font-size: .74rem; text-align: right;
+            font-variant-numeric: tabular-nums; color: var(--ink-2);
+        }}
+        .qc-plan {{
+            display: grid; grid-template-columns: 1.5fr 1fr 1fr .9fr; gap: 8px;
+            border-top: 1px solid var(--rule); margin-top: 10px; padding-top: 10px;
+        }}
+        .qc-plan-k {{ font-size: .68rem; color: var(--muted); }}
+        .qc-plan-v {{
+            font-family: var(--font-num); font-size: .84rem; font-weight: 600; color: var(--ink);
+            font-variant-numeric: tabular-nums; white-space: nowrap;
+        }}
+        .qc-plan-s {{ font-family: var(--font-num); font-size: .7rem; color: var(--muted); }}
+        .qc-plan-empty {{ font-size: .75rem; color: var(--muted); border-top: 1px solid var(--rule);
+                          margin-top: 10px; padding-top: 8px; }}
+        .qc-flags {{ display: flex; flex-wrap: wrap; gap: 4px; margin-top: 10px; }}
+        .qc-flag {{
+            font-size: .7rem; padding: 2px 7px; border-radius: 3px; color: var(--warn);
+            background: rgba(169,106,5,0.10); border-left: 2px solid currentColor;
+        }}
+        .qc-flag.ok {{ color: var(--pos); background: rgba(15,123,90,0.08); }}
+        .qc-board-v .up {{ color: #5FD3A6; }} .qc-board-v .down {{ color: #FF8A9A; }}
+
         @media (max-width: 640px) {{
+            .qc-pick-score {{ font-size: 1.8rem; }}
+            .qc-plan {{ grid-template-columns: 1fr 1fr; }}
             .qc-value {{ font-size: 1.35rem; }}
             .qc-ticker {{ font-size: 1rem; }}
             .qc-card {{ padding: 12px 14px; margin-bottom: 10px; }}
@@ -863,7 +984,7 @@ def board_strip(cells: list[tuple[str, str, bool]]) -> str:
         label, value, live = cell[0], cell[1], cell[2]
         hint = cell[3] if len(cell) > 3 else ""
         dim = "" if live else " dim"
-        title = f' title="{hint}"' if hint else ""
+        title = f' title="{html.escape(hint)}"' if hint else ""
         out.append(f'<div class="qc-board-cell"{title}><div class="qc-board-k">{label}</div>'
                    f'<div class="qc-board-v{dim}">{value}</div></div>')
     return f'<div class="qc-board">{"".join(out)}</div>'
@@ -896,14 +1017,46 @@ def safe_float(value, default: float = float("nan")) -> float:
         return default if math.isnan(f) or math.isinf(f) else f
     except (TypeError, ValueError): return default
 
-def fmt_money(v: float) -> str: return "—" if math.isnan(v) else f"${v:,.2f}"
+# Quote currency. Every price used to print with "$", so Toyota at 2,850 yen read as
+# $2,850 and LVMH's euro price as dollars. Yahoo's own `currency` field wins when the
+# fundamentals call returned it; otherwise the exchange suffix decides.
+_CCY_BY_SUFFIX = {"": "USD", "T": "JPY", "HK": "HKD", "PA": "EUR", "DE": "EUR",
+                  "AS": "EUR", "MI": "EUR", "SS": "CNY", "SZ": "CNY", "SI": "SGD",
+                  "JK": "IDR", "L": "GBp"}
+_CCY_FMT = {   # code -> (prefix, suffix, decimals)
+    "USD": ("$", "", 2), "JPY": ("¥", "", 0), "EUR": ("€", "", 2), "HKD": ("HK$", "", 2),
+    "CNY": ("CN¥", "", 2), "SGD": ("S$", "", 2), "IDR": ("Rp ", "", 0),
+    "GBP": ("£", "", 2), "GBp": ("", "p", 1), "GBX": ("", "p", 1),
+}
+
+def currency_for(ticker: str | None = None, code: str | None = None) -> str:
+    """ISO-ish currency code for a quote: explicit code first, then exchange suffix."""
+    if code and str(code) in _CCY_FMT:
+        return str(code)
+    t = str(ticker or "")
+    suffix = t.rsplit(".", 1)[1].upper() if "." in t else ""
+    return _CCY_BY_SUFFIX.get(suffix, "USD")
+
+def fmt_money(v: float, ticker: str | None = None, currency: str | None = None) -> str:
+    """Price in its quote currency. Called with just a number it keeps the old "$"
+    behaviour, so untouched call sites are unchanged."""
+    v = safe_float(v)
+    if math.isnan(v): return "—"
+    pre, suf, nd = _CCY_FMT.get(currency_for(ticker, currency), _CCY_FMT["USD"])
+    return f"{pre}{v:,.{nd}f}{suf}"
+
+def fmt_px(r: dict, key: str = "price") -> str:
+    """fmt_money for a field of a scan-result dict, in that result's currency."""
+    return fmt_money(r.get(key), r.get("ticker"), r.get("currency"))
+
 def fmt_pct(v: float) -> str: return "—" if math.isnan(v) else f"{v:+.2f}%"
 def fmt_num(v: float, nd: int = 1) -> str: return "—" if math.isnan(v) else f"{v:.{nd}f}"
-def fmt_big(v: float) -> str:
+def fmt_big(v: float, ticker: str | None = None, currency: str | None = None) -> str:
     if math.isnan(v): return "—"
+    pre, suf, _ = _CCY_FMT.get(currency_for(ticker, currency), _CCY_FMT["USD"])
     for unit, div in (("T", 1e12), ("B", 1e9), ("M", 1e6)):
-        if abs(v) >= div: return f"${v / div:,.2f}{unit}"
-    return f"${v:,.0f}"
+        if abs(v) >= div: return f"{pre}{v / div:,.2f}{unit}{suf}"
+    return f"{pre}{v:,.0f}{suf}"
 
 # ----------------------------------------------------------------------------
 # Database layer — dual backend.
@@ -937,6 +1090,23 @@ def _pg_sql(sql: str) -> str:
     return sql.replace("?", "%s")
 
 
+class _PgCursor:
+    """Thin DBAPI cursor proxy that speaks the app's sqlite '?' dialect."""
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, sql, params=None, *args):
+        if params is None:
+            return self._cur.execute(_pg_sql(sql))
+        return self._cur.execute(_pg_sql(sql), tuple(params))
+
+    def __iter__(self):
+        return iter(self._cur)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
 class _PgConn:
     """psycopg2 adapter with the sqlite3-ish surface the app uses.
 
@@ -963,8 +1133,11 @@ class _PgConn:
         return cur
 
     def cursor(self, *args, **kwargs):
-        # pandas.read_sql_query drives the raw DBAPI cursor protocol directly.
-        return self._raw.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        # pandas.read_sql_query drives the raw DBAPI cursor protocol directly, so the
+        # '?' -> '%s' translation has to live on the cursor too. Without the wrapper
+        # every read_sql_query that passed params (Model Lab, IC report, buzz
+        # history) failed on Postgres and was silently swallowed by its try/except.
+        return _PgCursor(self._raw.cursor(cursor_factory=psycopg2.extras.DictCursor))
 
     def commit(self):
         self._raw.commit()
@@ -1174,6 +1347,16 @@ def init_db() -> None:
                 symbol TEXT PRIMARY KEY,
                 fails INTEGER NOT NULL DEFAULT 0,
                 last_fail TEXT, last_ok TEXT
+            )"""))
+        # Daily mention counts per ticker, the memory behind the v3 abnormal-buzz
+        # hype kicker. One row per ticker per day per source mix (latest scan wins);
+        # `sources` matters because Reddit+GDELT counts are not comparable with
+        # GDELT-only counts.
+        conn.execute(_ddl("""
+            CREATE TABLE IF NOT EXISTS buzz_history (
+                ticker TEXT NOT NULL, obs_date TEXT NOT NULL, sources TEXT NOT NULL,
+                mentions REAL, created_at TEXT,
+                PRIMARY KEY (ticker, obs_date, sources)
             )"""))
         conn.execute(_ddl("""
             CREATE TABLE IF NOT EXISTS theme_history (
@@ -1620,7 +1803,7 @@ def _fmp_fundamentals(ticker: str) -> dict:
     hdr = {"User-Agent": "Mozilla/5.0"}
     out = {"pe": float("nan"), "div_yield": float("nan"), "market_cap": float("nan"),
            "roe": float("nan"), "short_pct": float("nan"), "name": ticker,
-           "sector": "", "industry": ""}
+           "sector": "", "industry": "", "currency": "USD", "earnings_ts": float("nan")}
     got = False
     try:
         prof = json.loads(_reddit_get(f"{base}/profile/{ticker}?apikey={key}", hdr))
@@ -1692,6 +1875,12 @@ def fetch_fundamentals(ticker: str) -> dict:
     # Deep Scan <-> Themes bridge (match_theme) at zero extra API cost.
     out["sector"] = str(info.get("sector") or "")
     out["industry"] = str(info.get("industry") or "")
+    # Display/risk context from the SAME .info payload (zero extra requests): the
+    # quote currency for honest price labels, and the next earnings date for the
+    # "results due" flag on pick cards. Neither feeds a factor.
+    out["currency"] = str(info.get("currency") or "")
+    out["earnings_ts"] = safe_float(info.get("earningsTimestampStart")
+                                    or info.get("earningsTimestamp"))
     return out
 
 def resolve_div_yield(info: dict) -> float:
@@ -1844,28 +2033,24 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
     roe = funds["roe"]
     quality_score = 50.0 if math.isnan(roe) else clamp(50 + (roe * 200))
 
-    # Social & news buzz — a live retail/news-sentiment kicker combining every
-    # enabled source for this market (Reddit, GDELT news, …). Each mention adds 10
-    # points to the hype score (capped at +35), then the whole score is re-clamped
-    # to 0-100. Zero mentions (or a failed fetch) leave hype untouched.
-    if hype_mentions > 0:
-        hype["score"] = clamp(hype["score"] + min(35, hype_mentions * 10))
-
-    # Japan-native sentiment: Yahoo!掲示板 みんなの評価 poll, blended 50/50 into the
-    # hype score when available. This gives Japanese names a real sentiment signal
-    # (Reddit/GDELT are English-centric); the transform (net bullishness, damped)
-    # is forum_sentiment_score in indicators.py. Fail-safe: no poll -> volume-only.
-    if jp_forum is not None:
-        fs = forum_sentiment_score(jp_forum[0], jp_forum[1])
-        if fs is not None:
-            hype["score"] = clamp(0.5 * hype["score"] + 0.5 * fs)
-
-    # Short-squeeze modifier — a heavily-shorted name (>10% of float) that is also
-    # printing sustained volume breakouts can squeeze violently, so we boost its
-    # hype score by +30 (capped at 100). The boost flows into hype_score below.
+    # Hype is assembled from four parts (indicators.finalize_hype):
+    #   volume breakout score
+    #   + social/news buzz kicker (Reddit, GDELT, … for this market)
+    #   -> 50/50 blend with the Yahoo!掲示板 みんなの評価 poll for Japanese names
+    #      (Reddit/GDELT are English-centric; transform = forum_sentiment_score)
+    #   + 30 short-squeeze boost when >10% of float is short AND volume breakouts
+    #     are sustained.
+    # The parts are stored on the result so run_engine can re-assemble hype once the
+    # whole scan is known: the v3 buzz kicker compares each name's mentions with its
+    # OWN normal level (apply_buzz_model), which a per-ticker function cannot see.
+    # Here the kicker is the legacy one (+10 per raw mention, cap +35), which is
+    # exactly v2 behaviour and is what the deep scan (0 mentions) keeps.
+    vol_hype = float(hype["score"])
+    legacy_bonus = min(35.0, hype_mentions * 10.0) if hype_mentions > 0 else 0.0
+    fs = forum_sentiment_score(jp_forum[0], jp_forum[1]) if jp_forum is not None else None
     short_pct = funds["short_pct"]
-    if not math.isnan(short_pct) and short_pct > 0.10 and hype["sustained"]:
-        hype["score"] = clamp(hype["score"] + 30.0)
+    squeeze = bool(not math.isnan(short_pct) and short_pct > 0.10 and hype["sustained"])
+    hype["score"] = finalize_hype(vol_hype, legacy_bonus, fs, squeeze)
 
     return {
         "ticker": ticker, "region": region, "name": funds["name"], "price": price,
@@ -1890,6 +2075,16 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
         # see. Neutral 50 contributes weight*50 to the composite, i.e. no tilt.
         "theme": 50.0, "theme_match": None,
         "hype_score": hype["score"], "hype_mentions": hype_mentions,
+        # Hype parts (see finalize_hype) + buzz bookkeeping; apply_buzz_model fills
+        # baseline/ratio/basis and swaps the kicker in v3 mode.
+        "hype_vol_score": vol_hype, "hype_forum_score": (fs if fs is not None else float("nan")),
+        "hype_squeeze": squeeze,
+        "buzz_baseline": float("nan"), "buzz_ratio": float("nan"), "buzz_basis": "",
+        "buzz_bonus": float(legacy_bonus), "buzz_legacy_bonus": float(legacy_bonus),
+        # Display / risk context — none of these feed a factor.
+        "currency": funds.get("currency") or currency_for(ticker),
+        "earnings_ts": safe_float(funds.get("earnings_ts")),
+        "vol_63": realized_vol(close, 63),
         "jp_bull": (jp_forum[0] if jp_forum else float("nan")),
         # Keep ONLY the Close column of the history frame in the result dict: the
         # sole post-scan consumer is the Deep-Dive price chart (Close + SMAs derived
@@ -2409,6 +2604,119 @@ def attach_early_setups(results: list[dict],
             r["setup_state_changed"] = bool(prev is not None and prev != out["state"])
             n += 1
     return n
+
+
+# ----------------------------------------------------------------------------
+# Abnormal buzz (model v3) — buzz history + the cross-sectional second pass
+# ----------------------------------------------------------------------------
+def _buzz_sources_for(region: str, live: list) -> str:
+    """Canonical key of the live sentiment sources that cover `region`."""
+    return "+".join(sorted(k for k in live
+                           if region in SENTIMENT_SOURCES.get(k, {}).get("markets", ())))
+
+
+def buzz_baselines(keys: list) -> dict:
+    """{(ticker, sources): (median_mentions, n_days)} over the last BUZZ_BASELINE_DAYS,
+    EXCLUDING today (today is what is being judged). Missing names are absent."""
+    if not keys:
+        return {}
+    since = (date.today() - timedelta(days=BUZZ_BASELINE_DAYS)).isoformat()
+    today = date.today().isoformat()
+    try:
+        with get_conn() as conn:
+            df = pd.read_sql_query(
+                "SELECT ticker, sources, mentions FROM buzz_history "
+                "WHERE obs_date >= ? AND obs_date < ?", conn, params=(since, today))
+    except Exception as e:
+        logger.warning("buzz history read skipped: %s", e)
+        return {}
+    if df.empty:
+        return {}
+    wanted = set(keys)
+    out = {}
+    for (t, s), g in df.groupby(["ticker", "sources"]):
+        if (t, s) in wanted:
+            vals = pd.to_numeric(g["mentions"], errors="coerce").dropna()
+            if len(vals):
+                out[(t, s)] = (float(vals.median()), int(len(vals)))
+    return out
+
+
+def record_buzz(rows: list) -> None:
+    """Upsert today's mentions: rows = [(ticker, sources, mentions)]. Never raises."""
+    if not rows:
+        return
+    today, ts = date.today().isoformat(), datetime.now().isoformat(timespec="seconds")
+    try:
+        with get_conn() as conn:
+            conn.executemany(
+                "DELETE FROM buzz_history WHERE ticker = ? AND obs_date = ? AND sources = ?",
+                [(t, today, s) for t, s, _ in rows])
+            conn.executemany(
+                "INSERT INTO buzz_history (ticker, obs_date, sources, mentions, created_at) "
+                "VALUES (?,?,?,?,?)", [(t, today, s, float(m), ts) for t, s, m in rows])
+            conn.commit()
+    except Exception as e:
+        logger.warning("buzz history write skipped: %s", e)
+
+
+def apply_buzz_model(analyses: list[dict], live_sources: list) -> None:
+    """v3 second pass: replace the legacy +10/mention kicker with ABNORMAL buzz.
+
+    Baseline per name, in order of preference:
+      own   — its median daily mentions over the last 30 days (>= BUZZ_MIN_HISTORY
+              days, same source mix);
+      size  — while history builds: the mentions expected for a company of its
+              market cap, fitted across this scan (expected_buzz_from_size);
+    Names no live source covers keep zero buzz. Hype is then re-assembled from the
+    stored parts, so the forum blend and squeeze boost behave exactly as before.
+    Mutates `analyses` in place; also logs today's counts for future baselines."""
+    if HYPE_BUZZ_MODE != "abnormal" or not analyses:
+        return
+    keys = {id(a): _buzz_sources_for(a.get("region", ""), live_sources) for a in analyses}
+    own = buzz_baselines([(a["ticker"], keys[id(a)]) for a in analyses if keys[id(a)]])
+    # Cold-start fits are per source mix: GDELT-only (Japan) counts are not on the
+    # same scale as Reddit+GDELT (USA).
+    size_base: dict = {}
+    for k in {v for v in keys.values() if v}:
+        grp = [a for a in analyses if keys[id(a)] == k]
+        fit = expected_buzz_from_size([safe_float(a.get("hype_mentions"), 0.0) for a in grp],
+                                      [safe_float(a.get("market_cap")) for a in grp])
+        for a, b in zip(grp, fit):
+            size_base[id(a)] = b
+    to_log = []
+    for a in analyses:
+        k = keys[id(a)]
+        m = safe_float(a.get("hype_mentions"), 0.0)
+        if not k:
+            base, basis = float("nan"), ""
+        else:
+            to_log.append((a["ticker"], k, m))
+            o = own.get((a["ticker"], k))
+            if o and o[1] >= BUZZ_MIN_HISTORY:
+                base, basis = o[0], "own"
+            else:
+                base, basis = size_base.get(id(a), float("nan")), "size"
+        bonus = 0.0 if math.isnan(base) else abnormal_buzz_bonus(m, base)
+        a["buzz_baseline"], a["buzz_basis"] = base, basis
+        a["buzz_ratio"] = buzz_ratio(m, base) if not math.isnan(base) else float("nan")
+        a["buzz_bonus"] = float(bonus)
+        fs = safe_float(a.get("hype_forum_score"))
+        score = finalize_hype(safe_float(a.get("hype_vol_score"), 0.0), bonus,
+                              None if math.isnan(fs) else fs, bool(a.get("hype_squeeze")))
+        a["hype_score"] = score
+        if isinstance(a.get("hype"), dict):
+            a["hype"]["score"] = score
+    record_buzz(to_log)
+
+
+def compute_regimes(histories: dict, benchmarks: list) -> dict:
+    """{benchmark: market_regime(...)} from already-downloaded frames (no requests)."""
+    out = {}
+    for b in benchmarks:
+        h = histories.get(b)
+        out[b] = market_regime(h["Close"] if h is not None and "Close" in h.columns else None)
+    return out
 
 
 def record_observations(results: list[dict], scan_type: str = "unknown") -> int:
@@ -3249,6 +3557,14 @@ def attach_candidate_signals(results: list[dict], histories: dict | None = None)
         try:
             cands = candidate_signals(
                 hist["Close"], bh["Close"] if bh is not None and "Close" in bh.columns else None)
+            # v3 bookkeeping, so the Model Lab can compare the two buzz definitions
+            # and test whether the market regime conditions anything.
+            cands["buzz_raw_mentions"] = safe_float(r.get("hype_mentions"), 0.0)
+            cands["buzz_ratio"] = safe_float(r.get("buzz_ratio"))
+            cands["buzz_legacy_bonus"] = safe_float(r.get("buzz_legacy_bonus"))
+            cands["regime_score"] = {"risk_on": 1.0, "neutral": 0.0,
+                                     "risk_off": -1.0}.get(r.get("regime"), float("nan"))
+            cands["vol_63"] = safe_float(r.get("vol_63"))
             exp = r.get("expectations") or {}
             for k in ("expectations_score", "eps_revision_score", "eps_trend_score",
                       "forward_growth_score", "earnings_surprise_score"):
@@ -3406,6 +3722,18 @@ def run_engine(limit_per_region: int | None = None,
         a["theme_match"] = match_theme(a["region"], a.get("sector"), a.get("industry"))
         if a["theme_match"]:
             theme_members.setdefault(a["theme_match"], []).append(a)
+    # ---- Hype (v3): abnormal buzz needs the whole scan + buzz history ----
+    try:
+        apply_buzz_model(analyses, list(_LAST_HYPE_LIVE))
+    except Exception as e:
+        logger.warning("abnormal-buzz pass failed, legacy buzz kept: %s", e)
+    # ---- Market regime per home benchmark (context for the pick cards) ----
+    regimes = compute_regimes(bulk, _benches)
+    st.session_state["regimes"] = regimes
+    for a in analyses:
+        rg = regimes.get(benchmark_for(a["ticker"])) or {}
+        a["regime"] = rg.get("state", "unknown")
+        a["regime_pct"] = safe_float(rg.get("pct_vs_200"))
     for a in analyses:
         peers = [p["momentum"] for p in theme_members.get(a.get("theme_match"), []) if p is not a]
         a["theme"] = theme_strength_score(peers)
@@ -3428,6 +3756,144 @@ def run_engine(limit_per_region: int | None = None,
 # ----------------------------------------------------------------------------
 # Layout Tab Renderers
 # ----------------------------------------------------------------------------
+# Display names for home benchmarks (risk flags + board strip).
+BENCH_LABELS = {"SPY": "S&P 500", "^N225": "Nikkei 225", "^HSI": "Hang Seng",
+                "^FCHI": "CAC 40", "^GDAXI": "DAX", "000300.SS": "CSI 300",
+                "^STI": "STI", "^JKSE": "IDX", "^FTSE": "FTSE 100"}
+BENCH_SHORT = {"SPY": "US", "^N225": "JP", "^HSI": "HK", "^FCHI": "FR", "^GDAXI": "DE",
+               "000300.SS": "CN", "^STI": "SG", "^JKSE": "ID", "^FTSE": "UK"}
+_REGIME_GLYPH = {"risk_on": "▲", "risk_off": "▼", "neutral": "●", "unknown": "–"}
+
+EARNINGS_FLAG_DAYS = 14     # results inside this window get a flag on the card
+RSI_HOT = 72.0              # stretched-trend flag
+VOL_HOT = 50.0              # annualised realised vol (%) that earns a flag
+BUZZ_FLAG_RATIO = 2.5       # crowd attention well above the name's normal
+
+
+def _factor_scores(r: dict) -> dict:
+    return {f: safe_float(r.get("hype_score" if f == "hype" else f)) for f in FACTORS}
+
+
+def _why_line(r: dict, weights: dict) -> str:
+    """The factors that lifted this name ABOVE neutral the most. Contribution is
+    measured vs 50 (weight x (score - 50)), so a factor sitting at neutral never
+    'drives' a pick however large its weight."""
+    lifts = []
+    for f, s in _factor_scores(r).items():
+        if not math.isnan(s):
+            lifts.append((float(weights.get(f, 0.0)) * (s - 50.0), f))
+    lifts = [x for x in sorted(lifts, reverse=True) if x[0] >= 1.0]
+    if len(lifts) >= 2:
+        return tr("picks_why", a=tr(f"factor_{lifts[0][1]}"), b=tr(f"factor_{lifts[1][1]}"))
+    if lifts:
+        return tr("picks_why_one", a=tr(f"factor_{lifts[0][1]}"))
+    return tr("picks_why_none")
+
+
+def _risk_flags(r: dict) -> list[tuple[str, str]]:
+    """[(label, tooltip)] — things that should change HOW you act on a pick, not
+    whether it ranks. Deliberately short; an always-on wall of warnings is ignored."""
+    flags = []
+    ets = safe_float(r.get("earnings_ts"))
+    if not math.isnan(ets):
+        days = (ets - time.time()) / 86400.0
+        if -0.5 <= days <= EARNINGS_FLAG_DAYS:
+            flags.append((tr("flag_earnings", d=max(0, int(round(days)))), tr("flag_earnings_help")))
+    if r.get("recommendation") == "BUY" and r.get("regime") == "risk_off":
+        b = benchmark_for(r.get("ticker", ""))
+        flags.append((tr("flag_regime_off", m=BENCH_LABELS.get(b, b)), tr("board_regime_hint")))
+    rsi = safe_float(r.get("rsi"))
+    if not math.isnan(rsi) and rsi >= RSI_HOT:
+        flags.append((tr("flag_rsi_hot", v=f"{rsi:.0f}"), ""))
+    p = safe_float(r.get("payout"))
+    if not math.isnan(p) and p > 1.0:
+        flags.append((tr("flag_payout", v=f"{p * 100:.0f}%"), tr("payout_note")))
+    vol = safe_float(r.get("vol_63"))
+    if not math.isnan(vol) and vol >= VOL_HOT:
+        flags.append((tr("flag_vol", v=f"{vol:.0f}"), ""))
+    br = safe_float(r.get("buzz_ratio"))
+    if not math.isnan(br) and br >= BUZZ_FLAG_RATIO:
+        flags.append((tr("flag_buzz", v=f"{br:.1f}"), tr("hype_buzz_caption_v3")))
+    return flags
+
+
+def _fbars_html(r: dict) -> str:
+    """Six diverging bars around the neutral line at 50: the model's own zero point,
+    so a glance shows which factors pull for the pick and which pull against it."""
+    rows = []
+    for f, s in _factor_scores(r).items():
+        label = html.escape(tr(f"factor_{f}"))
+        if math.isnan(s):
+            rows.append(f'<div class="qc-fbar-l">{label}</div><div class="qc-fbar-track"></div>'
+                        f'<div class="qc-fbar-v">—</div>')
+            continue
+        d = s - 50.0
+        left, width = (50.0, d) if d >= 0 else (50.0 + d, -d)
+        cls = "pos" if d >= 10 else "neg" if d <= -10 else "mid"
+        rows.append(
+            f'<div class="qc-fbar-l">{label}</div>'
+            f'<div class="qc-fbar-track" role="img" aria-label="{label} {s:.0f}">'
+            f'<div class="qc-fbar-fill {cls}" style="left:{left:.1f}%;width:{width:.1f}%"></div></div>'
+            f'<div class="qc-fbar-v">{s:.0f}</div>')
+    return f'<div class="qc-fbars">{"".join(rows)}</div>'
+
+
+def _plan_html(r: dict) -> str:
+    lo, hi = safe_float(r.get("entry_lo")), safe_float(r.get("entry_hi"))
+    tgt, stp, px = safe_float(r.get("target_level")), safe_float(r.get("stop_level")), safe_float(r.get("price"))
+    if any(math.isnan(v) for v in (lo, hi, tgt, stp, px)) or px <= 0:
+        return f'<div class="qc-plan-empty">{html.escape(tr("picks_no_levels"))}</div>'
+    t, c = r.get("ticker"), r.get("currency")
+    rr = reward_risk(px, tgt, stp)
+    cells = [
+        (tr("picks_entry"), f'{fmt_money(lo, t, c)}–{fmt_money(hi, t, c)}', ""),
+        (tr("picks_target"), fmt_money(tgt, t, c), f"{(tgt / px - 1) * 100:+.1f}%"),
+        (tr("picks_stop"), fmt_money(stp, t, c), f"{(stp / px - 1) * 100:+.1f}%"),
+        (tr("picks_rr"), "—" if math.isnan(rr) else f"{rr:.1f} : 1", ""),
+    ]
+    out = []
+    for k, v, sub in cells:
+        sub_html = f'<div class="qc-plan-s">{sub}</div>' if sub else ""
+        out.append(f'<div><div class="qc-plan-k">{html.escape(k)}</div>'
+                   f'<div class="qc-plan-v">{v}</div>{sub_html}</div>')
+    return f'<div class="qc-plan">{"".join(out)}</div>'
+
+
+def pick_card_html(r: dict, rank: int, weights: dict, prev: tuple | None) -> str:
+    comp = safe_float(r.get("composite"))
+    name = html.escape(str(r.get("name") or r.get("ticker")))
+    theme = r.get("theme_match") or r.get("sector") or ""
+    sub = name + (f' <span class="qc-dim">· {html.escape(str(theme))}</span>' if theme else "")
+    if prev and not math.isnan(prev[0]) and not math.isnan(comp):
+        d = comp - prev[0]
+        delta = (f'<span class="{"qc-pos" if d >= 0 else "qc-neg"}">{"▲" if d >= 0 else "▼"} '
+                 f'{d:+.1f}</span> {html.escape(tr("delta_vs_last"))}')
+    else:
+        delta = html.escape(tr("price_label"))
+    ag = factor_agreement(_factor_scores(r))
+    flags = _risk_flags(r)
+    if flags:
+        flag_html = "".join(f'<span class="qc-flag" title="{html.escape(tip)}">{html.escape(lbl)}</span>'
+                            for lbl, tip in flags)
+    else:
+        flag_html = f'<span class="qc-flag ok">{html.escape(tr("flag_none"))}</span>'
+    return (
+        f'<div class="qc-card qc-pick">'
+        f'<div class="qc-pick-head"><div><span class="qc-rank">{rank}</span>'
+        f'<span class="qc-ticker">{html.escape(r["ticker"])}</span> {rec_pill(r.get("recommendation", "HOLD"))}</div>'
+        f'<div class="qc-sub">{html.escape(region_name(r.get("region", "")))}</div></div>'
+        f'<div class="qc-sub qc-pick-name">{sub}</div>'
+        f'<div class="qc-pick-row"><div class="qc-pick-score">{comp:.1f}<span>/100</span></div>'
+        f'<div class="qc-pick-px"><div class="qc-plan-v">{fmt_px(r)}</div>'
+        f'<div class="qc-plan-s">{delta}</div></div></div>'
+        f'<div class="qc-why">{html.escape(_why_line(r, weights))}</div>'
+        f'<div class="qc-agree">{html.escape(tr("picks_agree", s=ag["support"], n=ag["n"], x=ag["against"]))}</div>'
+        f'{_fbars_html(r)}'
+        f'{_plan_html(r)}'
+        f'<div class="qc-flags">{flag_html}</div>'
+        f'</div>')
+
+
 def render_daily_top_3(results: list[dict]) -> None:
     st.subheader(tr("top3_header"))
     if not results:
@@ -3439,30 +3905,76 @@ def render_daily_top_3(results: list[dict]) -> None:
     prev = previous_composites([r["ticker"] for r in results if r.get("ticker")],
                                asof={r["ticker"]: r.get("price_date")
                                      for r in results if r.get("ticker")})
-    top_3 = results[:3]
-    c1, c2, c3 = st.columns(3)
-    for i, col in enumerate([c1, c2, c3]):
-        if i < len(top_3):
-            r = top_3[i]
-            comp = safe_float(r.get("composite"))
-            p = prev.get(r["ticker"])
-            if p and not math.isnan(p[0]) and not math.isnan(comp):
-                delta = f"{comp - p[0]:+.1f} {tr('delta_vs_last')}"
-                positive = comp >= p[0]
-            else:
-                delta = f"{tr('price_label')}: {fmt_money(r['price'])}"
-                positive = comp >= BUY_THRESHOLD
-            col.markdown(metric_card(f"{r['ticker']} · {region_name(r['region'])}",
-                                     f"{comp:.1f}/100 {tr('score_suffix')}",
-                                     delta, positive=positive), unsafe_allow_html=True)
-            div_txt = f"{r['div_yield']:.2f}%" if not math.isnan(r['div_yield']) else "—"
-            col.markdown(
-                f"**{tr('company_profile')}:** {r['name']} <br>"
-                f"**{tr('price_label')}:** {fmt_money(r['price'])} <br>"
-                f"**{tr('trend_return_1m')}:** {fmt_pct(r['ret_1m'])} <br>"
-                f"**{tr('pe_ratio')}:** {fmt_num(r['pe'], 1)} &nbsp;·&nbsp; **{tr('dividend_yield')}:** {div_txt}",
-                unsafe_allow_html=True,
-            )
+    weights = get_latest_weights()
+    ranked = sorted(results, key=lambda r: safe_float(r.get("composite"), float("-inf")),
+                    reverse=True)
+    lc, rc = st.columns([4, 1.4])
+    lc.caption(tr("picks_lede"))
+    diversify = rc.toggle(tr("picks_diversify"), value=True, key="picks_diversify",
+                          help=tr("picks_diversify_help"))
+    top_3 = diversified_top(ranked, 3) if diversify else ranked[:3]
+    cols = st.columns(3)
+    for i, col in enumerate(cols):
+        if i >= len(top_3):
+            continue
+        r = top_3[i]
+        col.markdown(pick_card_html(r, i + 1, weights, prev.get(r["ticker"])),
+                     unsafe_allow_html=True)
+        if col.button(tr("open_deep_dive_btn", ticker=r["ticker"]), key=f"podium_dd_{r['ticker']}",
+                      width="stretch"):
+            st.session_state["deep_dive_pick"] = r["ticker"]
+            page = _PAGES.get("deep_dive")
+            if page is not None:
+                st.switch_page(page)
+
+    # --- Next in line: the bench behind the podium ---------------------------
+    podium = {id(r) for r in top_3}
+    runners = [r for r in ranked if id(r) not in podium][:9]
+    if runners:
+        st.markdown(f"#### {tr('picks_runners')}")
+        def _agree_txt(r):
+            a = factor_agreement(_factor_scores(r))
+            return f"{a['support']}↑ {a['against']}↓"
+        rdf = pd.DataFrame([{
+            "ticker": r["ticker"], "name": str(r.get("name") or r["ticker"]),
+            "region": region_name(r.get("region", "")),
+            "call": tr(f"rec_{r['recommendation']}") if r.get("recommendation") in ("BUY", "HOLD", "SELL") else "—",
+            "composite": safe_float(r.get("composite")),
+            "agree": _agree_txt(r),
+            "rel3m": safe_float(r.get("rel_ret_3m")),
+            "rr": reward_risk(safe_float(r.get("price")), safe_float(r.get("target_level")),
+                              safe_float(r.get("stop_level"))),
+            "flags": len(_risk_flags(r)),
+        } for r in runners])
+        ev = st.dataframe(
+            rdf, hide_index=True, width="stretch", on_select="rerun",
+            selection_mode="single-row",
+            # Fresh key after each jump: a selection that survived the trip would
+            # bounce the user straight back to Deep Dive on their return.
+            key=f"runners_table_{st.session_state.get('_runners_nonce', 0)}",
+            column_config={
+                "ticker": st.column_config.TextColumn(tr("col_ticker"), width="small"),
+                "name": st.column_config.TextColumn(tr("col_company")),
+                "region": st.column_config.TextColumn(tr("col_region"), width="small"),
+                "call": st.column_config.TextColumn(tr("why_call"), width="small"),
+                "composite": st.column_config.ProgressColumn(
+                    tr("col_overall_score"), min_value=0, max_value=100, format="%.1f"),
+                "agree": st.column_config.TextColumn("↑ / ↓", width="small"),
+                "rel3m": st.column_config.NumberColumn(tr("col_rel_3m"), format="%+.1f%%"),
+                "rr": st.column_config.NumberColumn(tr("picks_rr"), format="%.1f"),
+                "flags": st.column_config.NumberColumn("⚑", width="small"),
+            })
+        st.caption(tr("picks_runners_cap"))
+        try:
+            sel = list(ev.selection.rows)
+        except Exception:
+            sel = []
+        if sel:
+            st.session_state["deep_dive_pick"] = runners[sel[0]]["ticker"]
+            st.session_state["_runners_nonce"] = st.session_state.get("_runners_nonce", 0) + 1
+            page = _PAGES.get("deep_dive")
+            if page is not None:
+                st.switch_page(page)
 
     # --- What changed since the last scan ----------------------------------
     moves = []
@@ -3627,9 +4139,17 @@ def render_category_views(results: list[dict]) -> None:
 
     with v1:
         st.markdown(f"### {tr('growth_header_text')}")
-        growth_df = df.sort_values(by="ret_1m", ascending=False).head(5).copy()
+        # Ranked by the production momentum factor (trend + MACD + 3-month return
+        # vs the home market), NOT raw 1-month return: the app's own research notes
+        # that 1-month winners tend to reverse, so sorting on it put the names most
+        # likely to give back gains at the top of the "growth" list.
+        if "rel_ret_3m" not in df.columns:
+            df["rel_ret_3m"] = float("nan")
+        growth_df = df.sort_values(by=["momentum", "rel_ret_3m"], ascending=False,
+                                   na_position="last").head(5).copy()
         growth_df["region"] = growth_df["region"].map(region_name)
-        st.dataframe(growth_df[["ticker", "name", "region", "price", "ret_1m", "composite"]].rename(columns={"ticker": tr("col_ticker"), "name": tr("col_company"), "region": tr("col_region"), "price": tr("col_price"), "ret_1m": tr("col_momentum_1m"), "composite": tr("col_overall_score")}), width="stretch", hide_index=True)
+        st.dataframe(growth_df[["ticker", "name", "region", "price", "momentum", "rel_ret_3m", "ret_1m", "composite"]].rename(columns={"ticker": tr("col_ticker"), "name": tr("col_company"), "region": tr("col_region"), "price": tr("col_price"), "momentum": tr("col_momentum_score"), "rel_ret_3m": tr("col_rel_3m"), "ret_1m": tr("col_momentum_1m"), "composite": tr("col_overall_score")}).style.format({tr("col_price"): "{:,.2f}", tr("col_momentum_score"): "{:.0f}", tr("col_rel_3m"): "{:+.1f}%", tr("col_momentum_1m"): "{:+.1f}%", tr("col_overall_score"): "{:.1f}"}, na_rep="—"), width="stretch", hide_index=True)
+        st.caption(tr("growth_sort_note"))
 
     with v2:
         st.markdown(f"### {tr('dividend_header_text')}")
@@ -3706,7 +4226,7 @@ def render_global_sectors(results: list[dict]) -> None:
         f'{rec_pill(r["recommendation"])}<br><span class="qc-sub">{r["name"]}</span></div>',
         unsafe_allow_html=True)
     cols[1].markdown(metric_card(tr("card_system_rating"), f"{r['composite']:.1f}"), unsafe_allow_html=True)
-    cols[2].markdown(metric_card(tr("card_trading_close"), fmt_money(r["price"])), unsafe_allow_html=True)
+    cols[2].markdown(metric_card(tr("card_trading_close"), fmt_px(r)), unsafe_allow_html=True)
     cols[3].markdown(metric_card(tr("card_sustained_hype"), f"{r['hype_score']:.0f}",
                      tr("breakout") if r["hype"]["sustained"] else tr("flat"),
                      positive=r["hype"]["sustained"]), unsafe_allow_html=True)
@@ -3755,6 +4275,17 @@ def _rel3m_disp(r: dict) -> str:
     return f"{v:+.1f}%"
 
 
+def _buzz_disp(r: dict) -> str:
+    """'12 today · normal 4.0 · 2.6× (own history)', or '—' before the v3 pass ran."""
+    base, ratio = safe_float(r.get("buzz_baseline")), safe_float(r.get("buzz_ratio"))
+    if math.isnan(base) or math.isnan(ratio):
+        return "—"
+    basis = {"own": tr("evi_buzz_basis_own"), "size": tr("evi_buzz_basis_peers")}.get(
+        r.get("buzz_basis"), "")
+    txt = tr("evi_buzz_val", m=safe_float(r.get("hype_mentions"), 0.0), b=base, r=ratio)
+    return f"{txt} ({basis})" if basis else txt
+
+
 def _payout_disp(p: float) -> str:
     """Payout ratio display: '65%', '112% ⚠' above 100%, '—' when unknown."""
     if math.isnan(p) or p <= 0:
@@ -3790,6 +4321,7 @@ def _evidence_rows(r: dict) -> list:
         (ft, tr("evi_bbpct"),    "—" if math.isnan(bbp) else f"{bbp:.2f}"),
         (fq, tr("evi_roe"),      "—" if math.isnan(roe) else f"{roe * 100:.1f}%"),  # roe is a fraction
         (fh, tr("evi_mentions"), f"{safe_float(r.get('hype_mentions'), 0):g}"),
+        (fh, tr("evi_buzz_ratio"), _buzz_disp(r)),
         (fh, tr("evi_short"),    "—" if math.isnan(shortp) else f"{shortp * 100:.1f}%"),  # fraction of float
         (fth, tr("evi_theme_basket"), str(r.get("theme_match") or "—")),
         (fth, tr("evi_theme_peers"),  fmt_num(safe_float(r.get("theme"), float("nan")), 0)),
@@ -4469,7 +5001,8 @@ def render_deep_dive(results: list[dict]) -> None:
     mentions = safe_float(r.get("hype_mentions", 0), 0.0)
     st.markdown(metric_card(tr("hype_buzz_label"), f"{mentions:g}", positive=mentions > 0),
                 unsafe_allow_html=True)
-    st.caption(tr("hype_buzz_caption"))
+    st.caption(tr("hype_buzz_caption_v3") if HYPE_BUZZ_MODE == "abnormal"
+               else tr("hype_buzz_caption"))
     if _LAST_HYPE_STATUS:
         st.caption(_LAST_HYPE_STATUS)
     if _LAST_HYPE_FETCHED_AT:
@@ -4914,7 +5447,7 @@ def _render_sell_detail(data: dict) -> None:
     if ins["available"] and ins["rows"]:
         idf = pd.DataFrame(ins["rows"]).rename(columns={
             "date": tr("col_date"), "insider": tr("col_insider"),
-            "transaction": tr("col_transaction"), "shares": tr("col_shares"), "value": tr("col_value"),
+            "transaction": tr("col_transaction"), "shares": tr("col_shares"), "value": tr("col_txn_value"),
         })
         st.dataframe(idf, width="stretch", hide_index=True)
     else:
@@ -5080,6 +5613,9 @@ weights** (see "How the engine learns" below)."""),
 overbought/oversold extremes.
 - **Hype** — volume-breakout detection vs. a 30-day baseline, boosted by live retail/news buzz
 (Reddit, GDELT), the Yahoo! Japan forum poll for Japanese names, and a short-squeeze modifier.
+Buzz counts only when it is *unusual for that company*: today's mentions are compared with the
+name's own 30-day normal (or, while that history builds, with what a company of its size usually
+gets), so a megacap that is always discussed earns nothing on an ordinary day.
 - **Quality** — return on equity (profitability). Missing data scores neutral, never penalised.
 - **Theme** *(new)* — industry-rotation strength: the average momentum of the *other* scanned members
 of the stock's theme basket (AI, Semis, Defense, Clean Energy…), damped so a hot industry helps a
@@ -5139,6 +5675,8 @@ licensed financial advisor before trading."""),
 - **テクニカル** — RSIの位置とボリンジャー%B。過熱・売られすぎより健全な中間帯を評価。
 - **ハイプ** — 30日ベースライン比の出来高ブレイクアウトに、Reddit・GDELTニュース・
 Yahoo!掲示板「みんなの評価」（日本株）・踏み上げ（ショートスクイーズ）補正を加味。
+話題度は「その企業にとって普段より多いか」で評価します。本日の言及数をその銘柄の過去30日の
+平常値（履歴が少ない間は同規模企業の水準）と比べるため、常に話題の大型株は平常日には加点されません。
 - **クオリティ** — ROE（収益性）。データ欠損は中立扱いで減点しません。
 - **テーマ**（新設）— 業種ローテーションの強さ。同じテーマバスケット（AI・半導体・防衛・
 クリーンエネルギー等）の*他の*スキャン銘柄の平均モメンタムを減衰付きで反映します。
@@ -5585,6 +6123,22 @@ def render_portfolio() -> None:
         st.caption(tr("pf_estimated_note"))
 
 
+def _regime_board_value(results: list[dict]) -> str:
+    """'US ▲  JP ▼  FR ●' from the regimes stamped on the scan results (so a
+    restored snapshot shows them too). HTML; values are fixed glyphs/codes."""
+    seen = {}
+    for r in results or []:
+        b = benchmark_for(r.get("ticker", ""))
+        if b not in seen and r.get("regime"):
+            seen[b] = r["regime"]
+    parts = []
+    for b, state in seen.items():
+        cls = "up" if state == "risk_on" else "down" if state == "risk_off" else ""
+        parts.append(f'{BENCH_SHORT.get(b, b)} <span class="{cls}" title="{html.escape(tr("regime_" + state))}">'
+                     f'{_REGIME_GLYPH.get(state, "–")}</span>')
+    return "&nbsp;&nbsp;".join(parts)
+
+
 def _build_navigation() -> "st.navigation":
     """Grouped page tree. Titles are translated per rerun (tr follows the language
     menu, which is read before this runs); url_paths stay fixed so bookmarks and
@@ -5798,6 +6352,8 @@ def main() -> None:
         (tr("board_feed"),
          (_ago(_LAST_HYPE_FETCHED_AT) if _LAST_HYPE_FETCHED_AT else tr("board_not_run")),
          bool(_LAST_HYPE_FETCHED_AT), tr("board_feed_hint")),
+        (tr("board_regime"), _regime_board_value(_res) or tr("board_no_scan"),
+         bool(_res), tr("board_regime_hint")),
     ]
     st.markdown(board_strip(_cells), unsafe_allow_html=True)
 
