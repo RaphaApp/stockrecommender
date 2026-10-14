@@ -1,13 +1,18 @@
-streamlit>=1.40
+# Alpha Quant Engine — runtime dependencies.
+# Versions this release was tested with (Python 3.12.3): streamlit 1.65.0, pandas 3.0.2,
+# numpy 2.4.4, yfinance 1.7.0, altair 6.3.0, plotly 7.1.0. Streamlit is given a lower
+# bound because the app uses newer APIs (st.navigation, width="stretch"); the others are
+# left open as before. Pin exact versions in your own environment if you need
+# reproducible installs.
+streamlit>=1.65.0
+yfinance
 pandas
 numpy
 altair
-yfinance
-curl_cffi
-
-# Optional: six-factor radar in Chart Deep Dive (skipped cleanly if absent).
+# Radar chart on the Deep-Dive page. Optional (guarded import) but install it
+# so the chart renders on Streamlit Cloud.
 plotly
-
-# Optional: Postgres/Supabase backend (set DATABASE_URL). The app imports psycopg2,
-# so this is the driver it needs; without it the app uses local SQLite.
+# Optional: enables persistent Postgres storage (e.g. Supabase) when a
+# DATABASE_URL secret is set. Without it the app runs on local SQLite.
+# NOTE: the Postgres path was NOT exercised in this release's testing.
 psycopg2-binary
