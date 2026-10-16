@@ -484,13 +484,7 @@ OUTCOME_LOSS, OUTCOME_WIN, OUTCOME_NEUTRAL = 0, 1, 2
 #   v5 — one validity rule shared by parser and scorers (an all-様子見 poll scores
 #        neutral 50; impossible displays such as 100%+2% are rejected); scopes cut at
 #        HTML structure; the Japan poll is now OFF by default (opt-in, experimental).
-#   v6 — the opt-in is actually ENFORCED on every path. v5 only changed the toggle's
-#        default: the first-run quick-scan button and run_engine's own default still
-#        fetched the board and blended it into hype, and the Sell Scanner fetched and
-#        scored it unconditionally. v5 observations from those paths can carry a poll
-#        (their retail_sentiment.jp_board has status "ok") although v5 says opt-in, so
-#        they are kept apart from v6, where a poll is present only if it was requested.
-PRODUCTION_MODEL_VERSION = "composite-v6-jp-opt-in-enforced-everywhere"
+PRODUCTION_MODEL_VERSION = "composite-v5-jp-poll-shared-validity-optin"
 DIRECTIONAL_CALLS = ("BUY", "SELL")
 
 BUY_THRESHOLD = 65.0
@@ -2017,7 +2011,7 @@ SELL_KPI_WEIGHTS = {
     "technical": 0.15,    # trend breakdown (moving averages, MACD)
     "momentum": 0.10,     # recent price momentum
     "short": 0.05,        # short interest as bearish positioning
-    "forum": 0.05,        # Yahoo!掲示板 euphoria (JP only; asymmetric, skipped elsewhere)
+    "forum": 0.05,        # Yahoo!掛示板 euphoria (JP only; asymmetric, skipped elsewhere)
 }
 _SELL_GRADES = ("sell", "underperform", "reduce", "underweight", "negative", "strong sell")
 
@@ -2231,7 +2225,7 @@ def analyze_sell_signals(ticker: str, hist: pd.DataFrame | None = None) -> dict 
         signals.append(("short", None,
                         f"{sp * 100:.1f}% short ignored — 1M momentum not negative (possible squeeze)"))
 
-    # 8) Yahoo!掲示板 euphoria (Japan only). ASYMMETRIC and contrarian-aware:
+    # 8) Yahoo!掛示板 euphoria (Japan only). ASYMMETRIC and contrarian-aware:
     # only lopsided retail *bullishness* on a .T name adds sell pressure (the retail-top
     # pattern); a bearish or balanced board is neutral, never a sell push. Skipped
     # (None) for non-Japanese names and whenever no usable poll is available, so it
@@ -2241,10 +2235,10 @@ def analyze_sell_signals(ticker: str, hist: pd.DataFrame | None = None) -> dict 
         es = (forum_euphoria_sell_score(poll[0], poll[1], poll[2] if len(poll) > 2 else None)
               if poll else None)
         if es is None:
-            signals.append(("forum", None, "No Yahoo!掲示板 poll available"))
+            signals.append(("forum", None, "No Yahoo!掛示板 poll available"))
         else:
             signals.append(("forum", es,
-                f"Yahoo!掲示板 買いたい {poll[0]:.0f}% / 売りたい {poll[1]:.0f}% "
+                f"Yahoo!掛示板 買いたい {poll[0]:.0f}% / 売りたい {poll[1]:.0f}% "
                 + ("(euphoric — possible retail top)" if es > 50 else "(not euphoric — neutral)")))
     else:
         signals.append(("forum", None, "Japan board poll disabled or not applicable"))
@@ -4763,13 +4757,6 @@ def render_hype_sentiment(r: dict) -> None:
     summary[2].metric(tr("hype_panel_breakouts"),
                       str(hype.get("breakout_days")) if hype.get("breakout_days") is not None else "\u2014")
     st.caption(tr("hype_panel_snapshot", asof=str(r.get("price_date") or "\u2014")))
-    # What the mention count is and which feeds produced it. These were on the Deep Dive
-    # before the panel replaced that block; they are last-scan values, so nothing is fetched.
-    st.caption(tr("hype_buzz_caption"))
-    if _LAST_HYPE_STATUS:
-        st.caption(_LAST_HYPE_STATUS)
-    if _LAST_HYPE_FETCHED_AT:
-        st.caption(tr("hype_updated", ago=_ago(_LAST_HYPE_FETCHED_AT)))
     left, right = st.columns(2)
     for col, source, title in ((left, "jp_board", "Yahoo!\u63b2\u793a\u677f \u300c\u307f\u3093\u306a\u306e\u8a55\u4fa1\u300d"),
                                (right, "stocktwits", "Stocktwits")):
