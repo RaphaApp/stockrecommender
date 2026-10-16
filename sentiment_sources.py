@@ -37,7 +37,7 @@ from indicators import jp_poll_problem
 # --------------------------------------------------------------------------
 # Yahoo! Japan board poll
 # --------------------------------------------------------------------------
-JP_PARSER_VERSION = "jp-board-v3-dom-scoped-shared-validity"
+JP_PARSER_VERSION = "jp-board-v5-visible-detail-safe-summary"
 JP_LABELS = (
     "\u5f37\u304f\u8cb7\u3044\u305f\u3044",   # 強く買いたい  strong buy
     "\u8cb7\u3044\u305f\u3044",               # 買いたい      buy
@@ -71,23 +71,94 @@ def _half_unit(raw: str) -> float:
     return 0.5 * 10 ** (-len(raw.split(".", 1)[1]) if "." in raw else 0)
 
 
-def _five_category_detail(scoped_text: str) -> tuple[dict | None, str]:
-    """(result, reason) for LABEL-THEN-PERCENT text from ONE isolated component."""
+# A headline summary ("買いたい 72% / 売りたい 20%") may be shown beside the five-category
+# breakdown. It is the rounded sum of strong + plain on each side, so it reuses the plain
+# labels. This slack is added on top of the displayed rounding half-units when checking it
+# against the categories; it covers a summary built from separately-rounded parts.
+_SUMMARY_SLACK = 0.5
+
+
+class _Hit:
+    """One 'LABEL value%' occurrence: the number, its text as displayed, and where."""
+    __slots__ = ("value", "raw", "pos")
+
+    def __init__(self, value: float, raw: str, pos: int):
+        self.value, self.raw, self.pos = value, raw, pos
+
+    @property
+    def decimals(self) -> int:
+        return len(self.raw.split(".", 1)[1]) if "." in self.raw else 0
+
+
+def _resolve_side(strong: "_Hit", hits: list) -> tuple[Any, Any, str]:
+    """Split one side's plain-label occurrences into (category, summary, reason).
+
+    One occurrence: it is the category and no summary is shown. Two: one is the category
+    and the other the rounded headline summary. Which is which is decided by arithmetic,
+    not by position (the summary may come before or after the breakdown): the summary
+    must equal strong + category within display rounding. Exactly one reading fitting ->
+    use it. Both fitting is possible only when the strong share is ~0 and the two numbers
+    nearly coincide; the aggregate is then the same within rounding, and the more
+    precisely displayed number is taken as the category. Neither fitting -> the numbers
+    contradict each other, which is reported, never averaged away. Three or more -> the
+    component is duplicated or malformed.
+    """
+    if len(hits) == 1:
+        return hits[0], None, ""
+    if len(hits) != 2:
+        return None, None, "duplicate_label"
+    fits = []
+    for cat, summ in ((hits[0], hits[1]), (hits[1], hits[0])):
+        bound = (0.5 * 10 ** -summ.decimals + 0.5 * 10 ** -strong.decimals
+                 + 0.5 * 10 ** -cat.decimals + _SUMMARY_SLACK + 1e-9)
+        if abs(summ.value - (strong.value + cat.value)) <= bound:
+            fits.append((cat, summ))
+    if not fits:
+        return None, None, "summary_conflicts_with_categories"
+    if len(fits) == 1:
+        return fits[0][0], fits[0][1], ""
+    # Arithmetic cannot identify different readings just because one occurs first.
+    if abs(fits[0][0].value - fits[1][0].value) > 1e-9:
+        return None, None, "ambiguous_category_summary"
+    return fits[0][0], fits[0][1], ""
+
+
+def _five_category_detail_legacy(scoped_text: str) -> tuple[dict | None, str]:
+    """(result, reason) for LABEL-THEN-PERCENT text from ONE isolated component.
+
+    Strong-buy, watch and strong-sell must each appear exactly once. Buy and sell may
+    appear once (breakdown only) or twice (breakdown plus a rounded headline summary);
+    the summary is cross-checked against the categories and kept as provenance, but the
+    SCORE uses the precise category sums, never the rounded summary, and nothing is
+    counted twice. Any other repetition means two components or a malformed one, and is
+    rejected rather than ignored.
+    """
     alternatives = "|".join(re.escape(x) for x in sorted(JP_LABELS, key=len, reverse=True))
     pattern = (rf"(?P<label>{alternatives})\s*[:\uff1a]?\s*"
                rf"(?P<value>\d+(?:\.\d+)?)\s*[%\uff05]")
-    values: dict[str, float] = {}
-    half: dict[str, float] = {}
+    hits: dict[str, list] = {lab: [] for lab in JP_LABELS}
     for match in re.finditer(pattern, scoped_text):
-        label, raw = match["label"], match["value"]
-        value = float(raw)
-        if label in values:
-            return None, "duplicate_label"
+        value = float(match["value"])
         if not 0 <= value <= 100:
             return None, "value_out_of_range"
-        values[label], half[label] = value, _half_unit(raw)
-    if set(values) != set(JP_LABELS):
+        hits[match["label"]].append(_Hit(value, match["value"], match.start()))
+    if any(not h for h in hits.values()):
         return None, "missing_category"
+    if any(len(hits[lab]) > 1 for lab in (JP_LABELS[0], JP_LABELS[2], JP_LABELS[4])):
+        return None, "duplicate_label"
+
+    buy_cat, buy_sum, why = _resolve_side(hits[JP_LABELS[0]][0], hits[JP_LABELS[1]])
+    if why:
+        return None, why
+    sell_cat, sell_sum, why = _resolve_side(hits[JP_LABELS[4]][0], hits[JP_LABELS[3]])
+    if why:
+        return None, why
+
+    chosen = {JP_LABELS[0]: hits[JP_LABELS[0]][0], JP_LABELS[1]: buy_cat,
+              JP_LABELS[2]: hits[JP_LABELS[2]][0], JP_LABELS[3]: sell_cat,
+              JP_LABELS[4]: hits[JP_LABELS[4]][0]}
+    values = {k: h.value for k, h in chosen.items()}
+    half = {k: 0.5 * 10 ** -h.decimals for k, h in chosen.items()}
     if abs(sum(values.values()) - 100.0) > _TOTAL_TOLERANCE:
         return None, "total_not_100"
     # Could these displayed numbers come from real shares that sum to 100? Even at the
@@ -100,9 +171,113 @@ def _five_category_detail(scoped_text: str) -> tuple[dict | None, str]:
     why = jp_poll_problem(buy, sell, neutral)        # the scorers' own rule
     if why is not None:
         return None, why
-    return {"buy_pct": buy, "neutral_pct": neutral, "sell_pct": sell,
-            "categories": values}, ""
+    return {"buy_pct": buy, "neutral_pct": neutral, "sell_pct": sell, "categories": values,
+            "summary_buy_pct": None if buy_sum is None else buy_sum.value,
+            "summary_sell_pct": None if sell_sum is None else sell_sum.value}, ""
 
+
+
+def _five_category_detail(scoped_text: str) -> tuple[dict | None, str]:
+    """Prefer an explicitly ordered five-category run, never infer it by position
+    among unrelated duplicate labels. This supports the public page's mixed-order
+    headline (75% buy / sell 19%) independently of the precise breakdown.
+    No embedded script data is used for scoring.
+    """
+    num = r"(\d+(?:\.\d+)?)\s*[%\uff05]"
+    sep = r"[\s,\u3001;/|\uff0f]*"
+    pieces = [re.escape(lab) + r"\s*[:\uff1a]?\s*" + num for lab in JP_LABELS]
+    matches = list(re.finditer(sep.join(pieces), scoped_text))
+    if not matches:
+        return _five_category_detail_legacy(scoped_text)
+    if len(matches) != 1:
+        return None, "duplicate_label"
+    m = matches[0]
+    result, why = _five_category_detail_legacy(m.group(0))
+    if result is None:
+        return None, why
+    remaining = scoped_text[:m.start()] + " " + scoped_text[m.end():]
+    # Repeated strong/watch labels WITH values indicate another partial component.
+    for lab in (JP_LABELS[0], JP_LABELS[2], JP_LABELS[4]):
+        if re.search(re.escape(lab) + r"\s*[:\uff1a]?\s*" + num, remaining):
+            return None, "duplicate_label"
+    # Recognise each summary as one complete pair, not independent overlapping
+    # label/value searches (which can bind the same percentage twice).
+    b, se = re.escape(_BUY), re.escape(_SELL)
+    pair_patterns = [
+        b + r"\s*[:\uff1a]?\s*" + num + sep + se + r"\s*[:\uff1a]?\s*" + num,
+        num + r"\s*" + b + sep + se + r"\s*[:\uff1a]?\s*" + num,
+        num + r"\s*" + b + sep + num + r"\s*" + se,
+    ]
+    pairs = []
+    for pattern in pair_patterns:
+        for hit in re.finditer(pattern, remaining):
+            item = (hit.start(), hit.end(), hit.group(1), hit.group(2))
+            if item not in pairs:
+                pairs.append(item)
+    if len(pairs) > 1:
+        return None, "duplicate_or_ambiguous_summary"
+    if pairs:
+        start, end, buy_raw, sell_raw = pairs[0]
+        for key, raw, labels in (("buy_pct", buy_raw, JP_LABELS[:2]),
+                                 ("sell_pct", sell_raw, (JP_LABELS[3], JP_LABELS[4]))):
+            val = float(raw)
+            if not 0 <= val <= 100:
+                return None, "value_out_of_range"
+            # Display precision bound plus the existing explicitly disclosed slack.
+            bound = _half_unit(raw) + sum(_half_unit(m.group(JP_LABELS.index(l)+1))
+                                         for l in labels) + _SUMMARY_SLACK + 1e-9
+            if abs(val - result[key]) > bound:
+                return None, "summary_conflicts_with_categories"
+            result["summary_" + key] = val
+        remaining = remaining[:start] + " " + remaining[end:]
+    # Do not silently ignore any extra numeric poll label we did not recognise.
+    labels = "|".join(re.escape(x) for x in sorted(JP_LABELS, key=len, reverse=True))
+    if re.search(r"(?:" + labels + r")\s*[:\uff1a]?\s*" + num, remaining) or re.search(
+            num + r"\s*(?:" + labels + r")", remaining):
+        return None, "unresolved_numeric_poll_labels"
+    return result, ""
+
+
+def _accessible_poll_text(raw: str) -> str:
+    """Expose a complete five-category aria-label to the scoped parser.
+    Accessible labels are page markup, not scripts. Only full ordered category
+    descriptions qualify. They are inserted in-place, never collected page-wide.
+    If visible and accessible copies both exist, agreement is checked separately.
+    """
+    def replace(match):
+        tag = match.group(0)
+        prefix = raw[:match.start()]
+        heading = max((prefix.rfind(h) for h in JP_POLL_HEADINGS), default=-1)
+        if heading < 0 or _BOUNDARY.search(prefix, heading):
+            return tag
+        attr = re.search(r'\baria-label\s*=\s*([\x22\x27])(.*?)\1', tag, re.I | re.S)
+        if not attr:
+            return tag
+        text = _html.unescape(attr.group(2))
+        if all(lab in text for lab in JP_LABELS) and len(re.findall(r'\d+(?:\.\d+)?\s*[%\uff05]', text)) == 5:
+            # Put it in its own heading-delimited scope at the original position.
+            return tag + '<h6>みんなの評価</h6>' + _html.escape(text) + '<h6>poll detail end</h6>'
+        return tag
+    return re.sub(r'<[^>]+>', replace, raw)
+
+
+def _decoded_script_strings(raw: str) -> str:
+    """Diagnostic only: decode JSON string literals, never execute JavaScript.
+    Bounded input/output; decoded values are never passed into the scoring parser.
+    """
+    chunks = []
+    for block in re.finditer(r'(?is)<script\b[^>]*>(.*?)</script\s*>', (raw or '')[:5_000_000]):
+        body = block.group(1)
+        for token in re.finditer(r'"(?:[^"\\]|\\.)*"', body):
+            try:
+                value = json.loads(token.group(0))
+            except (ValueError, TypeError):
+                continue
+            if isinstance(value, str):
+                chunks.append(value[:20000])
+            if len(chunks) >= 20000:
+                return ' '.join(chunks)
+    return ' '.join(chunks)
 
 def parse_jp_five_categories(scoped_text: str) -> dict[str, Any] | None:
     """Parse ONE isolated poll component into aggregates, or None. Never pass a whole
@@ -171,6 +346,7 @@ def _poll_scopes(raw_html: str) -> list[str]:
     built from plain <div>s without headings or sections could let a scope run on.
     """
     raw = re.sub(r"(?is)<(head|script|style)\b.*?</\1\s*>", " ", raw_html or "")
+    raw = _accessible_poll_text(raw)
     starts = sorted(m.start() for h in JP_POLL_HEADINGS for m in re.finditer(re.escape(h), raw))
     out = []
     for i, st in enumerate(starts):
@@ -224,6 +400,8 @@ def parse_jp_board(raw_html: str) -> dict[str, Any]:
         "categories": {}, "layout": None, "parser_version": JP_PARSER_VERSION,
         "metric_type": "posting_sentiment_distribution", "source": "yahoo_jp_board",
         "vote_count": None, "window": None, "reason": "",
+        # the rounded headline summary, when the page shows one next to the breakdown
+        "summary_buy_pct": None, "summary_sell_pct": None,
     }
     if not html_to_text(raw_html or ""):
         out["reason"] = "empty_page"
@@ -257,8 +435,51 @@ def parse_jp_board(raw_html: str) -> dict[str, Any]:
     out.update(status="ok", layout=layout, buy_pct=first["buy_pct"],
                neutral_pct=first["neutral_pct"], sell_pct=first["sell_pct"],
                categories=first["categories"],
+               summary_buy_pct=first.get("summary_buy_pct"),
+               summary_sell_pct=first.get("summary_sell_pct"),
                reason=f"{len(oks)} agreeing component(s)")
     return out
+
+
+def describe_poll_page(raw_html: str, context: int = 60, max_snippets: int = 24) -> dict[str, Any]:
+    """Diagnostic view of what the Japan-board parser sees on a page. Pure: no network.
+
+    Built to answer "why is there no poll?" on a REAL page, which cannot be verified from
+    a test environment. It reports the parse outcome and, separately:
+      * how often the 「みんなの評価」 heading appears in VISIBLE text;
+      * how often the poll labels appear in visible text versus only inside <script>/<style>
+        blocks. Labels present only in script data mean the numbers are embedded JSON that
+        this parser deliberately does not read (the page would need a different, verified
+        adapter) — the main thing to rule in or out;
+      * the text of each scope the parser would read, and short snippets around each label.
+    """
+    raw = raw_html or ""
+    res = parse_jp_board(raw)
+    visible = html_to_text(raw)
+    scripts = " ".join(m.group(0) for m in re.finditer(r"(?is)<(script|style)\b.*?</\1\s*>", raw))
+    scripts += " " + _decoded_script_strings(raw)
+    labels = list(JP_LABELS) + list(JP_POLL_HEADINGS)
+
+    def count(text: str, needle: str) -> int:
+        return len(re.findall(re.escape(needle), text))
+    snippets = []
+    for lab in labels:
+        for m in re.finditer(re.escape(lab), visible):
+            snippets.append({"label": lab, "where": "visible",
+                             "text": visible[max(0, m.start() - context): m.end() + context]})
+    return {
+        "result": {k: res.get(k) for k in ("status", "reason", "layout", "buy_pct", "neutral_pct",
+                                           "sell_pct", "summary_buy_pct", "summary_sell_pct",
+                                           "parser_version")},
+        "page_chars": len(raw), "visible_text_chars": len(visible),
+        "heading_in_visible_text": sum(count(visible, h) for h in JP_POLL_HEADINGS),
+        "heading_in_script_data": sum(count(scripts, h) for h in JP_POLL_HEADINGS),
+        "label_counts_visible": {lab: count(visible, lab) for lab in JP_LABELS},
+        "label_counts_script_data": {lab: count(scripts, lab) for lab in JP_LABELS},
+        "scope_count": len(_poll_scopes(raw)),
+        "scopes": [sc[:500] for sc in _poll_scopes(raw)],
+        "snippets": snippets[:max_snippets],
+    }
 
 
 # --------------------------------------------------------------------------

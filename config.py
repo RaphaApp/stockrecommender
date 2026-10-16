@@ -8,7 +8,7 @@ focused on logic. No app dependencies; safe to import anywhere.
 # Bumped whenever app.py starts depending on new keys in this file. app.py compares
 # against its own expected value and warns if the two files were deployed out of
 # step — which otherwise shows up as raw keys like "board_no_csv" on screen.
-CONFIG_SCHEMA_VERSION = 24
+CONFIG_SCHEMA_VERSION = 26
 
 
 
@@ -584,7 +584,7 @@ TRANSLATIONS = {
         "col_theme_buys": "BUYs",
         "col_theme_coverage": "Coverage",
         "jp_forum_toggle": "🇯🇵 Yahoo!掲示板 sentiment (Japan, experimental)",
-        "jp_forum_help": "OFF by default. When on, blends the Yahoo! Japan Finance board poll (みんなの評価) into the hype score for Japanese stocks, 50/50 with the volume signal. EXPERIMENTAL: the page parser is structural and has not been verified against Yahoo's live page. When the poll cannot be identified with confidence, no number is used and hype falls back to volume only (the Deep Dive shows why). Adds ~0.3s per Japanese name on a fresh scan (cached 30 min).",
+        "jp_forum_help": "OFF by default. When on, blends the Yahoo! Japan Finance board poll (みんなの評価) into the hype score for Japanese stocks, 50/50 with the volume signal. It applies to main scans and the Sell Scanner, NOT to Deep Scan, and takes effect on the next main scan after you switch it on. EXPERIMENTAL: the page parser is structural and has not been verified against Yahoo's live page. When the poll cannot be identified with confidence, no number is used and hype falls back to volume only (the Deep Dive shows why). Adds ~0.3s per Japanese name on a fresh scan (cached 30 min).",
         "col_theme_breadth": ">SMA50 %",
         "col_theme_buyspct": "BUY %",
         "col_theme_delta": "Δ Mom",
@@ -1111,7 +1111,7 @@ TRANSLATIONS = {
         "col_theme_buys": "BUY数",
         "col_theme_coverage": "カバレッジ",
         "jp_forum_toggle": "🇯🇵 Yahoo!掲示板センチメント（日本株・試験運用）",
-        "jp_forum_help": "既定はオフです。オンにすると、Yahoo!ファイナンス掲示板の「みんなの評価」を日本株のハイプスコアに出来高シグナルと50/50でブレンドします。試験運用：ページの解析は構造ベースで、Yahoo!の実ページでは未検証です。評価を確実に特定できない場合は数値を使わず、出来高シグナルのみにフォールバックします（理由は詳細分析に表示）。初回スキャン時は日本株1銘柄あたり約0.3秒追加（30分キャッシュ）。",
+        "jp_forum_help": "既定はオフです。オンにすると、Yahoo!ファイナンス掲示板の「みんなの評価」を日本株のハイプスコアに出来高シグナルと50/50でブレンドします。メインスキャンと売却スキャナーに適用され、ディープスキャンには適用されません。オンにした後の次回メインスキャンから有効になります。試験運用：ページの解析は構造ベースで、Yahoo!の実ページでは未検証です。評価を確実に特定できない場合は数値を使わず、出来高シグナルのみにフォールバックします（理由は詳細分析に表示）。初回スキャン時は日本株1銘柄あたり約0.3秒追加（30分キャッシュ）。",
         "col_theme_breadth": ">SMA50 %",
         "col_theme_buyspct": "BUY %",
         "col_theme_delta": "Δモメンタム",
@@ -1452,6 +1452,8 @@ TRANSLATIONS = {
 
 # Hype source-panel translations, UI-only release.
 TRANSLATIONS['en'].update({
+    "hype_jp_summary": "Headline summary as shown (rounded): buy {buy} / sell {sell}. Cross-checked against the categories; the score uses the precise category sums, not these rounded figures.",
+    "hype_jp_diag_hint": "If this keeps happening, run jp_board_diagnose.py from the app folder on your PC to see why the poll cannot be read.",
     "hype_panel_title": "Hype | Attention & crowd sentiment",
     "hype_panel_intro": "The scored Hype factor and its crowd-sentiment context, kept separate by source.",
     "hype_panel_breakouts": "Volume breakout days / 3",
@@ -1491,6 +1493,8 @@ TRANSLATIONS['en'].update({
     "hype_feed_invalid_symbol": "Unsupported provider symbol"
 })
 TRANSLATIONS['ja'].update({
+    "hype_jp_summary": "表示された要約（丸め値）：買い {buy} / 売り {sell}。カテゴリ内訳と照合済みで、採点には丸め前のカテゴリ合計を使い、この丸め値は使いません。",
+    "hype_jp_diag_hint": "この状態が続く場合は、PCでアプリのフォルダから jp_board_diagnose.py を実行すると、評価を読み取れない理由を確認できます。",
     "hype_panel_title": "\u30cf\u30a4\u30d7 | \u6ce8\u76ee\u5ea6\u30fb\u6295\u8cc7\u5bb6\u30bb\u30f3\u30c1\u30e1\u30f3\u30c8",
     "hype_panel_intro": "\u63a1\u70b9\u6e08\u307f\u306e\u30cf\u30a4\u30d7\u3068\u3001\u53d6\u5f97\u5143\u5225\u306e\u6295\u8cc7\u5bb6\u30bb\u30f3\u30c1\u30e1\u30f3\u30c8\u3092\u5206\u3051\u3066\u8868\u793a\u3057\u307e\u3059\u3002",
     "hype_panel_breakouts": "\u51fa\u6765\u9ad8\u30d6\u30ec\u30a4\u30af\u65e5\u6570 / 3",
@@ -1529,3 +1533,7 @@ TRANSLATIONS['ja'].update({
     "hype_feed_http_error": "\u63d0\u4f9b\u5143\u306eHTTP\u30a8\u30e9\u30fc",
     "hype_feed_invalid_symbol": "\u63d0\u4f9b\u5143\u672a\u5bfe\u5fdc\u30b7\u30f3\u30dc\u30eb"
 })
+
+TRANSLATIONS['en'].update({"hype_jp_saved_title": "Read a saved Yahoo page (diagnostic fallback)", "hype_jp_saved_help": "If the direct request is blocked, save the public board page as HTML in your browser and upload it here. Only markup is parsed; scripts are never executed. Confirm the page belongs to this ticker. This does not bypass a login or access restriction.", "hype_jp_saved_upload": "Saved public board HTML", "hype_jp_saved_privacy": "Parsed in this session only; not saved to the database. Review the page before sharing it.", "hype_jp_saved_large": "Page exceeds the 5 MB limit.", "hype_jp_saved_not_scored": "Manual diagnostic import: ticker and retrieval time are unverified. These values do not change the score, recommendation or ledger."})
+
+TRANSLATIONS['ja'].update({"hype_jp_saved_title": "\u4fdd\u5b58\u3057\u305fYahoo\u30da\u30fc\u30b8\u3092\u89e3\u6790\uff08\u8a3a\u65ad\u7528\uff09", "hype_jp_saved_help": "\u76f4\u63a5\u53d6\u5f97\u304c\u62d2\u5426\u3055\u308c\u305f\u5834\u5408\u306f\u3001\u30d6\u30e9\u30a6\u30b6\u30fc\u3067\u516c\u958b\u63b2\u793a\u677f\u30da\u30fc\u30b8\u3092HTML\u4fdd\u5b58\u3057\u3066\u30a2\u30c3\u30d7\u30ed\u30fc\u30c9\u3067\u304d\u307e\u3059\u3002\u30b9\u30af\u30ea\u30d7\u30c8\u306f\u5b9f\u884c\u3057\u307e\u305b\u3093\u3002\u5bfe\u8c61\u9298\u67c4\u3092\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044\u3002\u30ed\u30b0\u30a4\u30f3\u3084\u30a2\u30af\u30bb\u30b9\u5236\u9650\u3092\u56de\u907f\u3059\u308b\u6a5f\u80fd\u3067\u306f\u3042\u308a\u307e\u305b\u3093\u3002", "hype_jp_saved_upload": "\u4fdd\u5b58\u3057\u305f\u516c\u958b\u63b2\u793a\u677fHTML", "hype_jp_saved_privacy": "\u5f53\u30bb\u30c3\u30b7\u30e7\u30f3\u3067\u306e\u307f\u89e3\u6790\u3057\u3001DB\u306b\u306f\u4fdd\u5b58\u3057\u307e\u305b\u3093\u3002\u5171\u6709\u524d\u306b\u5185\u5bb9\u3092\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044\u3002", "hype_jp_saved_large": "\u30da\u30fc\u30b8\u304c5 MB\u306e\u4e0a\u9650\u3092\u8d85\u3048\u3066\u3044\u307e\u3059\u3002", "hype_jp_saved_not_scored": "\u624b\u52d5\u306e\u8a3a\u65ad\u7528\u30a4\u30f3\u30dd\u30fc\u30c8\uff1a\u9298\u67c4\u30fb\u53d6\u5f97\u6642\u523b\u306f\u672a\u691c\u8a3c\u3067\u3059\u3002\u30b9\u30b3\u30a2\u30fb\u5224\u5b9a\u30fb\u53f0\u5e33\u306f\u5909\u66f4\u3057\u307e\u305b\u3093\u3002"})

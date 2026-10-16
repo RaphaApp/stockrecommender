@@ -484,7 +484,17 @@ OUTCOME_LOSS, OUTCOME_WIN, OUTCOME_NEUTRAL = 0, 1, 2
 #   v5 — one validity rule shared by parser and scorers (an all-様子見 poll scores
 #        neutral 50; impossible displays such as 100%+2% are rejected); scopes cut at
 #        HTML structure; the Japan poll is now OFF by default (opt-in, experimental).
-PRODUCTION_MODEL_VERSION = "composite-v5-jp-poll-shared-validity-optin"
+#   v6 — the opt-in is actually ENFORCED on every path. v5 only changed the toggle's
+#        default: the first-run quick-scan button and run_engine's own default still
+#        fetched the board and blended it into hype, and the Sell Scanner fetched and
+#        scored it unconditionally. v5 observations from those paths can carry a poll
+#        (their retail_sentiment.jp_board has status "ok") although v5 says opt-in, so
+#        they are kept apart from v6, where a poll is present only if it was requested.
+#   v7 — the Japan poll parser now separates a rounded headline summary from the
+#        five-category breakdown and cross-checks it (it used to reject every such
+#        page as duplicate_label). Pages with a summary now contribute a poll — and so
+#        change the hype input for those names — where v6 recorded none.
+PRODUCTION_MODEL_VERSION = "composite-v8-jp-visible-detail"
 DIRECTIONAL_CALLS = ("BUY", "SELL")
 
 BUY_THRESHOLD = 65.0
@@ -514,7 +524,7 @@ try:
     from config import CONFIG_SCHEMA_VERSION
 except ImportError:
     CONFIG_SCHEMA_VERSION = 0
-EXPECTED_CONFIG_SCHEMA = 24
+EXPECTED_CONFIG_SCHEMA = 26
 
 try:
     from config import INSTRUMENT_JA
@@ -1825,12 +1835,11 @@ def _fetch_jp_board_cached(ticker: str) -> dict:
     freezes a transient error for 30 minutes; a page that parses to 'unavailable' or
     'parse_error' IS cached, because retrying it would just re-read the same page.
     fetched_at is set here, so a cache hit keeps the ORIGINAL retrieval time."""
-    url = f"https://finance.yahoo.co.jp/quote/{ticker}/forum"
-    html = _reddit_get(url, {"User-Agent": "Mozilla/5.0", "Accept-Language": "ja"})
-    time.sleep(0.25)   # only on cache miss; be polite to the page
+    from jp_board_transport import fetch_board_page
+    html, metadata = fetch_board_page(ticker)
+    time.sleep(0.25)
     d = _ss.parse_jp_board(html)
-    d.update(source_url=url, ticker=ticker, provider_asof=None,
-             fetched_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    d.update(metadata, ticker=ticker, provider_asof=None)
     return d
 
 
@@ -1846,8 +1855,10 @@ def fetch_jp_forum_detail(ticker: str) -> dict:
         return dict(base, status="unavailable", reason="sentiment_sources_module_missing")
     try:
         return _fetch_jp_board_cached(ticker)
+    except urllib.error.HTTPError as e:
+        return dict(base, status="unavailable", reason=f"http_{e.code}", http_status=e.code)
     except Exception as e:
-        logger.warning("JP forum fetch failed for %s: %s", ticker, e)
+        logger.warning("JP forum fetch failed for %s: %s", ticker, type(e).__name__)
         return dict(base, status="network_error", reason=type(e).__name__)
 
 
@@ -2011,7 +2022,7 @@ SELL_KPI_WEIGHTS = {
     "technical": 0.15,    # trend breakdown (moving averages, MACD)
     "momentum": 0.10,     # recent price momentum
     "short": 0.05,        # short interest as bearish positioning
-    "forum": 0.05,        # Yahoo!掛示板 euphoria (JP only; asymmetric, skipped elsewhere)
+    "forum": 0.05,        # Yahoo!掲示板 euphoria (JP only; asymmetric, skipped elsewhere)
 }
 _SELL_GRADES = ("sell", "underperform", "reduce", "underweight", "negative", "strong sell")
 
@@ -2225,7 +2236,7 @@ def analyze_sell_signals(ticker: str, hist: pd.DataFrame | None = None) -> dict 
         signals.append(("short", None,
                         f"{sp * 100:.1f}% short ignored — 1M momentum not negative (possible squeeze)"))
 
-    # 8) Yahoo!掛示板 euphoria (Japan only). ASYMMETRIC and contrarian-aware:
+    # 8) Yahoo!掲示板 euphoria (Japan only). ASYMMETRIC and contrarian-aware:
     # only lopsided retail *bullishness* on a .T name adds sell pressure (the retail-top
     # pattern); a bearish or balanced board is neutral, never a sell push. Skipped
     # (None) for non-Japanese names and whenever no usable poll is available, so it
@@ -2235,10 +2246,10 @@ def analyze_sell_signals(ticker: str, hist: pd.DataFrame | None = None) -> dict 
         es = (forum_euphoria_sell_score(poll[0], poll[1], poll[2] if len(poll) > 2 else None)
               if poll else None)
         if es is None:
-            signals.append(("forum", None, "No Yahoo!掛示板 poll available"))
+            signals.append(("forum", None, "No Yahoo!掲示板 poll available"))
         else:
             signals.append(("forum", es,
-                f"Yahoo!掛示板 買いたい {poll[0]:.0f}% / 売りたい {poll[1]:.0f}% "
+                f"Yahoo!掲示板 買いたい {poll[0]:.0f}% / 売りたい {poll[1]:.0f}% "
                 + ("(euphoric — possible retail top)" if es > 50 else "(not euphoric — neutral)")))
     else:
         signals.append(("forum", None, "Japan board poll disabled or not applicable"))
@@ -4757,6 +4768,13 @@ def render_hype_sentiment(r: dict) -> None:
     summary[2].metric(tr("hype_panel_breakouts"),
                       str(hype.get("breakout_days")) if hype.get("breakout_days") is not None else "\u2014")
     st.caption(tr("hype_panel_snapshot", asof=str(r.get("price_date") or "\u2014")))
+    # What the mention count is and which feeds produced it. These were on the Deep Dive
+    # before the panel replaced that block; they are last-scan values, so nothing is fetched.
+    st.caption(tr("hype_buzz_caption"))
+    if _LAST_HYPE_STATUS:
+        st.caption(_LAST_HYPE_STATUS)
+    if _LAST_HYPE_FETCHED_AT:
+        st.caption(tr("hype_updated", ago=_ago(_LAST_HYPE_FETCHED_AT)))
     left, right = st.columns(2)
     for col, source, title in ((left, "jp_board", "Yahoo!\u63b2\u793a\u677f \u300c\u307f\u3093\u306a\u306e\u8a55\u4fa1\u300d"),
                                (right, "stocktwits", "Stocktwits")):
@@ -4791,6 +4809,9 @@ def render_hype_sentiment(r: dict) -> None:
                         st.info(tr("hype_feed_scan_hint"))
                     elif status != "not_applicable":
                         st.info(tr("hype_no_number"))
+                        if status in ("unavailable", "parse_error", "ambiguous") \
+                                and record.get("reason") != "no_votes":
+                            st.caption(tr("hype_jp_diag_hint"))
                 else:
                     st.caption(tr("hype_st_role"))
                     score = safe_float(record.get("score"))
@@ -4817,11 +4838,35 @@ def render_hype_sentiment(r: dict) -> None:
                     st.text(tr("hype_parser") + ": " + str(record.get("parser_version") or "\u2014"))
                     if record.get("reason"):
                         st.text(tr("hype_reason") + ": " + str(record["reason"]))
+                    if source == "jp_board" and (record.get("summary_buy_pct") is not None
+                                                 or record.get("summary_sell_pct") is not None):
+                        def _pct(v):
+                            return "\u2014" if v is None else f"{float(v):g}%"
+                        st.text(tr("hype_jp_summary", buy=_pct(record.get("summary_buy_pct")),
+                                   sell=_pct(record.get("summary_sell_pct"))))
                     if source == "jp_board" and isinstance(record.get("categories"), dict) and record["categories"]:
                         st.dataframe(pd.DataFrame([
                             {tr("crowd_col_category"): k, tr("crowd_col_pct"): v}
                             for k, v in record["categories"].items()
                         ]), hide_index=True, width="stretch")
+    if str(r.get("ticker", "")).upper().endswith(".T"):
+        with st.expander(tr("hype_jp_saved_title")):
+            st.caption(tr("hype_jp_saved_help"))
+            page = st.file_uploader(tr("hype_jp_saved_upload"), type=["html", "htm"],
+                                    key="jp_saved_page_" + str(r.get("ticker")),
+                                    help=tr("hype_jp_saved_privacy"))
+            if page is not None and _ss is not None:
+                if page.size > 5_000_000:
+                    st.warning(tr("hype_jp_saved_large"))
+                else:
+                    imported = _ss.parse_jp_board(page.getvalue().decode("utf-8", errors="replace"))
+                    st.caption(tr("hype_jp_saved_not_scored"))
+                    if imported.get("status") == "ok":
+                        st.json({k: imported.get(k) for k in
+                                 ("status", "buy_pct", "neutral_pct", "sell_pct", "categories",
+                                  "summary_buy_pct", "summary_sell_pct", "parser_version")})
+                    else:
+                        st.warning(str(imported.get("reason") or imported.get("status")))
     st.caption(tr("hype_panel_footer"))
 
 
