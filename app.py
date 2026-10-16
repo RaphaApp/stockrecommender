@@ -484,7 +484,13 @@ OUTCOME_LOSS, OUTCOME_WIN, OUTCOME_NEUTRAL = 0, 1, 2
 #   v5 — one validity rule shared by parser and scorers (an all-様子見 poll scores
 #        neutral 50; impossible displays such as 100%+2% are rejected); scopes cut at
 #        HTML structure; the Japan poll is now OFF by default (opt-in, experimental).
-PRODUCTION_MODEL_VERSION = "composite-v5-jp-poll-shared-validity-optin"
+#   v6 — the opt-in is actually ENFORCED on every path. v5 only changed the toggle's
+#        default: the first-run quick-scan button and run_engine's own default still
+#        fetched the board and blended it into hype, and the Sell Scanner fetched and
+#        scored it unconditionally. v5 observations from those paths can carry a poll
+#        (their retail_sentiment.jp_board has status "ok") although v5 says opt-in, so
+#        they are kept apart from v6, where a poll is present only if it was requested.
+PRODUCTION_MODEL_VERSION = "composite-v6-jp-opt-in-enforced-everywhere"
 DIRECTIONAL_CALLS = ("BUY", "SELL")
 
 BUY_THRESHOLD = 65.0
@@ -514,7 +520,7 @@ try:
     from config import CONFIG_SCHEMA_VERSION
 except ImportError:
     CONFIG_SCHEMA_VERSION = 0
-EXPECTED_CONFIG_SCHEMA = 23
+EXPECTED_CONFIG_SCHEMA = 24
 
 try:
     from config import INSTRUMENT_JA
@@ -2011,7 +2017,7 @@ SELL_KPI_WEIGHTS = {
     "technical": 0.15,    # trend breakdown (moving averages, MACD)
     "momentum": 0.10,     # recent price momentum
     "short": 0.05,        # short interest as bearish positioning
-    "forum": 0.05,        # Yahoo!掛示板 euphoria (JP only; asymmetric, skipped elsewhere)
+    "forum": 0.05,        # Yahoo!掲示板 euphoria (JP only; asymmetric, skipped elsewhere)
 }
 _SELL_GRADES = ("sell", "underperform", "reduce", "underweight", "negative", "strong sell")
 
@@ -2225,23 +2231,23 @@ def analyze_sell_signals(ticker: str, hist: pd.DataFrame | None = None) -> dict 
         signals.append(("short", None,
                         f"{sp * 100:.1f}% short ignored — 1M momentum not negative (possible squeeze)"))
 
-    # 8) Yahoo!掛示板 euphoria (Japan only). ASYMMETRIC and contrarian-aware:
+    # 8) Yahoo!掲示板 euphoria (Japan only). ASYMMETRIC and contrarian-aware:
     # only lopsided retail *bullishness* on a .T name adds sell pressure (the retail-top
     # pattern); a bearish or balanced board is neutral, never a sell push. Skipped
     # (None) for non-Japanese names and whenever no usable poll is available, so it
     # never dilutes a US/EU/CN composite.
-    if ticker.endswith(".T"):
+    if ticker.endswith(".T") and st.session_state.get("_jp_forum_on", JP_FORUM_DEFAULT_ON):
         poll = fetch_jp_forum_rating(ticker)
         es = (forum_euphoria_sell_score(poll[0], poll[1], poll[2] if len(poll) > 2 else None)
               if poll else None)
         if es is None:
-            signals.append(("forum", None, "No Yahoo!掛示板 poll available"))
+            signals.append(("forum", None, "No Yahoo!掲示板 poll available"))
         else:
             signals.append(("forum", es,
-                f"Yahoo!掛示板 買いたい {poll[0]:.0f}% / 売りたい {poll[1]:.0f}% "
+                f"Yahoo!掲示板 買いたい {poll[0]:.0f}% / 売りたい {poll[1]:.0f}% "
                 + ("(euphoric — possible retail top)" if es > 50 else "(not euphoric — neutral)")))
     else:
-        signals.append(("forum", None, "Yahoo!掛示板 poll — Japan only"))
+        signals.append(("forum", None, "Japan board poll disabled or not applicable"))
 
     # Composite over only the KPIs that returned a score
     num = sum(SELL_KPI_WEIGHTS[k] * s for k, s, _ in signals if s is not None)
@@ -3672,7 +3678,7 @@ def _run_post_scan_tasks(results: list[dict], scan_histories: dict,
 def run_engine(limit_per_region: int | None = None,
                regions: list | None = None,
                sources: list | None = None,
-               use_jp_forum: bool = True) -> tuple[list[dict], list[str]]:
+               use_jp_forum: bool = JP_FORUM_DEFAULT_ON) -> tuple[list[dict], list[str]]:
     weights = get_latest_weights()
     results, failed = [], []
 
@@ -3760,6 +3766,7 @@ def run_engine(limit_per_region: int | None = None,
                 else:
                     if jp_detail is not None:
                         analysis["jp_board"] = jp_detail
+                    analysis["jp_forum_enabled"] = bool(use_jp_forum and region == "Japan")
                     analysis["promoted"] = t in promoted_set
                     if analysis["promoted"]:
                         # Star the display name so promoted ride-alongs are
@@ -4715,6 +4722,122 @@ def explanation_weights(r: dict) -> tuple[dict, bool]:
     return get_latest_weights(), False
 
 
+
+def _hype_source_record(r: dict, source: str) -> dict:
+    """Read scan-time data only. Rendering never fetches or changes a score."""
+    ticker = str(r.get("ticker") or "").upper()
+    if source == "jp_board":
+        if not ticker.endswith(".T"):
+            return {"status": "not_applicable"}
+        record = r.get("jp_board")
+        if isinstance(record, dict) and record:
+            return dict(record)
+        if r.get("jp_forum_enabled") is False:
+            return {"status": "disabled"}
+        return {"status": "not_collected"}
+    if stocktwits_symbol(ticker) is None:
+        return {"status": "not_applicable"}
+    record = r.get("stocktwits")
+    return dict(record) if isinstance(record, dict) and record else {"status": "not_collected"}
+
+
+def _hype_timestamp(value) -> str:
+    """Retain the actual offset. Never label an unknown timezone as UTC."""
+    if not value:
+        return "\u2014"
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt.isoformat(timespec="minutes")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def render_hype_sentiment(r: dict) -> None:
+    """Always-visible bilingual source cards. No network, no synthetic values."""
+    st.markdown(f"#### {tr('hype_panel_title')}")
+    st.caption(tr("hype_panel_intro"))
+    summary = st.columns(3)
+    summary[0].metric(tr("factor_hype"), fmt_num(safe_float(r.get("hype_score")), 1) + " /100")
+    summary[1].metric(tr("evi_mentions"), fmt_num(safe_float(r.get("hype_mentions")), 1))
+    hype = r.get("hype") if isinstance(r.get("hype"), dict) else {}
+    summary[2].metric(tr("hype_panel_breakouts"),
+                      str(hype.get("breakout_days")) if hype.get("breakout_days") is not None else "\u2014")
+    st.caption(tr("hype_panel_snapshot", asof=str(r.get("price_date") or "\u2014")))
+    # What the mention count is and which feeds produced it. These were on the Deep Dive
+    # before the panel replaced that block; they are last-scan values, so nothing is fetched.
+    st.caption(tr("hype_buzz_caption"))
+    if _LAST_HYPE_STATUS:
+        st.caption(_LAST_HYPE_STATUS)
+    if _LAST_HYPE_FETCHED_AT:
+        st.caption(tr("hype_updated", ago=_ago(_LAST_HYPE_FETCHED_AT)))
+    left, right = st.columns(2)
+    for col, source, title in ((left, "jp_board", "Yahoo!\u63b2\u793a\u677f \u300c\u307f\u3093\u306a\u306e\u8a55\u4fa1\u300d"),
+                               (right, "stocktwits", "Stocktwits")):
+        record = _hype_source_record(r, source)
+        status = str(record.get("status") or "unavailable")
+        with col:
+            with st.container(border=True):
+                st.markdown(f"**{title}**")
+                status_key = "hype_feed_" + status
+                # Unknown provider statuses are text, never unsafe HTML.
+                status_text = tr(status_key) if status_key in TRANSLATIONS.get(get_lang(), {}) else status
+                st.caption(status_text)
+                if source == "jp_board":
+                    st.caption(tr("hype_jp_role"))
+                    b = safe_float(record.get("buy_pct"))
+                    s = safe_float(record.get("sell_pct"))
+                    n = safe_float(record.get("neutral_pct"))
+                    if status == "ok" and not (math.isnan(b) or math.isnan(s)):
+                        for key, val in (("crowd_jp_buy", b), ("crowd_jp_neutral", n), ("crowd_jp_sell", s)):
+                            st.metric(tr(key), "\u2014" if math.isnan(val) else f"{val:.2f}%")
+                        # Applied means this scan actually received a scorable poll,
+                        # not that today's sidebar happens to be switched on.
+                        sb, ss = safe_float(r.get("jp_bull")), safe_float(r.get("jp_bear"))
+                        neutral = record.get("neutral_pct")
+                        applied = (not math.isnan(sb) and not math.isnan(ss)
+                                   and abs(sb-b) < 1e-9 and abs(ss-s) < 1e-9
+                                   and forum_sentiment_score(b, s, neutral) is not None)
+                        st.caption(tr("hype_jp_applied" if applied else "hype_jp_not_applied"))
+                    elif status == "disabled":
+                        st.info(tr("hype_jp_disabled_hint"))
+                    elif status == "not_collected":
+                        st.info(tr("hype_feed_scan_hint"))
+                    elif status != "not_applicable":
+                        st.info(tr("hype_no_number"))
+                else:
+                    st.caption(tr("hype_st_role"))
+                    score = safe_float(record.get("score"))
+                    if status == "ok" and not math.isnan(score) and 0 <= score <= 100:
+                        st.metric(tr("crowd_st_score"), f"{score:.1f} /100")
+                        st.progress(score / 100.0)
+                        # Provider label is rendered as literal text, not HTML/Markdown.
+                        st.text(str(record.get("label") or "\u2014"))
+                        attention = safe_float(record.get("message_volume_score"))
+                        st.metric(tr("crowd_st_attention"),
+                                  "\u2014" if math.isnan(attention) else f"{attention:.1f} /100")
+                    elif status == "not_configured":
+                        st.info(tr("hype_st_credentials"))
+                    elif status == "not_collected":
+                        st.info(tr("hype_feed_scan_hint"))
+                    elif status != "not_applicable":
+                        st.info(tr("hype_no_number"))
+                    st.caption(tr("hype_st_not_percent"))
+                if record.get("fetched_at"):
+                    st.caption(tr("hype_fetched", value=_hype_timestamp(record.get("fetched_at"))))
+                with st.expander(tr("hype_source_details")):
+                    st.text(tr("hype_window") + ": " + str(record.get("window") or "\u2014"))
+                    st.text(tr("hype_provider_asof") + ": " + _hype_timestamp(record.get("provider_asof")))
+                    st.text(tr("hype_parser") + ": " + str(record.get("parser_version") or "\u2014"))
+                    if record.get("reason"):
+                        st.text(tr("hype_reason") + ": " + str(record["reason"]))
+                    if source == "jp_board" and isinstance(record.get("categories"), dict) and record["categories"]:
+                        st.dataframe(pd.DataFrame([
+                            {tr("crowd_col_category"): k, tr("crowd_col_pct"): v}
+                            for k, v in record["categories"].items()
+                        ]), hide_index=True, width="stretch")
+    st.caption(tr("hype_panel_footer"))
+
+
 def render_deep_dive(results: list[dict]) -> None:
     if not results:
         st.info(tr("need_run_history"))
@@ -4867,6 +4990,9 @@ def render_deep_dive(results: list[dict]) -> None:
                d2=second["label"], s2=f"{second['score']:.0f}", share=f"{share2:.0f}",
                w=weak["label"], sw=f"{weak['score']:.0f}"))
 
+    # Hype context sits beside the factor explanation, not below the price chart.
+    render_hype_sentiment(r)
+
     # --- evidence: the real numbers behind each factor ---
     st.markdown(f"#### {tr('why_evidence')}")
     ev = pd.DataFrame(_evidence_rows(r), columns=[tr("col_factor"), tr("col_metric"), tr("col_value")])
@@ -4891,58 +5017,6 @@ def render_deep_dive(results: list[dict]) -> None:
         st.line_chart(chart_df.dropna())
     else:
         st.caption(tr("price_chart_unavailable"))
-
-    mentions = safe_float(r.get("hype_mentions", 0), 0.0)
-    st.markdown(metric_card(tr("hype_buzz_label"), f"{mentions:g}", positive=mentions > 0),
-                unsafe_allow_html=True)
-    st.caption(tr("hype_buzz_caption"))
-    if _LAST_HYPE_STATUS:
-        st.caption(_LAST_HYPE_STATUS)
-    if _LAST_HYPE_FETCHED_AT:
-        st.caption(tr("hype_updated", ago=_ago(_LAST_HYPE_FETCHED_AT)))
-
-    # --- Crowd sentiment: two DIFFERENT metrics, never interchangeable --------
-    # Yahoo! JP board = a five-category posting distribution in %.
-    # Stocktwits = a provider-normalised 0-100 score with a label; NOT a buy %.
-    _jp, _stw = r.get("jp_board") or {}, r.get("stocktwits") or {}
-    if _jp or _stw:
-        st.markdown(f"##### {tr('crowd_header')}")
-        if _jp:
-            if _jp.get("status") == "ok":
-                cj = st.columns(3)
-                cj[0].markdown(metric_card(tr("crowd_jp_buy"), f"{_jp['buy_pct']:.1f}%"),
-                               unsafe_allow_html=True)
-                cj[1].markdown(metric_card(tr("crowd_jp_neutral"),
-                               "—" if _jp.get("neutral_pct") is None else f"{_jp['neutral_pct']:.1f}%"),
-                               unsafe_allow_html=True)
-                cj[2].markdown(metric_card(tr("crowd_jp_sell"), f"{_jp['sell_pct']:.1f}%"),
-                               unsafe_allow_html=True)
-                st.caption(tr("crowd_jp_caption", layout=_jp.get("layout") or "—",
-                              fetched=str(_jp.get("fetched_at") or "—")[:16].replace("T", " ")))
-                if _jp.get("categories"):
-                    with st.expander(tr("crowd_jp_raw")):
-                        st.dataframe(pd.DataFrame(
-                            [{tr("crowd_col_category"): k, tr("crowd_col_pct"): v}
-                             for k, v in _jp["categories"].items()]),
-                            width="stretch", hide_index=True)
-            else:
-                _why = f" ({_jp['reason']})" if _jp.get("reason") else ""
-                st.caption(tr("crowd_jp_status", status=f"{_jp.get('status', '—')}{_why}"))
-        if _stw:
-            if _stw.get("status") == "ok":
-                cs = st.columns(2)
-                cs[0].markdown(metric_card(tr("crowd_st_score"),
-                               f"{_stw['score']:.0f}/100 · {_stw.get('label') or '—'}"),
-                               unsafe_allow_html=True)
-                cs[1].markdown(metric_card(tr("crowd_st_attention"),
-                               "—" if _stw.get("message_volume_score") is None
-                               else f"{_stw['message_volume_score']:.0f}/100"),
-                               unsafe_allow_html=True)
-                st.caption(tr("crowd_st_caption", window=_stw.get("window") or "—",
-                              fetched=str(_stw.get("fetched_at") or "—")[:16].replace("T", " ")))
-            else:
-                st.caption(tr("crowd_st_status", status=_stw.get("status", "—")))
-        st.caption(tr("crowd_note"))
 
     # --- Recent news -------------------------------------------------------
     # Deliberately last and visually separate: it is reading material, not part of
@@ -6218,6 +6292,7 @@ def main() -> None:
     quick_scan = st.sidebar.toggle(tr("scan_quick_toggle"), value=True, help=tr("scan_quick_help"))
     jp_forum_on = st.sidebar.toggle(tr("jp_forum_toggle"), value=JP_FORUM_DEFAULT_ON,
                                     help=tr("jp_forum_help"))
+    st.session_state["_jp_forum_on"] = bool(jp_forum_on)
     update_prices = st.sidebar.checkbox(tr("update_hist_prices"), value=True)
     # The Audit page reads this from session state (page callables take no args).
     st.session_state["_update_prices"] = bool(update_prices)
@@ -6307,7 +6382,7 @@ def main() -> None:
             with st.spinner(tr("scan_spinner")):
                 res, fail = run_engine(limit_per_region=10,
                                        regions=list(TICKER_UNIVERSE.keys()),
-                                       sources=None, use_jp_forum=True)
+                                       sources=selected_sources, use_jp_forum=jp_forum_on)
                 st.session_state["results"], st.session_state["failed"] = res, fail
                 st.session_state["scan_is_quick"] = True
             if not res and fail:

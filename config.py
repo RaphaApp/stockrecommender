@@ -8,7 +8,7 @@ focused on logic. No app dependencies; safe to import anywhere.
 # Bumped whenever app.py starts depending on new keys in this file. app.py compares
 # against its own expected value and warns if the two files were deployed out of
 # step — which otherwise shows up as raw keys like "board_no_csv" on screen.
-CONFIG_SCHEMA_VERSION = 23
+CONFIG_SCHEMA_VERSION = 24
 
 
 
@@ -1449,3 +1449,83 @@ TRANSLATIONS = {
         "rec_SELL": "売り",
     },
 }
+
+# Hype source-panel translations, UI-only release.
+TRANSLATIONS['en'].update({
+    "hype_panel_title": "Hype | Attention & crowd sentiment",
+    "hype_panel_intro": "The scored Hype factor and its crowd-sentiment context, kept separate by source.",
+    "hype_panel_breakouts": "Volume breakout days / 3",
+    "hype_panel_snapshot": "Scan-time snapshot | price session {asof}. Opening this panel does not fetch new data or change the recommendation.",
+    "hype_jp_role": "Japan listings | experimental scoring input when explicitly enabled and valid.",
+    "hype_jp_applied": "Used in this scan: board score blended 50/50 with pre-board Hype, before any squeeze adjustment.",
+    "hype_jp_not_applied": "Displayed as context; not confirmed as a scoring input in this snapshot.",
+    "hype_jp_disabled_hint": "Off for this scan. Enable the experimental Japan board toggle in the sidebar and run a new scan to request it.",
+    "hype_feed_scan_hint": "No source record in this snapshot. A new main scan is needed to collect the enabled sources.",
+    "hype_no_number": "No usable number was returned. Missing data is not a neutral score or zero.",
+    "hype_st_role": "US listings | measurement only. Never changes Hype, the composite or the call.",
+    "hype_st_credentials": "Approved API credentials are not configured. Add STOCKTWITS_API_USERNAME and STOCKTWITS_API_PASSWORD to secrets, then run a new main scan.",
+    "hype_st_not_percent": "A score of 34/100 is NOT 34% buy. Attention is normalised, not a message count.",
+    "hype_fetched": "Retrieved: {value}",
+    "hype_source_details": "Source details & raw categories",
+    "hype_window": "Provider window",
+    "hype_provider_asof": "Provider as-of",
+    "hype_parser": "Parser version",
+    "hype_reason": "Reason",
+    "hype_panel_footer": "Source values are scan snapshots, not live quotes. Japan extraction and authenticated Stocktwits access still need live verification. Existing volume, news/social buzz and squeeze inputs remain unchanged.",
+    "hype_feed_ok": "Available in this snapshot",
+    "hype_feed_disabled": "Disabled for this scan",
+    "hype_feed_not_applicable": "Not applicable to this listing",
+    "hype_feed_not_collected": "Not collected in this snapshot",
+    "hype_feed_not_configured": "API credentials not configured",
+    "hype_feed_unavailable": "Unavailable",
+    "hype_feed_parse_error": "Could not parse safely",
+    "hype_feed_ambiguous": "Conflicting poll components",
+    "hype_feed_network_error": "Network error",
+    "hype_feed_unauthorized": "API authentication failed",
+    "hype_feed_forbidden": "API access denied",
+    "hype_feed_rate_limited": "Provider rate limit",
+    "hype_feed_circuit_open": "Requests paused after a provider error",
+    "hype_feed_budget_exhausted": "Scan request budget exhausted",
+    "hype_feed_invalid_response": "Invalid provider response",
+    "hype_feed_http_error": "Provider HTTP error",
+    "hype_feed_invalid_symbol": "Unsupported provider symbol"
+})
+TRANSLATIONS['ja'].update({
+    "hype_panel_title": "\u30cf\u30a4\u30d7 | \u6ce8\u76ee\u5ea6\u30fb\u6295\u8cc7\u5bb6\u30bb\u30f3\u30c1\u30e1\u30f3\u30c8",
+    "hype_panel_intro": "\u63a1\u70b9\u6e08\u307f\u306e\u30cf\u30a4\u30d7\u3068\u3001\u53d6\u5f97\u5143\u5225\u306e\u6295\u8cc7\u5bb6\u30bb\u30f3\u30c1\u30e1\u30f3\u30c8\u3092\u5206\u3051\u3066\u8868\u793a\u3057\u307e\u3059\u3002",
+    "hype_panel_breakouts": "\u51fa\u6765\u9ad8\u30d6\u30ec\u30a4\u30af\u65e5\u6570 / 3",
+    "hype_panel_snapshot": "\u30b9\u30ad\u30e3\u30f3\u6642\u306e\u8a18\u9332 | \u4fa1\u683c\u30bb\u30c3\u30b7\u30e7\u30f3 {asof}\u3002\u8868\u793a\u3067\u65b0\u3057\u3044\u901a\u4fe1\u3084\u5224\u5b9a\u306e\u5909\u66f4\u306f\u884c\u3044\u307e\u305b\u3093\u3002",
+    "hype_jp_role": "\u65e5\u672c\u4e0a\u5834\u682a | \u660e\u793a\u7684\u306b\u6709\u52b9\u5316\u3057\u3001\u6709\u52b9\u306a\u8a55\u4fa1\u3092\u53d6\u5f97\u3057\u305f\u5834\u5408\u306e\u307f\u63a1\u70b9\u3002\u8a66\u9a13\u904b\u7528\u3002",
+    "hype_jp_applied": "\u3053\u306e\u30b9\u30ad\u30e3\u30f3\u3067\u53cd\u6620\u6e08\u307f\uff1a\u63b2\u793a\u677f\u30b9\u30b3\u30a2\u3092\u53cd\u6620\u524d\u306e\u30cf\u30a4\u30d7\u306850:50\u3067\u30d6\u30ec\u30f3\u30c9\u3002\u305d\u306e\u5f8c\u306b\u8e0f\u307f\u4e0a\u3052\u88dc\u6b63\u3002",
+    "hype_jp_not_applied": "\u53c2\u8003\u8868\u793a\u3002\u3053\u306e\u8a18\u9332\u3067\u63a1\u70b9\u306b\u4f7f\u308f\u308c\u305f\u3053\u3068\u306f\u78ba\u8a8d\u3067\u304d\u307e\u305b\u3093\u3002",
+    "hype_jp_disabled_hint": "\u3053\u306e\u30b9\u30ad\u30e3\u30f3\u3067\u306f\u30aa\u30d5\u3002\u30b5\u30a4\u30c9\u30d0\u30fc\u306e\u8a66\u9a13\u904b\u7528\u30c8\u30b0\u30eb\u3092\u30aa\u30f3\u306b\u3057\u3001\u65b0\u3057\u3044\u30b9\u30ad\u30e3\u30f3\u3092\u5b9f\u884c\u3057\u3066\u304f\u3060\u3055\u3044\u3002",
+    "hype_feed_scan_hint": "\u3053\u306e\u8a18\u9332\u306b\u306f\u53d6\u5f97\u5143\u306e\u30c7\u30fc\u30bf\u304c\u3042\u308a\u307e\u305b\u3093\u3002\u65b0\u3057\u3044\u30e1\u30a4\u30f3\u30b9\u30ad\u30e3\u30f3\u304c\u5fc5\u8981\u3067\u3059\u3002",
+    "hype_no_number": "\u5229\u7528\u53ef\u80fd\u306a\u6570\u5024\u306a\u3057\u3002\u6b20\u640d\u306f\u4e2d\u7acb\u30b9\u30b3\u30a2\u30840\u3068\u306f\u7570\u306a\u308a\u307e\u3059\u3002",
+    "hype_st_role": "\u7c73\u56fd\u4e0a\u5834\u682a | \u8a08\u6e2c\u5c02\u7528\u3002\u30cf\u30a4\u30d7\u30fb\u7dcf\u5408\u30b9\u30b3\u30a2\u30fb\u5224\u5b9a\u306b\u306f\u5f71\u97ff\u3057\u307e\u305b\u3093\u3002",
+    "hype_st_credentials": "\u627f\u8a8d\u6e08\u307fAPI\u306e\u8a8d\u8a3c\u60c5\u5831\u304c\u672a\u8a2d\u5b9a\u3002secrets\u306b STOCKTWITS_API_USERNAME / STOCKTWITS_API_PASSWORD \u3092\u8a2d\u5b9a\u3057\u3001\u65b0\u3057\u3044\u30e1\u30a4\u30f3\u30b9\u30ad\u30e3\u30f3\u3092\u5b9f\u884c\u3057\u3066\u304f\u3060\u3055\u3044\u3002",
+    "hype_st_not_percent": "34/100\u306f\u300c\u8cb7\u304434%\u300d\u3067\u306f\u3042\u308a\u307e\u305b\u3093\u3002\u6ce8\u76ee\u5ea6\u306f\u6b63\u898f\u5316\u5024\u3067\u3001\u6295\u7a3f\u4ef6\u6570\u3067\u306f\u3042\u308a\u307e\u305b\u3093\u3002",
+    "hype_fetched": "\u53d6\u5f97\u6642\u523b: {value}",
+    "hype_source_details": "\u53d6\u5f97\u5143\u306e\u8a73\u7d30\u30fb\u30ab\u30c6\u30b4\u30ea\u5185\u8a33",
+    "hype_window": "\u63d0\u4f9b\u5143\u306e\u96c6\u8a08\u671f\u9593",
+    "hype_provider_asof": "\u63d0\u4f9b\u5143\u306e\u57fa\u6e96\u6642\u523b",
+    "hype_parser": "\u30d1\u30fc\u30b5\u30fc\u7248",
+    "hype_reason": "\u7406\u7531",
+    "hype_panel_footer": "\u30b9\u30ad\u30e3\u30f3\u6642\u306e\u8a18\u9332\u3067\u3042\u308a\u3001\u30e9\u30a4\u30d6\u5024\u3067\u306f\u3042\u308a\u307e\u305b\u3093\u3002\u65e5\u672c\u306e\u5b9f\u30da\u30fc\u30b8\u89e3\u6790\u3068Stocktwits\u306e\u8a8d\u8a3c\u4ed8\u304d\u53d6\u5f97\u306f\u672a\u691c\u8a3c\u3002\u65e2\u5b58\u306e\u51fa\u6765\u9ad8\u30fb\u30cb\u30e5\u30fc\u30b9\u30fbSNS\u30fb\u8e0f\u307f\u4e0a\u3052\u306e\u8a08\u7b97\u306f\u5909\u66f4\u3057\u3066\u3044\u307e\u305b\u3093\u3002",
+    "hype_feed_ok": "\u53d6\u5f97\u6e08\u307f",
+    "hype_feed_disabled": "\u3053\u306e\u30b9\u30ad\u30e3\u30f3\u3067\u306f\u30aa\u30d5",
+    "hype_feed_not_applicable": "\u3053\u306e\u4e0a\u5834\u9298\u67c4\u306f\u5bfe\u8c61\u5916",
+    "hype_feed_not_collected": "\u3053\u306e\u8a18\u9332\u3067\u306f\u672a\u53d6\u5f97",
+    "hype_feed_not_configured": "API\u8a8d\u8a3c\u60c5\u5831\u304c\u672a\u8a2d\u5b9a",
+    "hype_feed_unavailable": "\u5229\u7528\u4e0d\u53ef",
+    "hype_feed_parse_error": "\u5b89\u5168\u306b\u89e3\u6790\u3067\u304d\u307e\u305b\u3093",
+    "hype_feed_ambiguous": "\u8a55\u4fa1\u30c7\u30fc\u30bf\u304c\u4e0d\u4e00\u81f4",
+    "hype_feed_network_error": "\u901a\u4fe1\u30a8\u30e9\u30fc",
+    "hype_feed_unauthorized": "API\u8a8d\u8a3c\u5931\u6557",
+    "hype_feed_forbidden": "API\u30a2\u30af\u30bb\u30b9\u62d2\u5426",
+    "hype_feed_rate_limited": "\u63d0\u4f9b\u5143\u306e\u30ec\u30fc\u30c8\u5236\u9650",
+    "hype_feed_circuit_open": "\u30a8\u30e9\u30fc\u5f8c\u306e\u901a\u4fe1\u4e00\u6642\u505c\u6b62",
+    "hype_feed_budget_exhausted": "\u30b9\u30ad\u30e3\u30f3\u901a\u4fe1\u4e0a\u9650",
+    "hype_feed_invalid_response": "\u63d0\u4f9b\u5143\u306e\u5fdc\u7b54\u304c\u7121\u52b9",
+    "hype_feed_http_error": "\u63d0\u4f9b\u5143\u306eHTTP\u30a8\u30e9\u30fc",
+    "hype_feed_invalid_symbol": "\u63d0\u4f9b\u5143\u672a\u5bfe\u5fdc\u30b7\u30f3\u30dc\u30eb"
+})

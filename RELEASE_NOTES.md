@@ -1,4 +1,113 @@
-# Alpha Quant Engine — release v21.2 (corrections to v21.1)
+# Alpha Quant Engine — release v21.3 (Hype panel + opt-in enforced on every path)
+
+Config schema 24. Production model `composite-v6-jp-opt-in-enforced-everywhere`.
+Early Setup model and Japan parser unchanged (`early-setup-v6-…`, `jp-board-v3-…`).
+
+Source: an externally supplied patch (a Deep Dive Hype panel plus opt-in fixes) built on
+the v21.2 files. I verified its claims, kept what held up, and added fixes of my own. The
+patch's own test file (`review/test_hype_review.py`) was listed in its manifest but not
+attached, so its "31 tests" and its Chromium checks were not reproduced from the package;
+I wrote and ran my own (below).
+
+## Deploy
+
+Replace **`app.py` and `config.py`** (a 2-file update). `indicators.py`,
+`sentiment_sources.py`, `portfolio.py`, `sec_research.py`, `requirements.txt` and
+`.streamlit/` are unchanged from v21.2 (`config.py`, `indicators.py` and
+`sentiment_sources.py` are byte-identical to the files supplied with the patch).
+**No database migration** (schema statements identical to v21.2; a v21.2 database was
+opened with this build and every row preserved). Expect the sidebar badge
+`config v24 · app expects v24`. Rollback: restore the v21.2 `app.py` and `config.py`.
+
+## The important finding: the Japan opt-in was not actually enforced (my v21.2 error)
+
+v21.2 made the poll "off by default" by changing the toggle's default, and its only test
+asserted that constant. Reproduced on the published v21.2 code, with the toggle OFF:
+
+| Path | v21.2 | v21.3 |
+|---|---|---|
+| First-run quick-scan button (real button, real Streamlit, network blocked and recorded) | 10 Yahoo! Japan board requests | 0 |
+| `run_engine()` called with no `use_jp_forum` argument | fetched and blended the poll | 0 requests |
+| Sell Scanner on a `.T` name | fetched the board and scored a **100 "euphoric — possible retail top"** signal from the unverified parser | no request, no signal |
+
+All three now respect the toggle, and the toggle works in the other direction too (on ->
+the poll is fetched and used). The Sell Scanner reads the sidebar state through
+`st.session_state["_jp_forum_on"]`; a test pins that the sidebar actually publishes it.
+
+## Intentional behaviour changes (disclosed)
+
+| Change | Effect |
+|---|---|
+| Opt-in enforced on every path | Japanese composites from the first-run quick scan no longer include the board unless you switch it on; the Sell Scanner's Japan "forum" signal is skipped while it is off. |
+| Production model v5 -> v6 | The supplied patch left the version unchanged while acknowledging that these paths change. They change composites, so v5 observations (which can carry a poll although v5 says opt-in) are kept apart from v6. Old rows are kept and excluded from current-model statistics, as before. |
+
+Unchanged: thresholds, weights, every scoring formula, frozen legacy learning, Stocktwits
+measurement-only, Early Setup.
+
+## What the patch adds (verified)
+
+* **Hype panel in the Chart Deep Dive**, directly after "Why this pick" and before the
+  numbers and the price chart (checked on a real rendered page). A summary (Hype score,
+  mentions, volume breakout days) and two bordered cards, Yahoo! 掲示板「みんなの評価」 and
+  Stocktwits, each always visible with an explicit state: available, disabled, not
+  collected, not applicable, credentials missing, rate limited, and so on. Raw categories,
+  provider window, timestamps, parser version and failure reason sit in a details
+  expander. Stocktwits is shown as a score out of 100, never as a percentage; missing data
+  never becomes 0 or 50; the provider label is rendered as literal text. Timestamps keep
+  their actual offset instead of being labelled UTC. 37 strings in English and Japanese.
+* Rendering reads the scan-time snapshot and fetches nothing (every panel test runs with
+  all network and data-source functions booby-trapped).
+* Each result records `jp_forum_enabled`, so a restored snapshot can say honestly whether
+  the poll was off or simply not collected.
+
+## What I changed on top of the patch
+
+1. **Restored the Deep Dive's mention context.** The panel replaced a block that also
+   said what the mention count is and which feeds produced it (Reddit/GDELT status and
+   last-updated). Restored with existing strings, so `config.py` stays exactly as supplied.
+2. **Fixed a wrong kanji in two user-visible Sell Scanner strings:** 「掛示板」 -> 「掲示板」.
+3. **Model version bump** (above).
+4. **Tests that exercise behaviour, not constants** (47 new).
+
+## Validation (executed for v21.3)
+
+    python -m py_compile app.py config.py indicators.py portfolio.py sec_research.py sentiment_sources.py   # OK
+    python -m pytest -q                                                                                      # 362 passed, 0 failed
+
+Per module: test_diagnostics 25, test_early_setup 33, test_feedback 19, test_indicators 47,
+test_integrity 31, test_p0_fixes 26, test_p1_integrity 30, test_portfolio 24,
+test_review_examples 18, test_v211_fixes 26, test_v212_fixes 36, test_v213_hype_panel 47
+(new). v21.2 had 315; +47.
+
+Real-Streamlit tests (the panel in both languages across every state, and the real hero
+button clicked with the toggle off and on) run in a clean subprocess, because the other
+test modules replace `sys.modules["streamlit"]` with a stub that would otherwise break them.
+
+Mutation checks: fourteen defects were reintroduced one at a time, each made the suite
+fail: hero button hard-coded on; `run_engine` default on; Sell Scanner ignoring the
+toggle; toggle default on; sidebar not publishing its state (this one was NOT caught at
+first, and a test was added); Stocktwits score shown as a percentage; label rendered as
+markdown; missing score becoming 50; the panel fetching while rendering; a poll claimed as
+"used" without being used; the Stocktwits card hidden when not applicable; the restored
+context removed; the wrong kanji; the version not bumped.
+
+Real Chromium (installed in the test environment), against the real Deep Dive page with
+the app's CSS applied, at 390px and 1280px: no horizontal overflow, no element past the
+right edge, no clipped text; on desktop the three summary metrics sit side by side with the
+two cards beside each other; on mobile everything stacks and reads cleanly (screenshots
+inspected). Only this panel was checked, not every page.
+
+## Still NOT verified
+
+Yahoo! Japan's live page (the parser stays experimental), live Stocktwits access,
+Postgres/Supabase, other pages in a browser. The patch's own test file and Chromium
+checks could not be reproduced from the package. Unit-test success says nothing about
+investment returns.
+
+
+---
+
+# v21.2 (original notes, with a correction marked [v21.3])
 
 Config schema 23. Production model `composite-v5-jp-poll-shared-validity-optin`.
 Early Setup model unchanged (`early-setup-v6-price-aligned-volume-confirmation`).
@@ -19,6 +128,7 @@ Expect the sidebar badge `config v23 · app expects v23`.
 | Change | Effect |
 |---|---|
 | **Japan poll now OFF by default** (sidebar toggle labelled *experimental*) | Following the reviewer's recommendation: the page parser is structural and unverified against Yahoo's live page, and it feeds the production hype score. Japanese hype is volume-only unless you switch it on. |
+| [v21.3] **The v21.2 statement above was WRONG for three paths.** Only the sidebar toggle's default had changed. The first-run quick-scan button hard-coded the poll on, `run_engine`'s own default was still on, and the Sell Scanner fetched the board unconditionally and scored it. Fixed in v21.3. | |
 | Production model v4 -> v5 | With the poll on: an all-様子見 poll now scores neutral 50 (it was dropped); impossible displays such as 100%+2% are rejected (they were shown, then dropped); scopes end at HTML structure. Model Lab excludes v4 rows (kept, counted). |
 
 Unchanged: thresholds, weights, frozen legacy learning, Stocktwits measurement-only, every
