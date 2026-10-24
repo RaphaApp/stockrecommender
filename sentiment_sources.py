@@ -56,6 +56,27 @@ _SCOPE_CHARS = 500
 _AGREE_TOLERANCE = 0.51          # duplicate components must agree to rounding
 
 
+# A page whose markup is grossly unbalanced makes the lazy tag/block regexes below
+# quadratic: 0.4 MB of unclosed <script> tags took >20 s, and 100 KB of "<" took 4 s, with no
+# timeout around parsing. These checks are linear (str.count) and ordinary pages never
+# trip them: real pages have balanced script/style/head blocks and near-equal "<" and ">".
+_UNBALANCED_BLOCKS_SLACK = 16
+_ANGLE_SURPLUS_LIMIT = 50_000
+
+
+def markup_problem(raw: str) -> str | None:
+    """Reason a page is too malformed to parse safely, or None. Fail-visible, never a guess."""
+    if not raw:
+        return None
+    low = raw.lower()
+    for name in ("script", "style", "head"):
+        if low.count("<" + name) > low.count("</" + name) + _UNBALANCED_BLOCKS_SLACK:
+            return "malformed_html_unclosed_blocks"
+    if raw.count("<") - raw.count(">") > _ANGLE_SURPLUS_LIMIT:
+        return "malformed_html_angle_flood"
+    return None
+
+
 def html_to_text(raw: str) -> str:
     """Visible text only: drop script/style, strip tags, unescape, collapse spaces."""
     if not raw:
@@ -238,17 +259,46 @@ def _five_category_detail(scoped_text: str) -> tuple[dict | None, str]:
     return result, ""
 
 
+_ARIA_LABEL_ATTR = re.compile(r"\baria-label\s*=", re.I)
+
+
 def _accessible_poll_text(raw: str) -> str:
     """Expose a complete five-category aria-label to the scoped parser.
     Accessible labels are page markup, not scripts. Only full ordered category
     descriptions qualify. They are inserted in-place, never collected page-wide.
     If visible and accessible copies both exist, agreement is checked separately.
+
+    Linear time. An earlier version copied everything before EVERY tag to look for the
+    nearest poll heading, which is quadratic: a 1.3 MB page took ~22 s (v21.4 parsing took
+    0.03 s), and the 5 MB size cap would have meant minutes per ticker. The result is
+    identical — same tags qualify, same text is inserted — which a differential test
+    against the previous implementation pins. Only tags that actually carry an
+    aria-label are examined; the nearest preceding heading comes from bisecting the
+    heading positions, and the first structural boundary after each heading is computed
+    once.
     """
+    import bisect
+    heads = {h: [m.start() for m in re.finditer(re.escape(h), raw)] for h in JP_POLL_HEADINGS}
+    if not any(heads.values()):
+        return raw                                   # no poll heading: nothing can qualify
+    first_boundary: dict[int, int] = {}              # heading start -> first boundary start
+
+    def in_poll_scope(pos: int) -> bool:
+        best = -1
+        for h, starts in heads.items():
+            i = bisect.bisect_right(starts, pos - len(h)) - 1     # last occurrence ending <= pos
+            if i >= 0:
+                best = max(best, starts[i])
+        if best < 0:
+            return False
+        if best not in first_boundary:
+            m = _BOUNDARY.search(raw, best)
+            first_boundary[best] = m.start() if m else len(raw) + 1
+        return not first_boundary[best] < pos        # a boundary BEFORE the tag ends the scope
+
     def replace(match):
         tag = match.group(0)
-        prefix = raw[:match.start()]
-        heading = max((prefix.rfind(h) for h in JP_POLL_HEADINGS), default=-1)
-        if heading < 0 or _BOUNDARY.search(prefix, heading):
+        if not _ARIA_LABEL_ATTR.search(tag) or not in_poll_scope(match.start()):
             return tag
         attr = re.search(r'\baria-label\s*=\s*([\x22\x27])(.*?)\1', tag, re.I | re.S)
         if not attr:
@@ -358,6 +408,25 @@ def _poll_scopes(raw_html: str) -> list[str]:
     return out
 
 
+def poll_scope_html(raw_html: str, max_chars: int = 60_000) -> list[str]:
+    """The raw HTML of each poll scope of the ORIGINAL page: from a 「みんなの評価」 heading to
+    the next heading or structural boundary (capped). Used to save a small, poll-only
+    fixture instead of a whole page: the rest of a saved page can hold personal or
+    unrelated content, the poll block does not need it. Pair with a round-trip check
+    (parse the fixture, compare) because slicing is only worth trusting if it reproduces
+    the same result."""
+    raw = re.sub(r"(?is)<(head|script|style)\b.*?</\1\s*>", " ", raw_html or "")
+    starts = sorted(m.start() for h in JP_POLL_HEADINGS for m in re.finditer(re.escape(h), raw))
+    out = []
+    for i, st in enumerate(starts):
+        end = min(starts[i + 1] if i + 1 < len(starts) else len(raw), st + max_chars)
+        cut = _BOUNDARY.search(raw, st, end)
+        if cut is not None:
+            end = cut.start()
+        out.append(raw[st:end])
+    return out
+
+
 def _parse_scope(scope: str) -> tuple[str, dict | None, str | None, str]:
     """One scope -> (kind, result, layout, reason); kind in ok | none | invalid.
     'none' = the scope holds no poll vocabulary at all (a menu link, say);
@@ -403,6 +472,10 @@ def parse_jp_board(raw_html: str) -> dict[str, Any]:
         # the rounded headline summary, when the page shows one next to the breakdown
         "summary_buy_pct": None, "summary_sell_pct": None,
     }
+    problem = markup_problem(raw_html or "")
+    if problem:
+        out.update(status="parse_error", reason=problem)
+        return out
     if not html_to_text(raw_html or ""):
         out["reason"] = "empty_page"
         return out
@@ -448,37 +521,74 @@ def describe_poll_page(raw_html: str, context: int = 60, max_snippets: int = 24)
     a test environment. It reports the parse outcome and, separately:
       * how often the 「みんなの評価」 heading appears in VISIBLE text;
       * how often the poll labels appear in visible text versus only inside <script>/<style>
-        blocks. Labels present only in script data mean the numbers are embedded JSON that
-        this parser deliberately does not read (the page would need a different, verified
-        adapter) — the main thing to rule in or out;
+        blocks (also counting JSON \\uXXXX-escaped strings, decoded for DETECTION only, never
+        for scoring). Labels present only in script data mean the numbers are embedded JSON
+        that this parser deliberately does not read;
+      * which source produced the poll: visible text, an accessible (aria-label) copy, or both,
+        and whether the two DISAGREE. Scoring is unchanged by this; it only exposes a case the
+        scorer cannot — an accessible label overriding different visible numbers inside the
+        same element;
       * the text of each scope the parser would read, and short snippets around each label.
     """
     raw = raw_html or ""
+    problem = markup_problem(raw)
     res = parse_jp_board(raw)
+    result = {k: res.get(k) for k in ("status", "reason", "layout", "buy_pct", "neutral_pct",
+                                      "sell_pct", "summary_buy_pct", "summary_sell_pct",
+                                      "parser_version")}
+    if problem:                                   # nothing below is safe to run on such markup
+        return {"result": result, "malformed_html": problem, "page_chars": len(raw),
+                "visible_text_chars": 0, "heading_in_visible_text": 0, "heading_in_script_data": 0,
+                "label_counts_visible": {l: 0 for l in JP_LABELS},
+                "label_counts_script_data": {l: 0 for l in JP_LABELS},
+                "scope_count": 0, "scopes": [], "snippets": [], "poll_source": "none",
+                "visible_only": None, "source_disagreement": False}
     visible = html_to_text(raw)
-    scripts = " ".join(m.group(0) for m in re.finditer(r"(?is)<(script|style)\b.*?</\1\s*>", raw))
-    scripts += " " + _decoded_script_strings(raw)
+    script_blocks = " ".join(m.group(0) for m in re.finditer(r"(?is)<(script|style)\b.*?</\1\s*>", raw))
+    decoded = _decoded_script_strings(raw)
     labels = list(JP_LABELS) + list(JP_POLL_HEADINGS)
 
     def count(text: str, needle: str) -> int:
         return len(re.findall(re.escape(needle), text))
+
+    def script_count(needle: str) -> int:
+        # max, not sum: a plain (unescaped) occurrence appears in BOTH the raw script text
+        # and its decoded strings, and must count once
+        return max(count(script_blocks, needle), count(decoded, needle))
     snippets = []
     for lab in labels:
         for m in re.finditer(re.escape(lab), visible):
             snippets.append({"label": lab, "where": "visible",
                              "text": visible[max(0, m.start() - context): m.end() + context]})
+    scopes = _poll_scopes(raw)
+    # source: compare the page as parsed (accessible copies exposed) with the same page
+    # with them removed. Different headings in the two views = an accessible copy exists.
+    injected = _accessible_poll_text(re.sub(r"(?is)<(head|script|style)\b.*?</\1\s*>", " ", raw))
+    n_accessible = injected.count("poll detail end")
+    visible_only = None
+    disagree = False
+    if n_accessible:
+        stripped = _ARIA_LABEL_ATTR.sub("data-x=", raw)          # neutralise aria-labels
+        vo = parse_jp_board(stripped)
+        visible_only = {k: vo.get(k) for k in ("status", "reason", "buy_pct", "neutral_pct", "sell_pct")}
+        if vo.get("status") == "ok" and res.get("status") == "ok":
+            disagree = (abs(vo["buy_pct"] - res["buy_pct"]) > _AGREE_TOLERANCE
+                        or abs(vo["sell_pct"] - res["sell_pct"]) > _AGREE_TOLERANCE)
+    source = ("none" if res.get("status") != "ok" else
+              "accessible_label" if n_accessible and (visible_only or {}).get("status") != "ok" else
+              "visible_and_accessible" if n_accessible else "visible_text")
     return {
-        "result": {k: res.get(k) for k in ("status", "reason", "layout", "buy_pct", "neutral_pct",
-                                           "sell_pct", "summary_buy_pct", "summary_sell_pct",
-                                           "parser_version")},
+        "result": result, "malformed_html": None,
         "page_chars": len(raw), "visible_text_chars": len(visible),
         "heading_in_visible_text": sum(count(visible, h) for h in JP_POLL_HEADINGS),
-        "heading_in_script_data": sum(count(scripts, h) for h in JP_POLL_HEADINGS),
+        "heading_in_script_data": sum(script_count(h) for h in JP_POLL_HEADINGS),
         "label_counts_visible": {lab: count(visible, lab) for lab in JP_LABELS},
-        "label_counts_script_data": {lab: count(scripts, lab) for lab in JP_LABELS},
-        "scope_count": len(_poll_scopes(raw)),
-        "scopes": [sc[:500] for sc in _poll_scopes(raw)],
+        "label_counts_script_data": {lab: script_count(lab) for lab in JP_LABELS},
+        "scope_count": len(scopes),
+        "scopes": [sc[:500] for sc in scopes],
         "snippets": snippets[:max_snippets],
+        "poll_source": source, "accessible_scopes": n_accessible,
+        "visible_only": visible_only, "source_disagreement": bool(disagree),
     }
 
 

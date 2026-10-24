@@ -516,6 +516,14 @@ try:
 except ImportError:
     _ss = None
 
+# Shared, bounded, verified-TLS transport for the Yahoo! Japan board (also used by
+# jp_board_diagnose.py). Guarded so a deployment that forgot the file reports a clear
+# reason instead of an ImportError class name.
+try:
+    import jp_board_transport as _jpt
+except ImportError:
+    _jpt = None
+
 try:
     from config import BENCHMARK_TYPES
 except ImportError:            # older config.py: methodology simply reported "unknown"
@@ -524,7 +532,7 @@ try:
     from config import CONFIG_SCHEMA_VERSION
 except ImportError:
     CONFIG_SCHEMA_VERSION = 0
-EXPECTED_CONFIG_SCHEMA = 26
+EXPECTED_CONFIG_SCHEMA = 27
 
 try:
     from config import INSTRUMENT_JA
@@ -1829,14 +1837,46 @@ def _parse_jp_forum(html: str) -> tuple | None:
     return _jp_poll_tuple(_ss.parse_jp_board(html))
 
 
+JP_BOARD_CIRCUIT_MINUTES = 30            # proposed policy, not a Yahoo! rule
+_JP_BOARD_BLOCK_CODES = (403, 429)
+
+
+class _JPBoardCircuitOpen(Exception):
+    def __init__(self, code: int):
+        super().__init__(code)
+        self.code = code
+
+
+class _JPBoardTransportMissing(Exception):
+    pass
+
+
+def _jp_board_circuit_code() -> int | None:
+    """HTTP status that opened the breaker, while it is still open, else None. A 403 or 429
+    means the site is refusing us: the app stops asking for a while instead of repeating
+    the request for every Japanese stock in the scan (and never tries to get around it)."""
+    c = st.session_state.get("_jp_board_circuit")
+    if not c:
+        return None
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(c["at"])).total_seconds()
+    except Exception:
+        return None
+    return int(c["code"]) if age < JP_BOARD_CIRCUIT_MINUTES * 60 else None
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def _fetch_jp_board_cached(ticker: str) -> dict:
     """Fetch + parse one board page. RAISES on a network failure so st.cache_data never
     freezes a transient error for 30 minutes; a page that parses to 'unavailable' or
     'parse_error' IS cached, because retrying it would just re-read the same page.
     fetched_at is set here, so a cache hit keeps the ORIGINAL retrieval time."""
-    from jp_board_transport import fetch_board_page
-    html, metadata = fetch_board_page(ticker)
+    if _jpt is None:
+        raise _JPBoardTransportMissing()
+    blocked = _jp_board_circuit_code()
+    if blocked:
+        raise _JPBoardCircuitOpen(blocked)          # cache MISS only: cached pages still serve
+    html, metadata = _jpt.fetch_board_page(ticker)
     time.sleep(0.25)
     d = _ss.parse_jp_board(html)
     d.update(metadata, ticker=ticker, provider_asof=None)
@@ -1855,11 +1895,25 @@ def fetch_jp_forum_detail(ticker: str) -> dict:
         return dict(base, status="unavailable", reason="sentiment_sources_module_missing")
     try:
         return _fetch_jp_board_cached(ticker)
+    except _JPBoardCircuitOpen as e:
+        return dict(base, status="unavailable", reason=f"circuit_open_http_{e.code}", http_status=e.code)
+    except _JPBoardTransportMissing:
+        return dict(base, status="unavailable", reason="jp_board_transport_missing")
     except urllib.error.HTTPError as e:
+        if e.code in _JP_BOARD_BLOCK_CODES:
+            st.session_state["_jp_board_circuit"] = {
+                "code": e.code, "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        logger.warning("JP forum fetch for %s: HTTP %s", ticker, e.code)
         return dict(base, status="unavailable", reason=f"http_{e.code}", http_status=e.code)
     except Exception as e:
-        logger.warning("JP forum fetch failed for %s: %s", ticker, type(e).__name__)
-        return dict(base, status="network_error", reason=type(e).__name__)
+        # a transport failure carries a stable reason code; anything else is reported by
+        # class name only (never the message, which can contain URLs or paths)
+        reason = getattr(e, "reason", None) if (_jpt is not None and isinstance(e, _jpt.BoardTransportError)) \
+            else type(e).__name__
+        logger.warning("JP forum fetch failed for %s: %s", ticker, reason)
+        # reachable-but-unusable vs. could-not-reach
+        reachable = reason in ("unexpected_redirect", "page_too_large", "invalid_ticker")
+        return dict(base, status="unavailable" if reachable else "network_error", reason=str(reason))
 
 
 def fetch_jp_forum_rating(ticker: str) -> tuple[float, float] | None:
@@ -3507,6 +3561,29 @@ def stocktwits_symbol(ticker: str) -> str | None:
     return t
 
 
+def source_links(ticker: str) -> dict:
+    """Public pages of a listing's crowd-sentiment sources, for the user to open in a browser.
+
+    Links only: building them makes no request, and nothing on those pages is read back into
+    the app or the score. Stocktwits uses the same listing rule as stocktwits_symbol() (US
+    listings only; share classes mapped explicitly, e.g. BRK-B -> BRK.B) plus a strict US-ticker
+    shape. The Yahoo! board link
+    uses the same strict Tokyo-ticker rule as jp_board_transport. Anything else gets no link."""
+    t = str(ticker or "").strip().upper()
+    sym = stocktwits_symbol(t)
+    # stocktwits_symbol() treats any unsuffixed string as a US listing; for a link that is too
+    # loose ("7203", "AA PL", junk input). Require a real US ticker shape: 1-5 letters with an
+    # optional class letter (BRK.B). Measurement routing is unaffected (the API client
+    # validates symbols on its own).
+    if sym and not re.fullmatch(r"[A-Z]{1,5}(?:\.[A-Z])?", sym):
+        sym = None
+    return {
+        "stocktwits": ("https://stocktwits.com/symbol/" + urllib.parse.quote(sym, safe=".")) if sym else None,
+        "jp_board": (f"https://finance.yahoo.co.jp/quote/{t}/forum"
+                     if re.fullmatch(r"[0-9A-Z]{4}\.T", t) else None),
+    }
+
+
 def _stocktwits_credentials() -> tuple[str | None, str | None]:
     """Approved-API credentials from Streamlit secrets or the environment only —
     never config.py, source control, logs or exports."""
@@ -4787,6 +4864,10 @@ def render_hype_sentiment(r: dict) -> None:
                 # Unknown provider statuses are text, never unsafe HTML.
                 status_text = tr(status_key) if status_key in TRANSLATIONS.get(get_lang(), {}) else status
                 st.caption(status_text)
+                # Open the source's public page yourself (a link; nothing is fetched or scored)
+                _link = source_links(r.get("ticker", "")).get(source)
+                if _link:
+                    st.link_button(tr("hype_open_" + source), _link, help=tr("hype_link_help"))
                 if source == "jp_board":
                     st.caption(tr("hype_jp_role"))
                     b = safe_float(record.get("buy_pct"))
@@ -4809,7 +4890,9 @@ def render_hype_sentiment(r: dict) -> None:
                         st.info(tr("hype_feed_scan_hint"))
                     elif status != "not_applicable":
                         st.info(tr("hype_no_number"))
-                        if status in ("unavailable", "parse_error", "ambiguous") \
+                        # network_error included: a TLS/proxy failure is exactly what the
+                        # diagnostic explains (it prints the STOCKREC_CA_BUNDLE advice)
+                        if status in ("unavailable", "parse_error", "ambiguous", "network_error") \
                                 and record.get("reason") != "no_votes":
                             st.caption(tr("hype_jp_diag_hint"))
                 else:

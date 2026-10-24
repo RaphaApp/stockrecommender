@@ -1,4 +1,374 @@
-# Alpha Quant Engine — release v21.3 (Hype panel + opt-in enforced on every path)
+# Alpha Quant Engine — v21.6 (links to the sources' public pages)
+
+Config schema 27. Production model and Japan parser unchanged
+(`composite-v8-jp-visible-detail`, `jp-board-v5-visible-detail-safe-summary`).
+
+## What changed
+
+In the Chart Deep Dive's Hype panel, each source card now has a button that opens that
+source's public page in your browser, directly under the card's status line:
+
+* **US stocks:** "Open on Stocktwits ↗" (`stocktwits.com/symbol/AAPL`). Share classes use the
+  existing mapping (BRK-B -> BRK.B, BF-B -> BF.B); a US-listed ADR such as BABA links to its own
+  page; a foreign listing such as SHEL.L is never sent to its ADR's page.
+* **Tokyo stocks:** "Open Yahoo!掲示板 ↗" (`finance.yahoo.co.jp/quote/7203.T/forum`), shown even
+  when the app's own fetch was blocked, so you can still read the page yourself.
+* Anything else (Europe, Hong Kong, indices, malformed input) gets no button.
+
+They are **links only**: building and rendering them makes no request, and nothing on those
+pages enters the app, the ledger or any score. Each button carries that sentence as its
+tooltip. Links open in a new tab with `rel=noreferrer`. English and Japanese labels.
+
+Found while testing: the existing "unsuffixed means US listing" rule would have produced
+Stocktwits links for strings such as `7203` or `AA PL`. The link therefore also requires a
+real US ticker shape (1-5 letters, optional class letter); none of the 216 tickers in your US
+universes loses its link. Measurement routing is unchanged.
+
+## Deploy
+
+Replace **`app.py` and `config.py`** (a two-file update over v21.5-reviewed). No database
+migration. Badge: `config v27 · app expects v27`. Rollback: the v21.5-reviewed `app.py` and
+`config.py` (or your original five working files).
+
+## Validation
+
+    python -m pytest -q          # 575 passed, 0 failed  (test_v216_links.py: 31 new)
+
+Five mutations (buttons removed, shape check removed, raw ticker used, any ".T" accepted,
+tooltip dropped) each made the suite fail. Real Streamlit: the panel in English and Japanese
+for US, share-class, Tokyo, blocked-Tokyo and UK listings, with all network functions
+booby-trapped. Real Chromium at 390 px: correct URLs, new tab, `noreferrer`, no horizontal
+overflow (screenshots inspected). The link format was checked against the URL the code
+builds, not by loading Stocktwits or Yahoo! (no network here).
+
+
+---
+
+# v21.5 Japan Fetch patch, REVIEWED (previous notes)
+
+Config schema 26 · production model `composite-v8-jp-visible-detail` · Japan parser
+`jp-board-v5-visible-detail-safe-summary`. **All three identifiers are unchanged from the patch
+you ran**, and `config.py` is byte-identical to the one supplied.
+
+## Verdict
+
+The working implementation passes review and is **kept**. Nothing was redesigned. The request
+it makes is unchanged (same URL, headers, verified TLS, timeout). Your report that fetching
+works is treated as **user-confirmed in your environment**; I could not reach Yahoo! from
+here, so I did not and cannot reproduce it. What I changed is limited to defects the review
+found, each with a test that fails on the supplied code.
+
+## 1. Your working files, recorded before any edit
+
+SHA-256 of the five files exactly as supplied (also in `WORKING_FILES_SHA256.txt`):
+
+    app_d95c3e.py                 2907016f4c11a5c3ee7dd8ed5eb3d61f678297497aca66d6e1ea6fa2e6ace9e7
+    config_012956.py              38542698a08e28b4c5d75cdfaf7f1922347286060388bb6232e4cee73b0e0be9
+    sentiment_sources_9963bb.py   843b0e855fe390c0c0731b6cb2250d02a06f92ecd857b9a676c08b1722ae80a1
+    jp_board_diagnose.py          2040507c43c1d240b1720a4dcfb154d13eac172146c288ae9168a35d2c26b43b
+    jp_board_transport.py         36dd35739e7b2188c43c9c41cc73c3825d6a87acdee780d981df2c8ebe4d5682
+
+**Keep those five files**: they are your known-working set and the rollback target.
+
+**What I could NOT record, because only you saw it:** the ticker, the displayed percentages,
+the parser status and the retrieval timestamp of your successful run, and a raw-page fixture.
+I will not invent them. Capture them now (about a minute), from the app folder:
+
+    python jp_board_diagnose.py 7203.T --record run.json --poll-html poll.html
+
+`run.json` holds ticker, UTC retrieval time, HTTP status, size, parser version, status, the
+percentages and which source produced them. `poll.html` holds ONLY the poll block (not the
+page), written with a round-trip check ("the fixture reproduces the original result") and a
+warning if it looks like it contains a secret or an e-mail address. It carries no cookies (the
+request sends none). Read both files before sharing them; with them I can turn your real,
+working layout into a permanent regression fixture.
+
+## 2. Findings, in order of importance
+
+**F1 — quadratic slowdown (measured, fixed).** The accessibility adapter copied everything
+before every tag to see whether that tag had an `aria-label`. A 1.3 MB page (60,000 tags)
+took **21.9 s to parse** (0.03 s before the patch); it grows with the square of the page size
+(minutes at the 5 MB cap), per ticker, 16 Japanese tickers per scan. Fixed with a linear
+version whose output is **identical**: differential-tested against the supplied
+implementation on 6,000 random pages (zero differences; the adapter fired on ~58% of them),
+and a 1,500-page version of that comparison is a permanent test. Now 0.07 s.
+
+**F2 — pathological markup could hang the parser (found in review; predates the patch, in
+my earlier code).** 0.4 MB of unclosed `<script>`/`<style>` tags took >20 s; 100 KB of `<`
+took 4 s; there is no timeout around parsing, and the new saved-page upload makes a truncated
+file easy to feed in. A linear guard (`markup_problem`) now refuses grossly unbalanced markup
+instantly with a visible reason (`malformed_html_unclosed_blocks` / `malformed_html_angle_flood`).
+Ordinary pages never trip it (a script-heavy page with 300 scripts and 8,000 `<` comparisons
+is a test).
+
+**F3 — failure reporting and blocking.** Transport failures reached the UI as a bare class
+name ("network_error (ValueError)"), because the patch also stopped logging the message.
+They now carry a stable reason: `tls_verification_failed`, `timeout`, `unexpected_redirect`,
+`page_too_large`, `ca_bundle_unreadable`, `jp_board_transport_missing`, `http_403`, ... And a
+**403/429 was re-requested for every Japanese stock in a scan**, contrary to the app's own
+"stop on blocking" rule: after a 403 or 429 the app now stops requesting for 30 minutes (per
+browser session; a proposed policy, not a Yahoo! rule), reporting `circuit_open_http_403`
+instead, and never tries to get around it. A TLS/network failure now also shows the
+"run jp_board_diagnose.py" hint (it prints the CA-bundle advice).
+
+**F4 — a limitation I did NOT change: nested visible vs accessible disagreement.** If the
+visible numbers sit *inside* the aria-labelled element, the adapter's injected heading ends
+the visible scope, so the scorer reads the accessible label and never sees different visible
+numbers (the sibling layout correctly refuses them as ambiguous). I left scoring alone on
+purpose: your live success may depend on this exact scope behaviour and I cannot see your
+page. The diagnostic now exposes it: it reports the poll source (visible / accessible /
+both) and prints a WARNING if the visible and accessible readings differ. Pinned by tests.
+
+**F5 — behaviour differences from my v21.4 (deliberate, fail-visible).** A one-sided summary
+next to an ordered breakdown is now refused (`unresolved_numeric_poll_labels`); a summary
+given sell-first is not a recognised layout and fails visibly. Where arithmetic fits two
+different readings, the result is `ambiguous_category_summary`. Correction to the handoff: my
+v21.4 did not "choose the first occurrence" in general; it preferred the more precisely
+displayed number and used position only for equal precision. The new rule is stricter and
+easier to defend. In practice an ordered five-label run (your layout) never reaches the
+arithmetic fallback, so the ambiguity rule applies only to non-ordered layouts.
+
+**F6 — security behaviour change to know about.** The Japan transport ignores
+`STOCKREC_INSECURE_SSL` (verification always on). If you ever relied on that switch for the
+Japan board behind a corporate proxy, set `STOCKREC_CA_BUNDLE` to your trusted CA file
+instead. Verified by a test that sets the switch and checks the context still requires and
+checks certificates.
+
+**F7 — diagnostic double counting fixed** (one occurrence inside a script counted twice
+after the decoded-JSON text was appended).
+
+**F8 — saved-page upload verified, not changed.** It parses markup only, writes nothing to the
+ledger, changes no score and no weight, does not touch the scan result, is a separate widget
+per ticker, refuses files over 5 MB, and reports malformed pages instead of hanging (tests,
+including a deep-equality check of the result and row counts in five ledger tables). Streamlit
+itself labels the uploader "200MB per file"; the app's own 5 MB limit applies after upload.
+
+## 3. The handoff's verification checklist
+
+| Item | Result |
+|---|---|
+| Fetch -> parser -> shared validity -> Hype -> ledger | Run end to end through the **real transport** with a fake HTTP layer (`test_the_whole_chain_...`). Not live. |
+| Precise values and summary provenance survive persistence | Yes, in `observations` and in the append-only `observation_snapshots`, with source URL, HTTP status, retrieval time, transport and page size. |
+| Toggle off by default, controls every scan path | Yes: `run_engine` default, hero button, Sell Scanner (earlier tests) and a new combined test. |
+| Deep Scan does not request the board | Pinned by a test. |
+| Same-bar rescans keep movers and NEW | Existing `test_integrity` tests, all passing. |
+| Missing/blocked never zero or neutral | A real scan with a 403: poll NaN, hype and composite equal the poll-off run. |
+| Saved-page imports cannot mutate scores or the ledger | Yes (F8). |
+| Existing observations stored; model filtering correct | v7 rows kept, excluded from v8 statistics (test, plus a v21.4 database upgrade). |
+| Stocktwits unchanged | AST-identical code; all earlier Stocktwits and credential-leak tests pass. |
+| Weights, thresholds, relative momentum, legacy freeze | Unchanged and pinned by value; `indicators.py` is byte-identical. |
+
+Regression cases requested, all present: summary before/after the breakdown, all three
+headline layouts (and five separators), contradictory and duplicated summaries, equal-valued
+and different-valued ambiguous readings, visible + accessible duplicates (agreeing, disagreeing,
+nested), unrelated percentages in adjacent sections, HTTP 403/429/500/503, TLS failure,
+timeout, redirect, oversize, bad ticker, bad charset, restored snapshots and both UI languages.
+
+**Wording to use:** weights and thresholds are unchanged; **a recommendation can change when
+an enabled Japan poll newly parses and moves Hype.** It is not "recommendations unchanged".
+
+## 4. Deploy and rollback
+
+Replace `app.py`, `sentiment_sources.py`, `jp_board_transport.py`, `jp_board_diagnose.py`
+(`config.py` is unchanged, so it needs no replacing). `indicators.py`, `portfolio.py`,
+`sec_research.py`, `requirements.txt` and `.streamlit/` are unchanged. **No database migration**
+(schema statements identical; a v21.4 database opened and every row preserved). Badge:
+`config v26 · app expects v26`. **Rollback:** put back your five supplied files; nothing in the
+database needs reverting.
+
+## 5. Validation executed
+
+    python -m py_compile app.py config.py indicators.py portfolio.py sec_research.py sentiment_sources.py jp_board_transport.py jp_board_diagnose.py   # OK
+    python -m pytest -q                                                                                                                               # 544 passed, 0 failed
+
+Per module: test_diagnostics 25, test_early_setup 33, test_feedback 19, test_indicators 47,
+test_integrity 31, test_p0_fixes 26, test_p1_integrity 30, test_portfolio 24,
+test_review_examples 18, test_v211_fixes 26, test_v212_fixes 36, test_v213_hype_panel 47,
+test_v214_jp_summary 64, **test_v215_review 118 (new)**. v21.4 had 426.
+
+**Baseline failures when your five files were first laid over the full suite: 11 of 426.**
+Seven tests mocked the old fetch function the patch replaced (they reached the real network
+and failed; now they run the real transport through a fake HTTP layer); two pinned the old
+model/parser versions; one pinned the old one-sided-summary behaviour; one was a stale
+diagnostic test that passed by accident. None was a regression in the patch's scoring.
+
+Mutation checks: 18 defects reintroduced one at a time, each made the suite fail (including
+the supplied quadratic adapter: the large-page test fails with `21.5 < 2.0`; and a mutation
+that sums script counts, a redirect not refused, insecure SSL honoured, no size cap, TLS
+reported as a generic error, no circuit breaker, class-name-only reasons, no hint on network
+errors, position-based ambiguity, a saved-page import attached to the result, no oversize
+guard, a fixture holding the whole page, an over-eager malformed-markup guard, a model
+version not bumped, and a disagreement flag that never fires). One first attempt was a bad
+mutation (a NameError, not the speed test) and was redone.
+
+Real Streamlit: app starts with no exceptions, badge `config v26`, the Japan toggle off by
+default; the Deep Dive panel is rendered in English and Japanese for every status, including
+restored snapshots from older builds. Real Chromium at 390 px and 1280 px (screenshots
+inspected): the failure state, the diagnostic hint and the saved-page control render without
+horizontal overflow.
+
+## 6. NOT verified
+
+* Live Yahoo! access beyond what you confirmed: other tickers, other days, other networks or
+  hosts (a cloud host may be blocked; Copilot's own request received HTTP 403).
+* Which layout your live page uses (visible, accessible label, or both) until you run the
+  diagnostic above.
+* Stocktwits provider access (pending), Postgres/Supabase, and how other pages look in a
+  browser. No RapidAPI endpoint exists anywhere in the code and none was added.
+* Unit-test success says nothing about investment returns.
+
+
+---
+
+# v21.4 (earlier release notes)
+
+Config schema 25. Production model `composite-v7-jp-summary-crosscheck`.
+Japan parser `jp-board-v4-summary-crosscheck`. Early Setup model unchanged.
+
+## Baseline (verified before editing)
+
+The files attached with the handoff were the *same Copilot patch you sent earlier*,
+byte-for-byte (`app_1.py` == the earlier `app.py`, and so on). Its `app.py` is older than
+my v21.3 (it still has model v5, the 掛示板 typo and no restored Deep Dive context);
+`config.py`, `indicators.py` and `sentiment_sources.py` equal my v21.3. So v21.3 was used as
+the baseline: it already contains everything in that patch. The handoff's section 3 (opt-in
+fixes) is present and tested: first-run button, `run_engine` default, Sell Scanner, and the
+stored `jp_forum_enabled`.
+
+## Deploy
+
+Replace **`app.py`, `config.py`, `sentiment_sources.py`** and add **`jp_board_diagnose.py`**
+(a stand-alone script, not imported by the app). `indicators.py`, `portfolio.py`,
+`sec_research.py`, `requirements.txt`, `.streamlit/` are unchanged from v21.3. No database
+migration (schema statements identical; v21.3 database opened and preserved). Badge:
+`config v25 · app expects v25`. Rollback: restore the v21.3 files.
+
+## The reported bug: a rounded headline summary broke the parser
+
+Reproduced with the handoff's numbers on v21.3: strong buy 62.96 / buy 9.26 / watch 7.41 /
+sell 3.70 / strong sell 16.67, plus a summary "買いたい 72% / 売りたい 20%". The breakdown
+alone read fine; with the summary, in either order, the result was
+`parse_error: duplicate_label`, because the summary reuses the plain buy/sell labels.
+
+Fix: strong-buy, watch and strong-sell must each appear exactly once; the plain buy and sell
+labels may appear once (breakdown only) or twice (breakdown plus summary). Which of the two
+numbers is the category is decided by **arithmetic, not position**: the summary must equal
+strong + category within display rounding (62.96 + 9.26 = 72.22 -> "72"). The score uses the
+**precise category sums** (72.22 / 20.37), never the rounded summary; nothing is counted
+twice; the summary is kept as provenance (`summary_buy_pct`, `summary_sell_pct`) in the
+result and the ledger. A summary that contradicts the breakdown is rejected
+(`summary_conflicts_with_categories`), never averaged. A whole component repeated in one
+scope, or a strong-buy/watch/strong-sell shown twice, is still rejected as `duplicate_label`.
+The allowed gap is half-unit rounding plus 0.5 (a summary built from separately rounded
+parts): 1.01 against 72.22, so 73 is accepted and 71 is not. This tolerance is my
+engineering choice, not a documented Yahoo! rule.
+
+## What this does NOT establish (important)
+
+**Nothing here proves the live page is readable.** Every test uses fixtures built from the
+handoff's description, and this environment cannot reach Yahoo!. The summary format is the
+reported one; other layouts (for example a percent shown before its label) are not handled
+and fail visibly. There is a second plausible reason the poll "returns no data" that a fixture
+cannot settle: Yahoo! Japan Finance is largely script-rendered, and this parser
+deliberately does not read `<script>` data. If the poll numbers exist only as embedded JSON,
+no summary fix will help and a different, verified adapter would be needed.
+
+## New: jp_board_diagnose.py — find out which case you are in
+
+Run from the app folder on your PC (where the page is reachable). It uses the app's own
+request settings, including `STOCKREC_CA_BUNDLE`:
+
+    python jp_board_diagnose.py 7203.T --save page.html     # fetch, explain, keep the HTML
+    python jp_board_diagnose.py --file page.html            # analyse a saved page
+
+It prints a plain verdict, then the details: READABLE (with the numbers and any summary
+found); heading missing (blocking, a login/consent page, or a layout change); poll wording
+present **only inside script data**; or heading found but the poll did not validate (with
+the reason and the text the parser saw). It never guesses a number, and a fetch failure is
+reported as a failure. Personal diagnostic use; check the saved page before sharing it.
+
+The Deep Dive now also tells you when a poll can't be read (but not when nobody has voted):
+*"run jp_board_diagnose.py … to see why"*, and its source-details expander shows the rounded
+summary when the page had one.
+
+## For your reply: what would settle it fastest
+
+Switch the Japan toggle on, run a **new main scan**, open a Japanese stock in Deep Dive and
+read the **Reason** line in the Yahoo! card's details — or run the diagnostic on `7203.T`.
+Either tells us whether it is the summary case (now fixed), a missing heading, script-only
+data, or something else.
+
+## Do users understand when the Japan poll applies? (handoff section 4)
+
+Now stated in the toggle's help text in both languages: it applies to **main scans and the
+Sell Scanner, not Deep Scan**, and takes effect on the **next main scan** after you switch it
+on. The Deep Dive card already says "enable the toggle … and run a new scan" when off, and "a
+new main scan is needed" when nothing was collected. Deep Scan not fetching the poll is
+pinned by a test (it makes no board request), so a future change has to update the help text.
+
+## Stocktwits and security (handoff sections 5 and 6) — no code change, by design
+
+* No RapidAPI integration was written and none is referenced anywhere (a test fails if the
+  word appears in the app code). The only supported route stays the documented approved API
+  with `STOCKTWITS_API_USERNAME` / `STOCKTWITS_API_PASSWORD`. A RapidAPI key must not be put
+  in those fields.
+* Open until the provider replies: the endpoint and host, the exact authentication (the form
+  also asks for an OAuth client id/secret and access token), whether it returns normalised
+  sentiment or only messages, the schema, windows, limits and permitted use. If only tagged
+  messages are available, any derived figure must be labelled "bullish share of sampled
+  tagged posts", not Stocktwits' own score (untagged posts stay unclassified). Not
+  implemented — there is nothing to build against yet.
+* New tests prove the existing client never returns or logs the username, password or the
+  Basic-auth token on any failure path (HTTP 401/429, network, timeout, malformed body), nor
+  does the app path that wraps it. They use obviously fake sentinel strings.
+* A key that was pasted into a chat must be treated as compromised. I cannot see your
+  RapidAPI account, so I cannot confirm that it was rotated or the old key deleted: please
+  confirm that yourself, and never paste keys into chats, code, notes or test files.
+
+## Intentional behaviour change (disclosed)
+
+Production model v6 -> v7. Japanese pages that carry a rounded summary used to contribute no
+poll and now do (when the toggle is on), which changes the hype input for those names.
+v6 observations are kept but excluded from current-model statistics. With the toggle off
+(the default) nothing changes. Weights, thresholds and recommendations are untouched.
+
+## Validation (executed for v21.4)
+
+    python -m py_compile app.py config.py indicators.py portfolio.py sec_research.py sentiment_sources.py jp_board_diagnose.py   # OK
+    python -m pytest -q                                                                                                          # 426 passed, 0 failed
+
+Per module: test_diagnostics 25, test_early_setup 33, test_feedback 19, test_indicators 47,
+test_integrity 31, test_p0_fixes 26, test_p1_integrity 30, test_portfolio 24,
+test_review_examples 18, test_v211_fixes 26, test_v212_fixes 36, test_v213_hype_panel 47,
+test_v214_jp_summary 64 (new). v21.3 had 362; +64.
+
+Mutation checks: fourteen defects reintroduced one at a time, each made the suite fail
+(repeated plain label rejected again; score from the rounded summary; no cross-check;
+precision tie-break flipped; repeated strong/watch ignored; diagnostic ignoring script data;
+summary not carried to the ledger; hint shown for an empty poll; version not bumped; Deep
+Scan fetching the board; the password logged; Deep Scan missing from the help; summary line
+removed from the panel; a RapidAPI reference added).
+
+Covered end to end: a page with a summary through `run_engine`, into the observations ledger
+(`retail_sentiment.jp_board` carries the summary, parser version and categories; model
+`composite-v7…`), with the poll visible in the hype score through the unchanged 50/50 blend;
+a conflicting summary recorded as a failure with no number; the toggle still gating
+everything; the Deep Dive card rendered in real Streamlit in English and Japanese.
+
+Real Streamlit start-up: no exceptions, badge `config v25`, toggle defaults to off.
+Not re-run: the real-Chromium layout check from v21.3 (the panel gained one text line and
+one caption; those are covered by real-Streamlit rendering tests, not by a new browser check).
+
+## Still NOT verified
+
+Yahoo! Japan's live page (see above), live Stocktwits access and the RapidAPI question,
+Postgres/Supabase, browsers beyond the v21.3 panel check. Unit-test success says nothing about
+investment returns.
+
+
+---
+
+# v21.3 (previous release notes)
 
 Config schema 24. Production model `composite-v6-jp-opt-in-enforced-everywhere`.
 Early Setup model and Japan parser unchanged (`early-setup-v6-…`, `jp-board-v3-…`).

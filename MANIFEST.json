@@ -1,20 +1,21 @@
 {
-  "release": "alpha-quant-v21.3",
-  "config_schema": 24,
-  "baseline": "alpha-quant-v21.2",
-  "production_model": "composite-v6-jp-opt-in-enforced-everywhere",
-  "early_setup_model": "early-setup-v6-price-aligned-volume-confirmation",
-  "jp_parser": "jp-board-v3-dom-scoped-shared-validity",
+  "release": "alpha-quant-v21.6",
+  "config_schema": 27,
+  "baseline": "alpha-quant-v21.5-reviewed",
+  "production_model": "composite-v8-jp-visible-detail",
+  "jp_parser": "jp-board-v5-visible-detail-safe-summary",
   "files": {
     ".streamlit/config.toml": "2cf41d5dda221f6478e56482c17189f1c794d889abb36729d80415be7c4a4102",
     ".streamlit/secrets.toml.example": "aab088f13d59ead268503aa2db6ba215005d093c71d9d31c7c9059b5b67c81be",
-    "RELEASE_NOTES.md": "d069f923c10068342c9162b5def99e89f703e0d020af2e08e914abe133fe2895",
-    "app.py": "3f5a5dcf7aa4ea731b2bb69b6bcc853fe3641074d5c9c1495778aa2ee41e3d4f",
-    "config.py": "16eebc5e4c460a7392cda329518ff0dff35b1f5e9ed76d84bcc625d5be1684f7",
+    "RELEASE_NOTES.md": "d08cd42426f071c356b7d4fa32356be2d14d9087cfdc6083ab11ed2bddddd615",
+    "app.py": "e4cc6bfc0ee6186e56b03004d726993df4e66f70927e33cdad89f346ff860e67",
+    "config.py": "51ffd245a88a2518929de90559abe74230b13ee76d20cbc91f8cec0e3a41578a",
     "indicators.py": "9d1179b5a4ed4723468a918e2f3a4d14e14b16e8db18c6426dc900d9cc0a2d56",
+    "jp_board_diagnose.py": "18d933a63f8f42131c671c8a1f11560445d7f000ecf1c19fdc0d27f445fa792f",
+    "jp_board_transport.py": "8ea360c7741889e08616af99024f73d34e66b14e4ab4644c38c5570c15f9c832",
     "portfolio.py": "4b0204f00c03ef5696f5ee628afa7746cba900f019eedb688d61f11356b0a8ed",
     "requirements.txt": "c726d437c3ea704485343ca19a3128fe2c761fd4433123f1e83d3b547e46bc3f",
     "sec_research.py": "c96d613cc229a702b6f205cb6919ade7f25206f30cd9a28522226f836c302952",
-    "sentiment_sources.py": "6e244d29b872421b7b229416cac506cd6b23f42ceeb366f752996d74e3bef5f4"
+    "sentiment_sources.py": "5135a5d5425c7260096bfe4e1939036a8b4e4b17fb97c1f2688303f80c8a969e"
   }
 }

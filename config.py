@@ -8,7 +8,7 @@ focused on logic. No app dependencies; safe to import anywhere.
 # Bumped whenever app.py starts depending on new keys in this file. app.py compares
 # against its own expected value and warns if the two files were deployed out of
 # step — which otherwise shows up as raw keys like "board_no_csv" on screen.
-CONFIG_SCHEMA_VERSION = 26
+CONFIG_SCHEMA_VERSION = 27
 
 
 
@@ -1452,6 +1452,9 @@ TRANSLATIONS = {
 
 # Hype source-panel translations, UI-only release.
 TRANSLATIONS['en'].update({
+    "hype_open_stocktwits": "Open on Stocktwits \u2197",
+    "hype_open_jp_board": "Open Yahoo!\u63b2\u793a\u677f \u2197",
+    "hype_link_help": "Opens the public page in your browser for your own reading. Nothing is fetched or read back into the app, and the score does not change.",
     "hype_jp_summary": "Headline summary as shown (rounded): buy {buy} / sell {sell}. Cross-checked against the categories; the score uses the precise category sums, not these rounded figures.",
     "hype_jp_diag_hint": "If this keeps happening, run jp_board_diagnose.py from the app folder on your PC to see why the poll cannot be read.",
     "hype_panel_title": "Hype | Attention & crowd sentiment",
@@ -1493,6 +1496,9 @@ TRANSLATIONS['en'].update({
     "hype_feed_invalid_symbol": "Unsupported provider symbol"
 })
 TRANSLATIONS['ja'].update({
+    "hype_open_stocktwits": "Stocktwits\u3067\u958b\u304f \u2197",
+    "hype_open_jp_board": "Yahoo!\u63b2\u793a\u677f\u3067\u958b\u304f \u2197",
+    "hype_link_help": "\u516c\u958b\u30da\u30fc\u30b8\u3092\u30d6\u30e9\u30a6\u30b6\u3067\u958b\u3044\u3066\u3054\u81ea\u8eab\u3067\u78ba\u8a8d\u3059\u308b\u305f\u3081\u306e\u30ea\u30f3\u30af\u3067\u3059\u3002\u30a2\u30d7\u30ea\u3078\u306e\u53d6\u5f97\u3084\u8aad\u307f\u8fbc\u307f\u306f\u884c\u308f\u305a\u3001\u30b9\u30b3\u30a2\u3082\u5909\u308f\u308a\u307e\u305b\u3093\u3002",
     "hype_jp_summary": "表示された要約（丸め値）：買い {buy} / 売り {sell}。カテゴリ内訳と照合済みで、採点には丸め前のカテゴリ合計を使い、この丸め値は使いません。",
     "hype_jp_diag_hint": "この状態が続く場合は、PCでアプリのフォルダから jp_board_diagnose.py を実行すると、評価を読み取れない理由を確認できます。",
     "hype_panel_title": "\u30cf\u30a4\u30d7 | \u6ce8\u76ee\u5ea6\u30fb\u6295\u8cc7\u5bb6\u30bb\u30f3\u30c1\u30e1\u30f3\u30c8",
