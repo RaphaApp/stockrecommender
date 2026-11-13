@@ -1,4 +1,120 @@
-# Alpha Quant Engine — v21.6 (links to the sources' public pages)
+# Alpha Quant Engine — v21.7 (learning evidence pooled, manual Stocktwits score, Guba links)
+
+Config schema 28 · production model `composite-v9-manual-stocktwits` · Japan parser unchanged.
+
+## Is the learning still working?
+
+Two different things are called "learning":
+
+* **Measurement — working.** Every main scan records every scored stock in the observation
+  ledger, and each is graded 5, 20 and 60 trading sessions later against its benchmark. The
+  Model Lab (Systems Audit page) reports whether high scores were followed by better returns,
+  per factor and per candidate signal.
+* **Automatic weight tuning — deliberately paused** since v20 (`ENABLE_LEGACY_WEIGHT_LEARNING
+  = False`). It learned from six hand-picked names with a win/lose label, the weakest evidence
+  in the app. It still runs in shadow mode and records the weights it *would* set; production
+  weights stay fixed until the Model Lab supports a change.
+
+**A weakness in my own design, now fixed.** The Model Lab counted only observations from the
+*current* model version, and I bumped that version six times in a month (v3 to v8), each time
+for a change that only affected how the Japan board is read. Every bump reset the Lab's
+evidence to zero for all stocks, including US, European and Chinese ones whose scores were
+computed identically throughout. The Lab now pools earlier versions wherever the formula was
+identical, and only there:
+
+| Earlier version | Pooled |
+|---|---|
+| v8 | all rows (v9 differs only where a hand-entered score was applied) |
+| v3 – v7 | everything except Japanese listings (those bumps changed the Japan board input) |
+| v2 | everything except Japanese listings and the eight European exchanges (.AS .CO .HE .MC .MI .OL .ST .SW) that were benchmarked against SPY at the time |
+| v1, unversioned | never (a different momentum formula) |
+
+Nothing is deleted. The Lab states how many earlier observations it includes and how many
+remain excluded. Expect its tables to fill in noticeably after this update.
+
+**Are the Yahoo! board and Stocktwits part of it?** The *links* are only links. The Yahoo!
+board poll, when its toggle is on, feeds the Hype factor, so its effect is measured through
+Hype. A hand-entered Stocktwits score (below) feeds Hype too and is also measured on its own
+as a candidate signal. Neither changes any weight: weights are frozen.
+
+## New: enter a Stocktwits score by hand (US listings)
+
+The Stocktwits API is not available, so in the Chart Deep Dive's Stocktwits card you can open
+the page, read the sentiment score (for example 28 for Marathon Petroleum) and type it in.
+
+* A fresh entry is blended **50/50 into Hype** (the same rule as the Japan poll) **from your
+  next main scan**. Saving never changes the scan on screen; the card shows a preview instead
+  (for example "Hype 48.0 → 38.0, composite 57.0 → 55.4 (HOLD)").
+* Entries **expire after 72 hours** and are then ignored (and shown as expired).
+* "Remove my entry" withdraws it. One sidebar switch, "Use my Stocktwits scores (US)", turns
+  all entries off. Stocks without an entry are scored exactly as before.
+* Main scans only: Deep Scan and the Sell Scanner do not use entries. US listings only
+  (including US-listed Chinese ADRs such as BABA, JD, PDD, NIO, BIDU).
+* Every use is written to the ledger with the Hype value before the blend, so the effect can
+  always be seen and separated later.
+
+**The trade-offs, stated once.** I advised against scoring manual entries and you chose to;
+that is a reasonable call for your own tool, and the design keeps its weaknesses visible
+rather than hiding them: the number exists only for stocks you looked up (a selection effect),
+it is one reading at one moment, and nothing has yet shown it predicts returns. The Model Lab
+will now show whether it does. Recommendations can change for stocks with an entry; weights
+and the BUY/SELL thresholds are unchanged.
+
+## New: Guba link for mainland-China and Hong Kong listings
+
+Below the two source cards, `.SS`/`.SZ`/`.HK` stocks get "Open Guba (东方财富股吧) ↗"
+(`guba.eastmoney.com/list,600519.html`, `…/list,hk00700.html`). It is a link only.
+
+**Not built, on purpose: the Guba scraper in the note you shared.** It relies on an
+undocumented endpoint found through the browser's developer tools and recommends random
+delays and a proxy pool to avoid blocks. That is circumventing a site's anti-scraping
+measures, which this app has consistently not done. I also could not verify that endpoint,
+or that the GitHub projects it names exist; and a keyword count over forum posts is a crude
+signal. If Guba shows a single number you would like to enter by hand, tell me which one and
+I can add an entry field like the Stocktwits one.
+
+## Fixes found while checking the app
+
+* **Japanese label bug.** `col_value` was defined twice per language with different text, so
+  the Deep Dive evidence table's value column was headed 「金額」 (monetary amount) instead of
+  「値」. The evidence table now has its own label; the insider-trades table keeps 「金額」.
+* **Dead duplicate code.** `compute_macd`, `compute_bollinger`, `compute_hype` and `clamp`
+  were each defined twice in `indicators.py` (identical). The shadowed copies are removed;
+  every remaining function and constant is verified identical.
+* **Dependency check.** The full suite passes on Streamlit 1.67, pandas 3.0.6 and numpy 2.5.4
+  (newer than the versions used before), so an unpinned fresh install is fine today.
+
+## Deploy
+
+Replace **`app.py`, `config.py`, `indicators.py`**. One new table (`manual_sentiment`) is
+created automatically on first start; nothing else in the database changes (a v21.6 database
+was opened with this build and every row preserved). Badge: `config v28 · app expects v28`.
+Rollback: the v21.6 files; the extra table is simply ignored by older builds.
+
+## Validation executed
+
+    python -m pytest -q        # 660 passed, 0 failed  (test_v217_manual_and_pooling.py: 86 new)
+
+19 mutations (entry not blended, expired entries used, switch ignored, non-US rows applied,
+preview mutating the result, Deep Scan using entries, ledger not recording, bad input turned
+into 50, any listing accepted, typing saving immediately, double-blended preview, form on
+every listing, unpadded HK codes, loose HK pattern, Japan rows pooled, SPY-benchmarked rows
+pooled, v1 pooled, one Lab table still exact-version, version not bumped) each made the suite
+fail. Real Streamlit: the form typed into and clicked (save, then remove), with the database
+rows checked. Real Chromium at 390 px: typed 28, clicked Save, one row written, no overflow.
+Static analysis (pyflakes) across all modules.
+
+## Not verified
+
+The Guba and Stocktwits link formats were built from known URL patterns, not loaded (no
+network here): click one of each once. Yahoo! Japan's live page, Postgres/Supabase (the new
+table and the pooling query use the app's existing SQL conventions, and the query's placeholder
+translation is tested, but no Postgres server was available), and investment results.
+
+
+---
+
+# v21.6 (previous notes)
 
 Config schema 27. Production model and Japan parser unchanged
 (`composite-v8-jp-visible-detail`, `jp-board-v5-visible-detail-safe-summary`).

@@ -23,34 +23,6 @@ def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     rsi = rsi.mask(ready & (avg_gain == 0) & (avg_loss > 0), 0.0)
     return rsi.mask(ready & (avg_gain == 0) & (avg_loss == 0), 50.0)
 
-def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line, macd_line - signal_line
-
-def compute_bollinger(close: pd.Series, window: int = 20, num_std: float = 2.0):
-    mid = close.rolling(window).mean()
-    std = close.rolling(window).std()
-    upper, lower = mid + num_std * std, mid - num_std * std
-    pct_b = (close - lower) / (upper - lower).replace(0, np.nan)
-    return mid, upper, lower, pct_b
-
-def compute_hype(volume: pd.Series) -> dict:
-    result = {"score": 0.0, "breakout_days": 0, "avg_ratio": float("nan"), "sustained": False}
-    vol = volume.dropna()
-    if len(vol) < 33: return result
-    baseline = float(vol.iloc[-33:-3].mean())
-    if baseline <= 0: return result
-    ratios = vol.iloc[-3:] / baseline
-    breakout_days = int((ratios > 1.5).sum())
-    avg_ratio = float(ratios.mean())
-    raw = (breakout_days / 3) * 60 + min(max(avg_ratio - 1.0, 0.0), 2.0) / 2.0 * 40
-    result.update(score=float(min(raw, 100.0)), breakout_days=breakout_days, avg_ratio=avg_ratio, sustained=breakout_days == 3)
-    return result
-
-def clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float: return max(lo, min(hi, v))
 
 def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     ema_fast = close.ewm(span=fast, adjust=False).mean()
@@ -208,6 +180,35 @@ def jp_poll_problem(bull_pct, bear_pct, neutral_pct=None) -> str | None:
     if b == 0.0 and s == 0.0 and not (n is not None and n > 0.0):
         return "no_votes"
     return None
+
+
+# A sentiment score the user reads on a public page and types in by hand (for example the
+# Stocktwits gauge: 0-100, 50 = neutral). It is blended into hype with the same 50/50 rule as
+# the Japan board poll. It is the user's own reading, not provider data: it exists only for
+# the stocks they chose to look up, at the moment they looked.
+MANUAL_SENTIMENT_BLEND = 0.5
+
+
+def manual_sentiment_value(value) -> float | None:
+    """A usable hand-entered score (finite, 0-100), else None. Booleans and text are refused;
+    nothing is ever coerced to a neutral 50."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if np.isnan(v) or np.isinf(v) or not 0.0 <= v <= 100.0:
+        return None
+    return v
+
+
+def blend_manual_sentiment(hype_score: float, manual, weight: float = MANUAL_SENTIMENT_BLEND) -> float:
+    """clamp((1 - w) * hype + w * manual). An unusable manual value leaves hype untouched."""
+    v = manual_sentiment_value(manual)
+    if v is None:
+        return float(hype_score)
+    return clamp((1.0 - weight) * float(hype_score) + weight * v)
 
 
 def forum_sentiment_score(bull_pct: float, bear_pct: float,

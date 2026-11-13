@@ -494,7 +494,49 @@ OUTCOME_LOSS, OUTCOME_WIN, OUTCOME_NEUTRAL = 0, 1, 2
 #        five-category breakdown and cross-checks it (it used to reject every such
 #        page as duplicate_label). Pages with a summary now contribute a poll — and so
 #        change the hype input for those names — where v6 recorded none.
-PRODUCTION_MODEL_VERSION = "composite-v8-jp-visible-detail"
+#   v8 — visible five-category detail with a safely separated headline summary (Japan).
+#   v9 — an optional Stocktwits score entered BY HAND for a US listing is blended 50/50 into
+#        hype (fresh entries only, from the next main scan). Rows without an entry are
+#        scored exactly as in v8.
+PRODUCTION_MODEL_VERSION = "composite-v9-manual-stocktwits"
+
+# ---------------------------------------------------------------------------
+# Which PAST observations were scored by the same formula as the current model?
+#
+# The version above is bumped whenever a production input changes meaning. Six of those
+# bumps (v3-v8) only changed how the Yahoo! Japan board is READ, and v9 only adds an
+# optional hand-entered Stocktwits score for US listings. Filtering the Model Lab on the
+# exact version therefore threw away every US / European / Chinese observation at each
+# bump, although their scores were computed identically — the Lab kept restarting from
+# zero and "the learning" never accumulated evidence.
+#
+# Rules (each is a statement about what actually changed; see the version notes above):
+#   v8        all rows        (v9 differs only where a manual entry was applied; v8 had none)
+#   v3 - v7   not Japan       (those bumps changed the Japan board input only)
+#   v2        not Japan, and not the eight European exchanges that had no mapped benchmark:
+#             under v2 they were scored and evaluated against SPY (fixed in v3), so both
+#             their momentum and their recorded excess returns are not comparable
+# v1 (absolute momentum) is a different formula and is never pooled.
+# ---------------------------------------------------------------------------
+_MODEL_V8 = "composite-v8-jp-visible-detail"
+_MODEL_V3_TO_V7 = ("composite-v3-jp-board-parser-fix", "composite-v4-jp-poll-scope-and-tolerance",
+                   "composite-v5-jp-poll-shared-validity-optin",
+                   "composite-v6-jp-opt-in-enforced-everywhere", "composite-v7-jp-summary-crosscheck")
+_MODEL_V2 = "composite-v2-relative-momentum"
+_V2_UNMAPPED_SUFFIXES = (".AS", ".CO", ".HE", ".MC", ".MI", ".OL", ".ST", ".SW")
+
+
+def comparable_model_clause() -> tuple[str, tuple]:
+    """(SQL condition, params) selecting observations comparable with the current model.
+    Uses '?' placeholders like the rest of the app (translated for Postgres)."""
+    marks = ",".join("?" for _ in _MODEL_V3_TO_V7)
+    not_like = " ".join("AND ticker NOT LIKE ?" for _ in _V2_UNMAPPED_SUFFIXES)
+    sql = ("(model_version = ? OR model_version = ? "
+           f"OR (model_version IN ({marks}) AND COALESCE(region, '') <> 'Japan') "
+           f"OR (model_version = ? AND COALESCE(region, '') <> 'Japan' {not_like}))")
+    params = (PRODUCTION_MODEL_VERSION, _MODEL_V8, *_MODEL_V3_TO_V7, _MODEL_V2,
+              *("%" + s for s in _V2_UNMAPPED_SUFFIXES))
+    return sql, params
 DIRECTIONAL_CALLS = ("BUY", "SELL")
 
 BUY_THRESHOLD = 65.0
@@ -532,7 +574,7 @@ try:
     from config import CONFIG_SCHEMA_VERSION
 except ImportError:
     CONFIG_SCHEMA_VERSION = 0
-EXPECTED_CONFIG_SCHEMA = 27
+EXPECTED_CONFIG_SCHEMA = 28
 
 try:
     from config import INSTRUMENT_JA
@@ -548,6 +590,7 @@ try:
     from config import DYNAMIC_UNIVERSE_SPEC, DYNAMIC_ALLOWED_SUFFIXES, THEME_INDUSTRY_KEYWORDS
 except ImportError:
     DYNAMIC_UNIVERSE_SPEC, DYNAMIC_ALLOWED_SUFFIXES, THEME_INDUSTRY_KEYWORDS = {}, {}, []
+from indicators import MANUAL_SENTIMENT_BLEND, manual_sentiment_value, blend_manual_sentiment
 from indicators import (
     compute_rsi, compute_macd, compute_bollinger, compute_hype, clamp, screen_metrics,
     forum_sentiment_score, forum_euphoria_sell_score, theme_strength_score,
@@ -1303,6 +1346,16 @@ def _init_schema(demo: bool) -> None:
             )"""))
         conn.execute("CREATE INDEX IF NOT EXISTS idx_obssnap_ticker "
                      "ON observation_snapshots(ticker, price_date)")
+        # Sentiment scores the user typed in by hand. Append-only: the latest row per
+        # (ticker, source) counts and a NULL score means "cleared", so history is kept.
+        conn.execute(_ddl("""
+            CREATE TABLE IF NOT EXISTS manual_sentiment (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL, source TEXT NOT NULL,
+                score REAL, entered_at TEXT NOT NULL
+            )"""))
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_manual_sentiment "
+                     "ON manual_sentiment(ticker, source, id)")
         # Shadow log for the frozen legacy optimiser: what it WOULD have set.
         conn.execute(_ddl("""
             CREATE TABLE IF NOT EXISTS shadow_weights (
@@ -1941,7 +1994,8 @@ def _benchmark_close(ticker: str) -> pd.Series | None:
 def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
                    jp_forum: tuple | None = None,
                    hist: pd.DataFrame | None = None,
-                   bench_close: pd.Series | None = None) -> dict | None:
+                   bench_close: pd.Series | None = None,
+                   manual_sentiment: float | None = None) -> dict | None:
     # `hist` lets bulk callers (run_engine / run_deep_scan) hand in the frame from
     # ONE yf.download for the whole universe instead of paying a per-ticker request;
     # names the bulk call missed fall back to the per-ticker fetch (retry + Stooq).
@@ -2012,6 +2066,15 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
         if fs is not None:
             hype["score"] = clamp(0.5 * hype["score"] + 0.5 * fs)
 
+    # A Stocktwits score the user read on the public page and typed in (US listings).
+    # Same 50/50 blend as the Japan poll, applied before the squeeze bonus. The hype value
+    # before the blend is kept so the effect is always visible and reversible on paper.
+    manual_applied = None
+    _ms = manual_sentiment_value(manual_sentiment)
+    if _ms is not None:
+        manual_applied = {"score": _ms, "hype_before": float(hype["score"])}
+        hype["score"] = blend_manual_sentiment(hype["score"], _ms)
+
     # Short-squeeze modifier — a heavily-shorted name (>10% of float) that is also
     # printing sustained volume breakouts can squeeze violently, so we boost its
     # hype score by +30 (capped at 100). The boost flows into hype_score below.
@@ -2034,6 +2097,7 @@ def analyze_ticker(ticker: str, region: str, hype_mentions: float = 0.0,
         "stop_level": (levels["stop"] if levels else float("nan")),
         "market_cap": funds["market_cap"], "roe": roe, "short_pct": short_pct,
         "sector": funds.get("sector", ""), "industry": funds.get("industry", ""),
+        "manual_sentiment": manual_applied,
         "hype": hype, "momentum": momentum_score, "value": value_score,
         "technical": technical_score, "quality": quality_score,
         # Theme (industry-rotation) KPI: neutral until the caller's cross-sectional
@@ -2629,7 +2693,8 @@ def record_observations(results: list[dict], scan_type: str = "unknown") -> int:
             str(r.get("sector") or ""), str(r.get("industry") or ""),
             safe_float(r.get("market_cap")), scan_type,
             json.dumps(r.get("expectations") or {}),
-            json.dumps({"jp_board": r.get("jp_board"), "stocktwits": r.get("stocktwits")},
+            json.dumps({"jp_board": r.get("jp_board"), "stocktwits": r.get("stocktwits"),
+                        "stocktwits_manual": r.get("st_manual")},
                        default=str),
             scored_at,
         ))
@@ -2794,6 +2859,23 @@ IC_MIN_DATES = 10    # scan dates with matured outcomes before an IC is shown as
 COHORT_MIN_NAMES = 10     # a (date, region) cohort needs this many names for quintiles
 
 
+def model_lab_population() -> dict:
+    """How many observations the Model Lab uses: scored under the current version, pooled
+    from earlier formula-identical versions, and excluded (kept, never deleted)."""
+    out = {"current": 0, "pooled_earlier": 0, "excluded": 0}
+    try:
+        sql, params = comparable_model_clause()
+        with get_conn() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+            used = conn.execute(f"SELECT COUNT(*) FROM observations WHERE {sql}", params).fetchone()[0]
+            cur = conn.execute("SELECT COUNT(*) FROM observations WHERE model_version = ?",
+                               (PRODUCTION_MODEL_VERSION,)).fetchone()[0]
+        out.update(current=int(cur), pooled_earlier=int(used - cur), excluded=int(total - used))
+    except Exception as e:
+        logger.warning("model lab population read skipped: %s", e)
+    return out
+
+
 def composite_summary(horizon: int = 20) -> dict | None:
     """Headline evidence for the composite at one horizon (current model only).
 
@@ -2813,8 +2895,8 @@ def composite_summary(horizon: int = 20) -> dict | None:
         with get_conn() as conn:
             df = pd.read_sql_query(
                 f"SELECT obs_date, region, composite, {col} AS excess FROM observations "
-                f"WHERE {col} IS NOT NULL AND composite IS NOT NULL AND model_version = ?",
-                conn, params=(PRODUCTION_MODEL_VERSION,))
+                f"WHERE {col} IS NOT NULL AND composite IS NOT NULL AND {comparable_model_clause()[0]}",
+                conn, params=comparable_model_clause()[1])
     except Exception as e:
         logger.warning("composite summary read skipped: %s", e)
         return None
@@ -2857,8 +2939,8 @@ def region_breakdown(horizon: int = 20) -> pd.DataFrame:
         with get_conn() as conn:
             df = pd.read_sql_query(
                 f"SELECT region, {col} AS excess FROM observations "
-                f"WHERE {col} IS NOT NULL AND model_version = ?", conn,
-                params=(PRODUCTION_MODEL_VERSION,))
+                f"WHERE {col} IS NOT NULL AND {comparable_model_clause()[0]}", conn,
+                params=comparable_model_clause()[1])
     except Exception as e:
         logger.warning("region breakdown read skipped: %s", e)
         return pd.DataFrame()
@@ -2876,8 +2958,9 @@ def benchmark_mix() -> dict:
     try:
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT benchmark_type, COUNT(*) FROM observations WHERE model_version = ? "
-                "GROUP BY benchmark_type", (PRODUCTION_MODEL_VERSION,)).fetchall()
+                "SELECT benchmark_type, COUNT(*) FROM observations "
+                f"WHERE {comparable_model_clause()[0]} GROUP BY benchmark_type",
+                comparable_model_clause()[1]).fetchall()
         return {str(k or "unknown"): int(v) for k, v in rows}
     except Exception as e:
         logger.warning("benchmark mix read skipped: %s", e)
@@ -2894,6 +2977,7 @@ SIGNAL_LABEL_KEYS = {
     "forward_growth_score": "ic_cand_fwd_growth",
     "earnings_surprise_score": "ic_cand_surprise",
     "stocktwits_score": "ic_cand_st_score", "stocktwits_attention": "ic_cand_st_attention",
+    "stocktwits_manual_score": "ic_cand_st_manual",
 }
 
 
@@ -2933,8 +3017,8 @@ def factor_ic_report(horizon: int = 20) -> tuple[pd.DataFrame, int]:
         with get_conn() as conn:
             df = pd.read_sql_query(
                 f"SELECT obs_date, factors, candidates, {col} AS target FROM observations "
-                f"WHERE {col} IS NOT NULL AND model_version = ?", conn,
-                params=(PRODUCTION_MODEL_VERSION,))
+                f"WHERE {col} IS NOT NULL AND {comparable_model_clause()[0]}", conn,
+                params=comparable_model_clause()[1])
     except Exception as e:
         logger.warning("IC read skipped: %s", e)
         return pd.DataFrame(), 0
@@ -2993,8 +3077,8 @@ def observation_buckets(horizon: int = 20) -> pd.DataFrame:
         with get_conn() as conn:
             df = pd.read_sql_query(
                 f"SELECT composite, {col} AS excess FROM observations "
-                f"WHERE {col} IS NOT NULL AND model_version = ?", conn,
-                params=(PRODUCTION_MODEL_VERSION,))
+                f"WHERE {col} IS NOT NULL AND {comparable_model_clause()[0]}", conn,
+                params=comparable_model_clause()[1])
     except Exception as e:
         logger.warning("bucket read skipped: %s", e)
         return pd.DataFrame()
@@ -3577,11 +3661,112 @@ def source_links(ticker: str) -> dict:
     # validates symbols on its own).
     if sym and not re.fullmatch(r"[A-Z]{1,5}(?:\.[A-Z])?", sym):
         sym = None
+    # Eastmoney Guba (股吧): mainland codes are six digits; Hong Kong codes are zero-padded to
+    # five with an "hk" prefix. A link for the user to read; the app never requests the page.
+    guba = None
+    cn = re.fullmatch(r"(\d{6})\.(?:SS|SZ)", t)
+    hk = re.fullmatch(r"(\d{1,5})\.HK", t)
+    if cn:
+        guba = f"https://guba.eastmoney.com/list,{cn.group(1)}.html"
+    elif hk:
+        guba = f"https://guba.eastmoney.com/list,hk{int(hk.group(1)):05d}.html"
     return {
         "stocktwits": ("https://stocktwits.com/symbol/" + urllib.parse.quote(sym, safe=".")) if sym else None,
         "jp_board": (f"https://finance.yahoo.co.jp/quote/{t}/forum"
                      if re.fullmatch(r"[0-9A-Z]{4}\.T", t) else None),
+        "guba": guba,
     }
+
+
+# ---------------------------------------------------------------------------
+# Hand-entered Stocktwits scores (US listings)
+# ---------------------------------------------------------------------------
+# The Stocktwits API is not available to this app, so the user may read the sentiment score
+# on the public page and type it in. A FRESH entry is blended into hype from the next main
+# scan. Known weaknesses, kept visible rather than hidden: it covers only the stocks the
+# user looked up (a selection effect), it is one reading at one moment, and nothing has yet
+# shown it predicts returns. Hence: entries expire, every use is recorded in the ledger with
+# the hype value before it, and one sidebar switch turns the mechanism off.
+MANUAL_SENTIMENT_DEFAULT_ON = True
+MANUAL_SENTIMENT_MAX_AGE_HOURS = 72
+
+
+def save_manual_sentiment(ticker: str, score, source: str = "stocktwits") -> dict:
+    """Store a hand-entered score. Raises ValueError for a non-US listing or a bad number."""
+    t = str(ticker or "").strip().upper()
+    if source != "stocktwits" or not source_links(t)["stocktwits"]:
+        raise ValueError("manual Stocktwits scores apply to US listings only")
+    v = manual_sentiment_value(score)
+    if v is None:
+        raise ValueError("enter a number from 0 to 100")
+    at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_conn() as conn:
+        conn.execute("INSERT INTO manual_sentiment (ticker, source, score, entered_at) VALUES (?,?,?,?)",
+                     (t, source, v, at))
+        conn.commit()
+    return {"ticker": t, "source": source, "score": v, "entered_at": at}
+
+
+def clear_manual_sentiment(ticker: str, source: str = "stocktwits") -> None:
+    """Withdraw the current entry (history is kept; a NULL row marks the clear)."""
+    t = str(ticker or "").strip().upper()
+    at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_conn() as conn:
+        conn.execute("INSERT INTO manual_sentiment (ticker, source, score, entered_at) VALUES (?,?,?,?)",
+                     (t, source, None, at))
+        conn.commit()
+
+
+def manual_sentiment_entries(tickers=None, source: str = "stocktwits", now=None) -> dict:
+    """{ticker: {score, entered_at, age_hours, fresh}} for the latest entry per ticker.
+    Cleared entries are absent. `fresh` = no older than MANUAL_SENTIMENT_MAX_AGE_HOURS.
+    Never raises: a database without the table simply has no entries."""
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("SELECT ticker, score, entered_at FROM manual_sentiment "
+                                "WHERE source = ? ORDER BY id", (source,)).fetchall()
+    except Exception:
+        return {}
+    wanted = None if tickers is None else {str(x).upper() for x in tickers}
+    latest: dict = {}
+    for row in rows:
+        latest[str(row[0]).upper()] = (row[1], row[2])
+    now = now or datetime.now(timezone.utc)
+    out: dict = {}
+    for t, (score, at) in latest.items():
+        if score is None or (wanted is not None and t not in wanted):
+            continue
+        try:
+            age = (now - datetime.fromisoformat(str(at))).total_seconds() / 3600.0
+        except Exception:
+            continue
+        out[t] = {"score": float(score), "entered_at": str(at), "age_hours": age,
+                  "fresh": 0.0 <= age <= MANUAL_SENTIMENT_MAX_AGE_HOURS}
+    return out
+
+
+def manual_sentiment_preview(r: dict, score) -> dict | None:
+    """What a hand-entered score would do to THIS scan's numbers, without changing them.
+    Approximate: it ignores the short-squeeze bonus that is applied after the blend."""
+    v = manual_sentiment_value(score)
+    if v is None:
+        return None
+    base = (r.get("manual_sentiment") or {}).get("hype_before")
+    hype_now = safe_float(r.get("hype_score"))
+    base = hype_now if base is None else safe_float(base)
+    if math.isnan(base):
+        return None
+    weights, _exact = explanation_weights(r)
+    trial = dict(r)
+    trial["hype_score"] = blend_manual_sentiment(base, v)
+    try:
+        scored = score_with_weights(trial, weights)
+    except Exception:
+        return None
+    return {"hype_now": hype_now, "hype_new": trial["hype_score"],
+            "composite_now": safe_float(r.get("composite")),
+            "composite_new": safe_float(scored.get("composite")),
+            "recommendation": scored.get("recommendation")}
 
 
 def _stocktwits_credentials() -> tuple[str | None, str | None]:
@@ -3714,6 +3899,11 @@ def attach_candidate_signals(results: list[dict], histories: dict | None = None)
                 cands["stocktwits_score"] = float(stw["score"])
                 if stw.get("message_volume_score") is not None:
                     cands["stocktwits_attention"] = float(stw["message_volume_score"])
+            man = r.get("st_manual") or {}
+            if man.get("score") is not None and not man.get("expired"):
+                # measured as its own candidate too, so the Model Lab can show whether the
+                # hand-entered reading has any forecasting value at all
+                cands["stocktwits_manual_score"] = float(man["score"])
             r["candidates"] = cands
             n += 1
         except Exception as e:
@@ -3760,7 +3950,8 @@ def _run_post_scan_tasks(results: list[dict], scan_histories: dict,
 def run_engine(limit_per_region: int | None = None,
                regions: list | None = None,
                sources: list | None = None,
-               use_jp_forum: bool = JP_FORUM_DEFAULT_ON) -> tuple[list[dict], list[str]]:
+               use_jp_forum: bool = JP_FORUM_DEFAULT_ON,
+               use_manual_sentiment: bool = MANUAL_SENTIMENT_DEFAULT_ON) -> tuple[list[dict], list[str]]:
     weights = get_latest_weights()
     results, failed = [], []
 
@@ -3770,6 +3961,8 @@ def run_engine(limit_per_region: int | None = None,
     # Promoted deep-scan names (PROMOTION_QUOTA per market) ride along AFTER the cap,
     # so even a quick scan always covers the current promotion layer.
     selected = regions if regions else list(TICKER_UNIVERSE.keys())
+    # hand-entered Stocktwits scores: read once per scan; only FRESH entries are used
+    manual_entries = manual_sentiment_entries() if use_manual_sentiment else {}
     promoted_map = get_promoted_universe()
     promoted_set = {t for ticks in promoted_map.values() for t in ticks}
     universe = {}
@@ -3839,13 +4032,23 @@ def run_engine(limit_per_region: int | None = None,
                 if frame is not None:
                     scan_histories[t] = frame
                 _bf = bulk.get(benchmark_for(t))
+                _me = manual_entries.get(t.upper())
+                _manual = (_me["score"] if (_me and _me["fresh"] and source_links(t)["stocktwits"])
+                           else None)
                 analysis = analyze_ticker(t, region, hype_counts.get(t, 0),
                                           jp_forum=jp_rating, hist=frame,
                                           bench_close=(_bf["Close"] if _bf is not None
-                                                       and "Close" in _bf.columns else None))
+                                                       and "Close" in _bf.columns else None),
+                                          manual_sentiment=_manual)
                 if analysis is None:
                     failed.append(f"{t} (no data)")
                 else:
+                    if _me:
+                        _ma = analysis.get("manual_sentiment") or {}
+                        analysis["st_manual"] = {
+                            "score": _me["score"], "entered_at": _me["entered_at"],
+                            "age_hours": round(_me["age_hours"], 2), "expired": not _me["fresh"],
+                            "applied": bool(_ma), "hype_before": _ma.get("hype_before")}
                     if jp_detail is not None:
                         analysis["jp_board"] = jp_detail
                     analysis["jp_forum_enabled"] = bool(use_jp_forum and region == "Japan")
@@ -4834,6 +5037,51 @@ def _hype_timestamp(value) -> str:
         return str(value)
 
 
+def _render_manual_stocktwits(r: dict) -> None:
+    """Entry field for a Stocktwits score the user read on the public page.
+
+    Saving never changes the scan on screen (it is a scan-time snapshot): a fresh entry is
+    used from the NEXT main scan. The preview shows what it would do to these numbers."""
+    t = str(r.get("ticker") or "").strip().upper()
+    st.markdown(f"**{tr('manual_st_title')}**")
+    st.caption(tr("manual_st_caveat"))
+    note = st.session_state.pop("_manual_st_note", None)
+    if note and note[0] == t:
+        st.success(tr(note[1], hours=MANUAL_SENTIMENT_MAX_AGE_HOURS))
+    used = r.get("st_manual") or {}
+    if used.get("applied"):
+        st.caption(tr("manual_st_applied", score=f"{safe_float(used.get('score')):g}",
+                      before=fmt_num(safe_float(used.get("hype_before")), 1)))
+    entry = manual_sentiment_entries([t]).get(t)
+    if entry:
+        st.caption(tr("manual_st_current" if entry["fresh"] else "manual_st_expired",
+                      score=f"{entry['score']:g}", age=f"{entry['age_hours']:.0f}",
+                      limit=MANUAL_SENTIMENT_MAX_AGE_HOURS))
+        same = used.get("applied") and abs(safe_float(used.get("score")) - entry["score"]) < 1e-9
+        if entry["fresh"] and not same:
+            st.caption(tr("manual_st_next_scan"))
+    val = st.number_input(tr("manual_st_input"), min_value=0.0, max_value=100.0, value=None,
+                          step=1.0, key=f"manual_st_in_{t}")
+    if val is not None:
+        p = manual_sentiment_preview(r, val)
+        if p:
+            st.caption(tr("manual_st_preview", h0=fmt_num(p["hype_now"], 1), h1=fmt_num(p["hype_new"], 1),
+                          c0=fmt_num(p["composite_now"], 1), c1=fmt_num(p["composite_new"], 1),
+                          call=str(p["recommendation"])))
+    b1, b2 = st.columns(2)
+    if b1.button(tr("manual_st_save"), key=f"manual_st_save_{t}", disabled=val is None):
+        try:
+            save_manual_sentiment(t, val)
+            st.session_state["_manual_st_note"] = (t, "manual_st_saved")
+        except ValueError:
+            st.session_state["_manual_st_note"] = (t, "manual_st_invalid")
+        st.rerun()
+    if b2.button(tr("manual_st_clear"), key=f"manual_st_clear_{t}", disabled=not entry):
+        clear_manual_sentiment(t)
+        st.session_state["_manual_st_note"] = (t, "manual_st_cleared")
+        st.rerun()
+
+
 def render_hype_sentiment(r: dict) -> None:
     """Always-visible bilingual source cards. No network, no synthetic values."""
     st.markdown(f"#### {tr('hype_panel_title')}")
@@ -4913,6 +5161,8 @@ def render_hype_sentiment(r: dict) -> None:
                     elif status != "not_applicable":
                         st.info(tr("hype_no_number"))
                     st.caption(tr("hype_st_not_percent"))
+                    if _link:                      # a US listing: allow a hand-entered score
+                        _render_manual_stocktwits(r)
                 if record.get("fetched_at"):
                     st.caption(tr("hype_fetched", value=_hype_timestamp(record.get("fetched_at"))))
                 with st.expander(tr("hype_source_details")):
@@ -4932,6 +5182,10 @@ def render_hype_sentiment(r: dict) -> None:
                             {tr("crowd_col_category"): k, tr("crowd_col_pct"): v}
                             for k, v in record["categories"].items()
                         ]), hide_index=True, width="stretch")
+    _guba = source_links(r.get("ticker", "")).get("guba")
+    if _guba:
+        st.caption(tr("hype_guba_note"))
+        st.link_button(tr("hype_open_guba"), _guba, help=tr("hype_link_help"))
     if str(r.get("ticker", "")).upper().endswith(".T"):
         with st.expander(tr("hype_jp_saved_title")):
             st.caption(tr("hype_jp_saved_help"))
@@ -5110,7 +5364,7 @@ def render_deep_dive(results: list[dict]) -> None:
 
     # --- evidence: the real numbers behind each factor ---
     st.markdown(f"#### {tr('why_evidence')}")
-    ev = pd.DataFrame(_evidence_rows(r), columns=[tr("col_factor"), tr("col_metric"), tr("col_value")])
+    ev = pd.DataFrame(_evidence_rows(r), columns=[tr("col_factor"), tr("col_metric"), tr("col_evidence_value")])
     st.dataframe(ev, width="stretch", hide_index=True)
 
     # --- price context ---
@@ -5205,16 +5459,12 @@ def render_model_lab() -> None:
         st.caption(tr("lab_intro", total=_tot, matured=_mat))
         # Rows scored by an earlier factor definition are kept but not pooled: mixing
         # absolute-momentum and relative-momentum rows would measure neither model.
-        try:
-            with get_conn() as _c:
-                _old = _c.execute(
-                    "SELECT COUNT(*) FROM observations WHERE model_version IS NULL "
-                    "OR model_version <> ?", (PRODUCTION_MODEL_VERSION,)).fetchone()[0]
-        except Exception:
-            _old = 0
+        _pool = model_lab_population()
         st.caption(tr("lab_prod_model", version=PRODUCTION_MODEL_VERSION))
-        if _old:
-            st.caption(tr("lab_prod_excluded", n=_old))
+        if _pool["pooled_earlier"]:
+            st.caption(tr("lab_pooled_note", n=_pool["pooled_earlier"]))
+        if _pool["excluded"]:
+            st.caption(tr("lab_prod_excluded", n=_pool["excluded"]))
         _h = st.radio(tr("lab_horizon"), list(OBS_HORIZONS), horizontal=True,
                       format_func=lambda d: tr("lab_days", d=d), key="lab_h")
         # Headline evidence first: does the top of the ranking beat the bottom?
@@ -6408,6 +6658,8 @@ def main() -> None:
     jp_forum_on = st.sidebar.toggle(tr("jp_forum_toggle"), value=JP_FORUM_DEFAULT_ON,
                                     help=tr("jp_forum_help"))
     st.session_state["_jp_forum_on"] = bool(jp_forum_on)
+    manual_st_on = st.sidebar.toggle(tr("manual_st_toggle"), value=MANUAL_SENTIMENT_DEFAULT_ON,
+                                     help=tr("manual_st_help"))
     update_prices = st.sidebar.checkbox(tr("update_hist_prices"), value=True)
     # The Audit page reads this from session state (page callables take no args).
     st.session_state["_update_prices"] = bool(update_prices)
@@ -6423,7 +6675,8 @@ def main() -> None:
             with st.spinner(tr("scan_spinner")):
                 limit = 10 if quick_scan else None
                 res, fail = run_engine(limit_per_region=limit, regions=selected_regions,
-                                       sources=selected_sources, use_jp_forum=jp_forum_on)
+                                       sources=selected_sources, use_jp_forum=jp_forum_on,
+                                       use_manual_sentiment=manual_st_on)
                 st.session_state["results"], st.session_state["failed"] = res, fail
                 st.session_state["scan_is_quick"] = bool(quick_scan)
             if res:
@@ -6497,7 +6750,8 @@ def main() -> None:
             with st.spinner(tr("scan_spinner")):
                 res, fail = run_engine(limit_per_region=10,
                                        regions=list(TICKER_UNIVERSE.keys()),
-                                       sources=selected_sources, use_jp_forum=jp_forum_on)
+                                       sources=selected_sources, use_jp_forum=jp_forum_on,
+                                       use_manual_sentiment=manual_st_on)
                 st.session_state["results"], st.session_state["failed"] = res, fail
                 st.session_state["scan_is_quick"] = True
             if not res and fail:

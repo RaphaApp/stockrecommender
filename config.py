@@ -8,7 +8,7 @@ focused on logic. No app dependencies; safe to import anywhere.
 # Bumped whenever app.py starts depending on new keys in this file. app.py compares
 # against its own expected value and warns if the two files were deployed out of
 # step — which otherwise shows up as raw keys like "board_no_csv" on screen.
-CONFIG_SCHEMA_VERSION = 27
+CONFIG_SCHEMA_VERSION = 28
 
 
 
@@ -470,7 +470,7 @@ TRANSLATIONS = {
         "col_contribution": "Contribution",
         "col_share": "Share",
         "col_metric": "Metric",
-        "col_value": "Value",
+        "col_evidence_value": "Value",
         "price_trend": "Price & moving averages",
         "evi_ret_1m": "1-month return",
         "evi_vs_sma50": "Price vs 50-day avg",
@@ -997,7 +997,7 @@ TRANSLATIONS = {
         "col_contribution": "寄与",
         "col_share": "占有率",
         "col_metric": "指標",
-        "col_value": "値",
+        "col_evidence_value": "値",
         "price_trend": "株価と移動平均",
         "evi_ret_1m": "1か月リターン",
         "evi_vs_sma50": "株価 対 50日平均",
@@ -1452,6 +1452,25 @@ TRANSLATIONS = {
 
 # Hype source-panel translations, UI-only release.
 TRANSLATIONS['en'].update({
+    "manual_st_title": "Enter the Stocktwits score yourself",
+    "manual_st_caveat": "The Stocktwits API is not available to this app. You can read the sentiment score on the Stocktwits page and type it here. It is your own reading of one page at one moment, for the stocks you chose to check, and nothing has yet shown that it predicts returns.",
+    "manual_st_input": "Sentiment score shown on Stocktwits (0–100, 50 = neutral)",
+    "manual_st_save": "Save score",
+    "manual_st_clear": "Remove my entry",
+    "manual_st_saved": "Saved. It will be blended into Hype from your next main scan and stops being used after {hours} hours.",
+    "manual_st_cleared": "Your entry was removed. It will not be used in the next scan.",
+    "manual_st_invalid": "Enter a number from 0 to 100.",
+    "manual_st_current": "Your current entry: {score}/100, entered {age} h ago (used for {limit} h).",
+    "manual_st_expired": "Your entry ({score}/100) is {age} h old. Entries older than {limit} h are no longer used; enter a fresh number to use it.",
+    "manual_st_next_scan": "Not in the scan shown here. It applies from your next main scan.",
+    "manual_st_applied": "Used in this scan: Hype was blended 50/50 with your entry of {score}/100 (Hype before: {before}).",
+    "manual_st_preview": "Preview on this scan's numbers: Hype {h0} → {h1}, composite {c0} → {c1} ({call}). Approximate; the next main scan computes the real values.",
+    "manual_st_toggle": "✍️ Use my Stocktwits scores (US)",
+    "manual_st_help": "ON by default. When you have typed a Stocktwits sentiment score for a US stock in its Chart Deep Dive, main scans blend it 50/50 into that stock's Hype score for 72 hours. Stocks without an entry are scored exactly as before. Deep Scan and the Sell Scanner do not use it. Switch off to ignore all entries.",
+    "hype_open_guba": "Open Guba (东方财富股吧) ↗",
+    "hype_guba_note": "Mainland China and Hong Kong listings: no crowd source is connected. This link is for your own reading; nothing is fetched or scored.",
+    "lab_pooled_note": "Includes {n} observation(s) scored under earlier model versions whose formula was identical for those listings (later versions only changed how the Japan board is read, or added the optional hand-entered Stocktwits score).",
+    "ic_cand_st_manual": "Stocktwits score entered by hand (US)",
     "hype_open_stocktwits": "Open on Stocktwits \u2197",
     "hype_open_jp_board": "Open Yahoo!\u63b2\u793a\u677f \u2197",
     "hype_link_help": "Opens the public page in your browser for your own reading. Nothing is fetched or read back into the app, and the score does not change.",
@@ -1467,7 +1486,7 @@ TRANSLATIONS['en'].update({
     "hype_jp_disabled_hint": "Off for this scan. Enable the experimental Japan board toggle in the sidebar and run a new scan to request it.",
     "hype_feed_scan_hint": "No source record in this snapshot. A new main scan is needed to collect the enabled sources.",
     "hype_no_number": "No usable number was returned. Missing data is not a neutral score or zero.",
-    "hype_st_role": "US listings | measurement only. Never changes Hype, the composite or the call.",
+    "hype_st_role": "US listings | Stocktwits API data would be measurement only. A score you enter by hand is blended into Hype from the next main scan.",
     "hype_st_credentials": "Approved API credentials are not configured. Add STOCKTWITS_API_USERNAME and STOCKTWITS_API_PASSWORD to secrets, then run a new main scan.",
     "hype_st_not_percent": "A score of 34/100 is NOT 34% buy. Attention is normalised, not a message count.",
     "hype_fetched": "Retrieved: {value}",
@@ -1496,6 +1515,25 @@ TRANSLATIONS['en'].update({
     "hype_feed_invalid_symbol": "Unsupported provider symbol"
 })
 TRANSLATIONS['ja'].update({
+    "manual_st_title": "Stocktwitsのスコアを自分で入力",
+    "manual_st_caveat": "このアプリではStocktwitsのAPIを利用できません。Stocktwitsのページに表示されるセンチメントスコアを確認して、ここに入力できます。これはご自身が選んだ銘柄について、ある時点で1つのページを読み取った値であり、リターンを予測できることはまだ確認されていません。",
+    "manual_st_input": "Stocktwitsに表示されているセンチメントスコア（0〜100、50が中立）",
+    "manual_st_save": "スコアを保存",
+    "manual_st_clear": "入力を取り消す",
+    "manual_st_saved": "保存しました。次回のメインスキャンからハイプに反映され、{hours}時間を過ぎると使用されなくなります。",
+    "manual_st_cleared": "入力を取り消しました。次回のスキャンでは使用されません。",
+    "manual_st_invalid": "0から100の数値を入力してください。",
+    "manual_st_current": "現在の入力：{score}/100（{age}時間前に入力、{limit}時間有効）。",
+    "manual_st_expired": "入力値（{score}/100）は{age}時間前のものです。{limit}時間を超えた入力は使用されません。使用するには新しい値を入力してください。",
+    "manual_st_next_scan": "表示中のスキャンには反映されていません。次回のメインスキャンから反映されます。",
+    "manual_st_applied": "このスキャンで反映済み：ハイプを入力値 {score}/100 と50:50でブレンドしました（反映前のハイプ：{before}）。",
+    "manual_st_preview": "このスキャンの数値での試算：ハイプ {h0} → {h1}、総合スコア {c0} → {c1}（{call}）。概算です。実際の値は次回のメインスキャンで計算されます。",
+    "manual_st_toggle": "✍️ 手入力のStocktwitsスコアを使う（米国株）",
+    "manual_st_help": "既定はオンです。米国株のチャート詳細分析でStocktwitsのセンチメントスコアを入力すると、メインスキャンでその銘柄のハイプスコアに72時間のあいだ50:50でブレンドされます。入力のない銘柄は従来どおりに採点されます。ディープスキャンと売却スキャナーでは使用しません。オフにするとすべての入力を無視します。",
+    "hype_open_guba": "股吧（東方財富）で開く ↗",
+    "hype_guba_note": "中国本土・香港上場銘柄：接続されている投資家センチメントのソースはありません。このリンクはご自身で確認するためのもので、取得や採点は行いません。",
+    "lab_pooled_note": "計算式が同一だった過去のモデルバージョンの観測{n}件を含みます（その後の変更は、日本の掲示板の読み取り方法と、任意の手入力Stocktwitsスコアの追加のみです）。",
+    "ic_cand_st_manual": "手入力のStocktwitsスコア（米国）",
     "hype_open_stocktwits": "Stocktwits\u3067\u958b\u304f \u2197",
     "hype_open_jp_board": "Yahoo!\u63b2\u793a\u677f\u3067\u958b\u304f \u2197",
     "hype_link_help": "\u516c\u958b\u30da\u30fc\u30b8\u3092\u30d6\u30e9\u30a6\u30b6\u3067\u958b\u3044\u3066\u3054\u81ea\u8eab\u3067\u78ba\u8a8d\u3059\u308b\u305f\u3081\u306e\u30ea\u30f3\u30af\u3067\u3059\u3002\u30a2\u30d7\u30ea\u3078\u306e\u53d6\u5f97\u3084\u8aad\u307f\u8fbc\u307f\u306f\u884c\u308f\u305a\u3001\u30b9\u30b3\u30a2\u3082\u5909\u308f\u308a\u307e\u305b\u3093\u3002",
@@ -1511,7 +1549,7 @@ TRANSLATIONS['ja'].update({
     "hype_jp_disabled_hint": "\u3053\u306e\u30b9\u30ad\u30e3\u30f3\u3067\u306f\u30aa\u30d5\u3002\u30b5\u30a4\u30c9\u30d0\u30fc\u306e\u8a66\u9a13\u904b\u7528\u30c8\u30b0\u30eb\u3092\u30aa\u30f3\u306b\u3057\u3001\u65b0\u3057\u3044\u30b9\u30ad\u30e3\u30f3\u3092\u5b9f\u884c\u3057\u3066\u304f\u3060\u3055\u3044\u3002",
     "hype_feed_scan_hint": "\u3053\u306e\u8a18\u9332\u306b\u306f\u53d6\u5f97\u5143\u306e\u30c7\u30fc\u30bf\u304c\u3042\u308a\u307e\u305b\u3093\u3002\u65b0\u3057\u3044\u30e1\u30a4\u30f3\u30b9\u30ad\u30e3\u30f3\u304c\u5fc5\u8981\u3067\u3059\u3002",
     "hype_no_number": "\u5229\u7528\u53ef\u80fd\u306a\u6570\u5024\u306a\u3057\u3002\u6b20\u640d\u306f\u4e2d\u7acb\u30b9\u30b3\u30a2\u30840\u3068\u306f\u7570\u306a\u308a\u307e\u3059\u3002",
-    "hype_st_role": "\u7c73\u56fd\u4e0a\u5834\u682a | \u8a08\u6e2c\u5c02\u7528\u3002\u30cf\u30a4\u30d7\u30fb\u7dcf\u5408\u30b9\u30b3\u30a2\u30fb\u5224\u5b9a\u306b\u306f\u5f71\u97ff\u3057\u307e\u305b\u3093\u3002",
+    "hype_st_role": "米国上場株 | StocktwitsのAPIデータは計測専用です。手入力したスコアは次回のメインスキャンからハイプにブレンドされます。",
     "hype_st_credentials": "\u627f\u8a8d\u6e08\u307fAPI\u306e\u8a8d\u8a3c\u60c5\u5831\u304c\u672a\u8a2d\u5b9a\u3002secrets\u306b STOCKTWITS_API_USERNAME / STOCKTWITS_API_PASSWORD \u3092\u8a2d\u5b9a\u3057\u3001\u65b0\u3057\u3044\u30e1\u30a4\u30f3\u30b9\u30ad\u30e3\u30f3\u3092\u5b9f\u884c\u3057\u3066\u304f\u3060\u3055\u3044\u3002",
     "hype_st_not_percent": "34/100\u306f\u300c\u8cb7\u304434%\u300d\u3067\u306f\u3042\u308a\u307e\u305b\u3093\u3002\u6ce8\u76ee\u5ea6\u306f\u6b63\u898f\u5316\u5024\u3067\u3001\u6295\u7a3f\u4ef6\u6570\u3067\u306f\u3042\u308a\u307e\u305b\u3093\u3002",
     "hype_fetched": "\u53d6\u5f97\u6642\u523b: {value}",
